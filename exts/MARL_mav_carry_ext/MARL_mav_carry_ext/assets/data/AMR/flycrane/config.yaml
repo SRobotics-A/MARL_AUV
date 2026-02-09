@@ -1,5 +1,5 @@
-asset_path: /home/isaac-sim/Jack_Zeng/MARL_mav_carry/source/extensions/isaaclab_assets/data/Robots/AMR/flycrane_data/flycrane.urdf
-usd_dir: /home/isaac-sim/Jack_Zeng/MARL_mav_carry/source/extensions/isaaclab_assets/data/Robots/AMR/flycrane
+asset_path: /home/xtj/xtj-project/RL/MARL_cooperative_aerial_manipulation_ext/exts/MARL_mav_carry_ext/MARL_mav_carry_ext/assets/data/AMR/flycrane_data/flycrane.urdf
+usd_dir: /home/xtj/xtj-project/RL/MARL_cooperative_aerial_manipulation_ext/exts/MARL_mav_carry_ext/MARL_mav_carry_ext/assets/data/AMR/flycrane
 usd_file_name: flycrane.usd
 force_usd_conversion: true
 make_instanceable: true
