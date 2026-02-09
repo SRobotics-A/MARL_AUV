@@ -32,7 +32,7 @@ from isaaclab.utils.math import (
     quat_from_euler_xyz,
     quat_inv,
     quat_mul,
-    quat_rotate,
+    quat_apply,
     quat_unique,
     sample_uniform,
 )
@@ -859,8 +859,8 @@ class MARLHoverFlypentEnv(DirectMARLEnv):
 
     def _downwash_reward(self):
         # Plane equation for the payload
-        x_len_payload_env = quat_rotate(self.load_orientation, self.load_length_x)
-        y_len_payload_env = quat_rotate(self.load_orientation, self.load_length_y)
+        x_len_payload_env = quat_apply(self.load_orientation, self.load_length_x)
+        y_len_payload_env = quat_apply(self.load_orientation, self.load_length_y)
         edge_payload_x = self.load_position + x_len_payload_env
         edge_payload_y = self.load_position + y_len_payload_env
         plane_vec1 = edge_payload_x - self.load_position
@@ -869,7 +869,7 @@ class MARLHoverFlypentEnv(DirectMARLEnv):
         d = torch.sum(normal * self.load_position, dim=-1).unsqueeze(-1).unsqueeze(-1)  # Shape (num_envs, 1, 1)
 
         # Line equations for each drone's thrust direction
-        thrust_directions = quat_rotate(
+        thrust_directions = quat_apply(
             self.drone_orientations.view(-1, 4),
             torch.tensor([[0, 0, 1.0]] * self.num_envs * self._num_drones, device=self.device),
         ).view(self.num_envs, self._num_drones, 3)

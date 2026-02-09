@@ -161,7 +161,7 @@ class MARLHoverFlycartEnvCfg(DirectMARLEnvCfg):
     )
     # robot
     robot_cfg: ArticulationCfg = FLYCART_CFG.replace(prim_path="/World/envs/env_.*/flycart")
-    robot_cfg.spawn.activate_contact_sensors = True
+    robot_cfg.spawn.activate_contact_sensors = False
 
     # contact sensors
     contact_forces = ContactSensorCfg(
