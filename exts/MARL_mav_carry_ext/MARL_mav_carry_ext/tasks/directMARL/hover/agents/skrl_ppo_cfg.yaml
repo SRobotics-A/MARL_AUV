@@ -1,89 +1,87 @@
+# 随机种子设置，确保实验可重现性
 seed: 42
 
 
-# Models are instantiated using skrl's model instantiator utility
+# 模型配置部分 - 使用skrl的模型实例化工具
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
-  separate: False
-  CTDE: False # Centralized Training with Decentralized Execution
-  separate_actors: False # separate models for each agent
-  separate_critics: False # separate models for each agent
-  policy:  # see gaussian_model parameters
-    class: GaussianMixin
-    clip_actions: False
-    clip_log_std: True
-    min_log_std: -20.0
-    max_log_std: 2.0
-    initial_log_std: 0.0
-    network:
-      - name: net
-        input: STATES
-        layers: [1024, 512, 256, 128]
-        activations:
-        - elu
+  separate: False  # 是否使用独立的演员(actor)和评论家(critic)模型（False表示共享网络）
+  CTDE: False      # 不使用集中式训练分布式执行
+  separate_actors: False  # 不为每个智能体使用独立的演员模型
+  separate_critics: False # 不为每个智能体使用独立的评论家模型
+  policy:  # 策略网络配置（高斯混合模型参数）
+    class: GaussianMixin     # 使用高斯分布作为动作输出
+    clip_actions: False      # 是否裁剪动作输出
+    clip_log_std: True       # 是否裁剪对数标准差
+    min_log_std: -20.0       # 最小对数标准差
+    max_log_std: 2.0         # 最大对数标准差
+    initial_log_std: 0.0     # 初始对数标准差
+    network:                 # 神经网络结构配置
+      - name: net            # 网络名称
+        input: STATES        # 输入为状态
+        layers: [1024, 512, 256, 128]  # 网络层结构：4层全连接网络
+        activations:         # 激活函数配置
+        - elu               # 指数线性单元激活函数
+    output: ACTIONS          # 输出为动作
+  value:  # 价值网络配置（确定性模型参数）
+    class: DeterministicMixin  # 确定性输出
+    clip_actions: False        # 不裁剪动作
+    network:                   # 神经网络结构
+      - name: net              # 网络名称
+        input: STATES          # 输入为状态
+        layers: [1024, 512, 256, 128]  # 与策略网络相同的结构
+        activations: elu       # 激活函数
+    output: ONE                # 输出单一价值标量
 
-    output: ACTIONS
-  value:  # see deterministic_model parameters
-    class: DeterministicMixin
-    clip_actions: False
-    network:
-      - name: net
-        input: STATES
-        layers: [1024, 512, 256, 128]
-        activations: elu
-    output: ONE
 
-
-# Rollout memory
+# 回放缓冲区内存配置
 # https://skrl.readthedocs.io/en/latest/api/memories/random.html
 memory:
-  class: RandomMemory
-  memory_size: -1  # automatically determined (same as agent:rollouts)
+  class: RandomMemory      # 使用随机内存存储经验
+  memory_size: -1          # 内存大小自动确定（与agent:rollouts相同）
 
 
-# PPO agent configuration (field names are from PPO_DEFAULT_CONFIG)
+# PPO智能体配置（字段名来自PPO_DEFAULT_CONFIG）
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
-  class: PPO
-  rollouts: 32
-  learning_epochs: 5
-  mini_batches: 1
-  discount_factor: 0.99
-  lambda: 0.95
-  learning_rate: 1.0e-03
-  learning_rate_scheduler: KLAdaptiveLR
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.01
-  state_preprocessor: RunningStandardScaler
-  state_preprocessor_kwargs: {"size": env.observation_space, "device": device}
-  value_preprocessor: RunningStandardScaler
-  value_preprocessor_kwargs: {"size": 1, "device": device}
-  random_timesteps: 0
-  learning_starts: 0
-  grad_norm_clip: 1.0
-  ratio_clip: 0.2
-  value_clip: 0.2
-  clip_predicted_values: True
-  entropy_loss_scale: 0.005
-  value_loss_scale: 1.0
-  kl_threshold: 0.0
-  rewards_shaper_scale: 1.0
-  time_limit_bootstrap: False
-  # logging and checkpoint
+  class: PPO               # 使用PPO算法
+  rollouts: 32             # 回合长度（收集多少步数据后进行更新）- 相对较小，适合单智能体
+  learning_epochs: 5       # 学习轮数（每次更新迭代几次）
+  mini_batches: 1          # 小批量数量（将数据分成多少份进行训练）- 单批次训练
+  discount_factor: 0.99    # 折扣因子γ（未来奖励的重要性）
+  lambda: 0.95             # GAE参数λ（优势函数计算中的权衡参数）
+  learning_rate: 1.0e-03   # 学习率（较高，适合单智能体训练）
+  learning_rate_scheduler: KLAdaptiveLR    # 学习率调度器：KL自适应学习率
+  learning_rate_scheduler_kwargs:          # 调度器参数
+    kl_threshold: 0.01                     # KL散度阈值（用于调整学习率）
+  state_preprocessor: RunningStandardScaler   # 状态预处理器：运行时标准化缩放器
+  state_preprocessor_kwargs: {"size": env.observation_space, "device": device}  # 预处理器参数
+  value_preprocessor: RunningStandardScaler   # 价值预处理器
+  value_preprocessor_kwargs: {"size": 1, "device": device}  # 价值预处理器参数
+  random_timesteps: 0      # 随机探索时间步数（0表示不使用）
+  learning_starts: 0       # 学习开始时间步数（0表示立即开始）
+  grad_norm_clip: 1.0      # 梯度范数裁剪（防止梯度爆炸）
+  ratio_clip: 0.2          # 比率裁剪范围（PPO的重要参数，较大值允许更大策略更新）
+  value_clip: 0.2          # 价值裁剪范围
+  clip_predicted_values: True   # 是否裁剪预测的价值
+  entropy_loss_scale: 0.005     # 熵损失缩放因子（鼓励探索，比MAPPO稍大）
+  value_loss_scale: 1.0         # 价值损失缩放因子
+  kl_threshold: 0.0             # KL散度阈值（0表示不限制）
+  rewards_shaper_scale: 1.0     # 奖励整形缩放因子
+  time_limit_bootstrap: False   # 不使用时间限制引导（单智能体通常不需要）
+  # 日志记录和检查点配置
   experiment:
-    directory: "centralized_MARL_flycrane_hover"
-    experiment_name: "bigbigNN_curr"
-    write_interval: 100
-    checkpoint_interval: 2500
+    directory: "centralized_MARL_flycrane_hover"  # 实验结果保存目录
+    experiment_name: "bigbigNN_curr"              # 实验名称
+    write_interval: 100                           # 日志写入间隔（每隔多少步记录一次）
+    checkpoint_interval: 2500                     # 检查点保存间隔（每隔多少步保存一次模型）
 
-    # wandb: True
-
-
+    # wandb: True  # 是否启用Weights & Biases日志记录（已注释）
 
 
-# Sequential trainer
+# 顺序训练器配置
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
-  class: SequentialTrainer
-  timesteps: 200000
-  environment_info: log
+  class: SequentialTrainer  # 使用顺序训练器
+  timesteps: 200000         # 总训练时间步数（比MAPPO少，因为是单智能体）
+  environment_info: log     # 环境信息记录方式

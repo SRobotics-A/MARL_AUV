@@ -4,40 +4,52 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-This script demonstrates how to simulate a quadcopter.
+DirectMARL环境测试脚本 - 多无人机悬停环境基础演示
 
+该脚本用于测试和演示DirectMARL架构下的多无人机悬停环境。
+主要功能包括：
+1. 创建多环境实例进行并行测试
+2. 实现基础的推力控制测试
+3. 支持视频录制功能用于结果可视化
+4. 验证环境的基本运行逻辑
+
+适用于：
+- DirectMARL环境功能验证
+- 控制器基础测试
+- 多环境并行运行测试
 """
 
-"""Launch Isaac Sim Simulator first."""
+"""启动Isaac Sim模拟器"""
 
 import argparse
 import torch
 
 from isaaclab.app import AppLauncher
 
-# add argparse arguments
-parser = argparse.ArgumentParser(description="This script demonstrates how to simulate a quadcopter.")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during execution.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+# 添加命令行参数配置
+parser = argparse.ArgumentParser(description="DirectMARL多无人机悬停环境测试脚本")
+parser.add_argument("--num_envs", type=int, default=1, help="要创建的环境数量（用于并行测试）")
+parser.add_argument("--video", action="store_true", default=False, help="是否录制执行过程视频")
+parser.add_argument("--video_length", type=int, default=200, help="录制视频的长度（步数）")
 
-# append AppLauncher cli args
+# 添加AppLauncher命令行参数
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
+# 解析命令行参数
 args_cli = parser.parse_args()
 if args_cli.video:
-    args_cli.enable_cameras = True
+    args_cli.enable_cameras = True  # 启用相机以支持视频录制
 
-# launch omniverse app
+# 启动Omniverse应用程序
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+"""主程序逻辑开始"""
 
 import csv
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
+# 导入自定义环境模块
 from MARL_mav_carry_ext.tasks.directMARL.hover.marl_hover_env import MARLHoverEnv
 from MARL_mav_carry_ext.tasks.directMARL.hover.marl_hover_env_cfg import MARLHoverEnvCfg
 
@@ -46,94 +58,99 @@ from isaaclab.utils.dict import print_dict
 
 
 def main():
-    """Main function."""
-    # create environment config
+    """主函数 - 执行环境测试逻辑"""
+    # 创建环境配置
     env_cfg = MARLHoverEnvCfg()
-    env_cfg.scene.num_envs = args_cli.num_envs
-    # setup RL environment
+    env_cfg.scene.num_envs = args_cli.num_envs  # 设置环境数量
+    
+    # 设置强化学习环境
     env = MARLHoverEnv(cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    
+    # 如果启用了视频录制功能
     if args_cli.video:
         video_kwargs = {
-            "video_folder": "./marl_videos",
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
+            "video_folder": "./marl_videos",           # 视频保存文件夹
+            "step_trigger": lambda step: step == 0,    # 触发录制的条件（第0步开始）
+            "video_length": args_cli.video_length,     # 视频长度
+            "disable_logger": True,                    # 禁用日志记录
         }
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        print_dict(video_kwargs, nesting=4)  # 打印视频配置信息
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)  # 包装环境以支持视频录制
 
-    count = 0
+    count = 0  # 步数计数器
 
-    # references for testing
-
+    # 测试参考位置配置（注释掉的伸展位置示例）
     stretch_position = torch.tensor(
         [
             [
                 0.27,
                 1.0867,
-                1.7,
+                1.7,       # 无人机1位置 [x, y, z]
                 0.27,
                 -1.0867,
-                1.7,
+                1.7,       # 无人机2位置 [x, y, z]
                 -1.1367,
                 0.0,
-                1.7,
+                1.7,       # 无人机3位置 [x, y, z]
             ]
         ],
         dtype=torch.float32,
     )
 
-    falcon1_geo_tensor = torch.zeros((env.num_envs, 12), device=env.device)
+    # 初始化各无人机的动作张量
+    falcon1_geo_tensor = torch.zeros((env.num_envs, 12), device=env.device)  # 几何控制指令
     falcon2_geo_tensor = torch.zeros((env.num_envs, 12), device=env.device)
     falcon3_geo_tensor = torch.zeros((env.num_envs, 12), device=env.device)
 
-    falcon1_acc_tensor = torch.zeros((env.num_envs, 3), device=env.device)
+    falcon1_acc_tensor = torch.zeros((env.num_envs, 3), device=env.device)   # 加速度控制指令
     falcon2_acc_tensor = torch.zeros((env.num_envs, 3), device=env.device)
     falcon3_acc_tensor = torch.zeros((env.num_envs, 3), device=env.device)
 
+    # 主循环 - 持续运行直到模拟器关闭
     while simulation_app.is_running():
-        with torch.inference_mode():
-            # step the environment
+        with torch.inference_mode():  # 启用推理模式以提高性能
+            # 每500步重置一次环境（避免累积误差）
             if count % 500 == 0:
                 env.reset()
-            # falcon1_geo_tensor[:, 0:3] = stretch_position[:, 0:3]
-            # falcon2_geo_tensor[:, 0:3] = stretch_position[:, 3:6]
-            # falcon3_geo_tensor[:, 0:3] = stretch_position[:, 6:9]
-            # action = {
-            #     "falcon1": falcon1_geo_tensor,
-            #     "falcon2": falcon2_geo_tensor,
-            #     "falcon3": falcon3_geo_tensor,
-            # }
-            falcon1_acc_tensor[:, 0] = 20
-            falcon2_acc_tensor[:, 0] = 20
-            falcon3_acc_tensor[:, 0] = 20
-            falcon1_acc_tensor[:, 2] = 5
-            falcon2_acc_tensor[:, 2] = 5
-            falcon3_acc_tensor[:, 2] = 5
+            
+            # 设置控制指令（当前使用简单的加速度控制）
+            # X方向推力：20N，Z方向推力：5N（对抗重力）
+            falcon1_acc_tensor[:, 0] = 20  # 无人机1 X方向推力
+            falcon2_acc_tensor[:, 0] = 20  # 无人机2 X方向推力
+            falcon3_acc_tensor[:, 0] = 20  # 无人机3 X方向推力
+            
+            falcon1_acc_tensor[:, 2] = 5   # 无人机1 Z方向推力
+            falcon2_acc_tensor[:, 2] = 5   # 无人机2 Z方向推力
+            falcon3_acc_tensor[:, 2] = 5   # 无人机3 Z方向推力
+            
+            # 构造动作字典
             action = {
                 "falcon1": falcon1_acc_tensor,
                 "falcon2": falcon2_acc_tensor,
                 "falcon3": falcon3_acc_tensor,
             }
+            
+            # 执行环境步进
             obs, rew, terminated, truncated, info = env.step(action)
-            terminated = list(terminated.values())[0]
-            truncated = list(truncated.values())[0]
+            
+            # 检查终止条件
+            terminated = list(terminated.values())[0]  # 获取终止状态
+            truncated = list(truncated.values())[0]    # 获取截断状态
+            
+            # 如果任一环境终止或截断，则打印重置信息
             if any(terminated) or any(truncated):
                 print("-" * 80)
-                print("[INFO]: Resetting environment...")
-            # update counter
-
-            # if args_cli.video:
-            #     if count/2 == args_cli.video_length:
-            # break
+                print("[INFO]: 环境重置中...")
+            
+            # 更新计数器
             count += 1
 
-    # close the simulator
+    # 关闭环境
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
+    # 运行主函数
     main()
-    # close sim app
+    # 关闭模拟器应用
     simulation_app.close()

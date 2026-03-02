@@ -13,6 +13,8 @@
 """首先启动 Isaac Sim 模拟器。"""
 
 import argparse
+import os
+import sys
 
 from isaaclab.app import AppLauncher
 
@@ -63,6 +65,10 @@ parser.add_argument(
 # 实时运行参数
 parser.add_argument("--real-time", action="store_true", default=False, 
                    help="尽可能以实时速度运行。")
+parser.add_argument("--max_steps", type=int, default=None,
+                   help="播放的最大步数（达到后自动退出）。")
+parser.add_argument("--progress_interval", type=int, default=1000,
+                   help="进度显示间隔（步数）。")
 
 # 添加 AppLauncher 的命令行参数
 # 这些参数用于配置 Isaac Sim 模拟器
@@ -83,16 +89,18 @@ simulation_app = app_launcher.app
 """以下为播放的主要逻辑部分。"""
 
 import gymnasium as gym
-import os
 import random
 import time
 import torch
 
+# 确保本地 skrl 可被导入（仓库内自带 skrl 目录）
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_local_skrl = os.path.join(_repo_root, "skrl")
+if _local_skrl not in sys.path:
+    sys.path.insert(0, _local_skrl)
+
 import skrl
 from packaging import version
-
-# 导入自定义绘图工具
-from MARL_mav_carry_ext.plotting_tools import DirectMARLPlotter
 
 # 注册 gym 环境（虽然代码中有注释，但实际可能在其他地方完成）
 
@@ -115,6 +123,27 @@ elif args_cli.ml_framework.startswith("jax"):
 
 # 导入自定义的环境包装器
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
+
+# 确保使用当前仓库中的扩展（避免同名包冲突）
+# 强制优先使用当前工程的扩展包，避免与其他同名包冲突
+_this_dir = os.path.dirname(__file__)
+_exts_dir = os.path.abspath(os.path.join(_this_dir, "..", "..", "exts", "MARL_mav_carry_ext"))
+# 移除可能的旧扩展路径（例如 cooperative 版本），确保注册的是当前包
+sys.path = [p for p in sys.path if "MARL_cooperative_aerial_manipulation_ext/exts/MARL_mav_carry_ext" not in p]
+# 将当前扩展路径放到最前
+if _exts_dir in sys.path:
+    sys.path.remove(_exts_dir)
+sys.path.insert(0, _exts_dir)
+
+# 如果同名模块已被加载，清理掉以便重新导入正确版本
+if "MARL_mav_carry_ext" in sys.modules:
+    del sys.modules["MARL_mav_carry_ext"]
+
+# 导入自定义绘图工具（需在路径调整后）
+from MARL_mav_carry_ext.plotting_tools import DirectMARLPlotter
+
+# 导入项目相关的任务模块
+import MARL_mav_carry_ext.tasks  # noqa: F401
 
 # 导入 IsaacLab 任务模块
 import isaaclab_tasks  # noqa: F401
@@ -231,9 +260,15 @@ def main():
     # 创建数据绘图器实例
     plotter = DirectMARLPlotter(env, control_mode=args_cli.control_mode)
 
+    # flyfollow 默认固定 500000 步（若未显式指定）
+    if args_cli.max_steps is None and args_cli.task and "flyfollow" in args_cli.task.lower():
+        args_cli.max_steps = 500000
+
     # 重置环境并获取初始观测
     obs, _ = env.reset()
     timestep = 0
+    last_progress = 0
+    start_wall_time = time.time()
 
     # 开始环境仿真循环
     while simulation_app.is_running():
@@ -258,7 +293,27 @@ def main():
             obs, _, _, _, _ = env.step(actions)
 
         timestep += 1
+
+        # 进度显示
+        if args_cli.max_steps is not None and args_cli.progress_interval > 0:
+            if timestep - last_progress >= args_cli.progress_interval:
+                elapsed = time.time() - start_wall_time
+                avg_step = elapsed / max(timestep, 1)
+                avg_fps = 1.0 / max(avg_step, 1e-9)
+                remaining_steps = max(args_cli.max_steps - timestep, 0)
+                eta = remaining_steps * avg_step
+                percent = 100.0 * timestep / args_cli.max_steps
+                print(
+                    f"[INFO] 播放进度: {timestep}/{args_cli.max_steps} ({percent:.2f}%), "
+                    f"剩余时间约 {eta/60:.1f} 分钟, "
+                    f"平均步耗时 {avg_step*1000:.2f} ms, 平均 FPS {avg_fps:.1f}"
+                )
+                last_progress = timestep
         
+        # 固定步数控制（达到上限自动退出）
+        if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
+            break
+
         # 视频录制控制逻辑
         if args_cli.video:
             # 当达到指定视频长度时退出播放循环

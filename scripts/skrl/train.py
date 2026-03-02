@@ -13,6 +13,7 @@
 """首先启动 Isaac Sim 模拟器。"""
 
 import argparse
+import os
 import sys
 
 from isaaclab.app import AppLauncher
@@ -48,6 +49,15 @@ parser.add_argument("--resume", action="store_true", default=False,
                    help="从检查点恢复训练。")
 parser.add_argument("--checkpoint", type=str, default=None, 
                    help="要恢复训练的检查点文件路径。")
+
+# TensorBoard 参数
+# TensorBoard 参数（用于可视化训练过程）
+parser.add_argument("--tensorboard", action="store_true", default=False,
+                   help="启动 TensorBoard 以查看训练日志。")
+parser.add_argument("--tensorboard_port", type=int, default=6006,
+                   help="TensorBoard 端口。")
+parser.add_argument("--tensorboard_host", type=str, default="127.0.0.1",
+                   help="TensorBoard 绑定地址。")
 
 # 机器学习框架和算法选择参数
 parser.add_argument(
@@ -87,9 +97,14 @@ simulation_app = app_launcher.app
 """以下为训练的主要逻辑部分。"""
 
 import gymnasium as gym
-import os
 import random
 from datetime import datetime
+
+# 确保本地 skrl 可被导入（仓库内自带 skrl 目录）
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_local_skrl = os.path.join(_repo_root, "skrl")
+if _local_skrl not in sys.path:
+    sys.path.insert(0, _local_skrl)
 
 import skrl
 from packaging import version
@@ -113,6 +128,21 @@ elif args_cli.ml_framework.startswith("jax"):
 
 # 导入自定义的环境包装器
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
+
+# 确保使用当前仓库中的扩展（避免同名包冲突）
+# 强制优先使用当前工程的扩展包，避免与其他同名包冲突
+_this_dir = os.path.dirname(__file__)
+_exts_dir = os.path.abspath(os.path.join(_this_dir, "..", "..", "exts", "MARL_mav_carry_ext"))
+# 移除可能的旧扩展路径（例如 cooperative 版本），确保注册的是当前包
+sys.path = [p for p in sys.path if "MARL_cooperative_aerial_manipulation_ext/exts/MARL_mav_carry_ext" not in p]
+# 将当前扩展路径放到最前
+if _exts_dir in sys.path:
+    sys.path.remove(_exts_dir)
+sys.path.insert(0, _exts_dir)
+
+# 如果同名模块已被加载，清理掉以便重新导入正确版本
+if "MARL_mav_carry_ext" in sys.modules:
+    del sys.modules["MARL_mav_carry_ext"]
 
 # 导入项目相关的任务模块
 import MARL_mav_carry_ext.tasks  # noqa: F401
@@ -224,6 +254,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+
+    # 启动 TensorBoard（可选）
+    if args_cli.tensorboard:
+        import shutil
+        import subprocess
+
+        tb_exe = shutil.which("tensorboard")
+        if tb_exe is None:
+            print("[WARN] 未找到 tensorboard 可执行文件。请先安装：pip install tensorboard")
+        else:
+            tb_logdir = log_root_path
+            print(f"[INFO] TensorBoard 日志目录: {tb_logdir}")
+            print(f"[INFO] 启动 TensorBoard: http://{args_cli.tensorboard_host}:{args_cli.tensorboard_port}")
+            subprocess.Popen(
+                [
+                    tb_exe,
+                    "--logdir",
+                    tb_logdir,
+                    "--host",
+                    args_cli.tensorboard_host,
+                    "--port",
+                    str(args_cli.tensorboard_port),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
     # 创建 Isaac 环境实例
     # 使用 Gymnasium 接口创建环境
