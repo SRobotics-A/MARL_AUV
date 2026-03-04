@@ -325,7 +325,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 if __name__ == "__main__":
     # 程序入口点
+    # 由于main函数被hydra_task_config装饰器修饰，需要通过hydra来正确提供配置参数
+    # Hydra装饰器会自动处理配置加载和参数传递
     print("正在运行主训练函数")
-    main()
+    main()  # 此处的main函数由Hydra负责配置参数注入，不需要手动传参
     # 关闭模拟器应用程序
     simulation_app.close()
