@@ -5,44 +5,28 @@
 
 from __future__ import annotations
 
-import copy
-import math
 import numpy as np
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 
 # 导入控制器模块
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
 # 导入低层控制工具函数
-from MARL_mav_carry_ext.tasks.managerbased.mdp_llc.utils import get_drone_pdist, get_drone_rpos
-
 # 导入IsaacLab相关模块
 import isaaclab.sim as sim_utils
 import isaacsim.core.utils.prims as prim_utils
 from isaacsim.core.prims import XFormPrim
-from isaaclab.assets import Articulation, RigidObject
+from isaaclab.assets import Articulation
 from isaaclab.envs import DirectMARLEnv
-from isaaclab.markers import VisualizationMarkers
-from isaaclab.sensors import ContactSensor
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils import CircularBuffer, DelayBuffer
+from isaaclab.utils import CircularBuffer
 from isaaclab.utils.math import (
-    compute_pose_error,
-    euler_xyz_from_quat,
     matrix_from_quat,
-    quat_error_magnitude,
     quat_from_angle_axis,
-    quat_from_euler_xyz,
-    quat_inv,
     quat_mul,
-    quat_apply,
-    quat_unique,
-    sample_uniform,
 )
-
-# 继承悬停环境作为基础
-from MARL_mav_carry_ext.tasks.directMARL.hover.marl_hover_env import MARLHoverEnv
 
 # 导入跟随环境配置
 from .marl_flyfollow_env_cfg import MARLFlyFollowEnvCfg
@@ -68,17 +52,28 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         """
         super().__init__(cfg, render_mode, **kwargs)
 
+        # 多无人机与控制模式配置
+        self._num_drones = cfg.num_drones
+        self._control_mode = cfg.control_mode
+
         # 目标相关配置
         self._num_targets = cfg.num_targets           # 目标数量
         self._target_values = torch.tensor(cfg.target_values, device=self.device)  # 各目标的价值
 
-        # 获取无人机机体和旋翼的body索引（查询robot_0即可，因为结构相同）
-        self._falcon_idx = torch.tensor(
-            self.robots[0].find_bodies(".*base_link")[0], device=self.device
-        )
-        self._falcon_rotor_idx = torch.tensor(
-            self.robots[0].find_bodies(".*rotor_.*")[0], device=self.device
-        )
+        # 每台无人机的机体与旋翼索引
+        self._base_body_ids = []
+        self._rotor_body_ids = []
+        for robot in self.robots:
+            self._base_body_ids.append(
+                torch.tensor(robot.find_bodies(".*base_link_inertia")[0], device=self.device)
+            )
+            self._rotor_body_ids.append(
+                torch.tensor(robot.find_bodies(".*rotor_.*")[0], device=self.device)
+            )
+        self._rotor_forces = [
+            torch.zeros(self.num_envs, len(rotor_ids), 3, device=self.device)
+            for rotor_ids in self._rotor_body_ids
+        ]
 
         # 观测缓冲区 - 用于存储历史观测值（支持部分观测模式）
         self._observation_buffers = {}
@@ -103,15 +98,8 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         self.prev_actions = {}
         for agent in self.cfg.possible_agents:
             self._setpoints[agent] = {}
-            # 根据控制模式初始化不同的动作维度
-            if self._control_mode == "geometric":
-                self.prev_actions[agent] = torch.zeros(
-                    self.num_envs, 12, device=self.device
-                )
-            elif self._control_mode == "ACCBR":
-                self.prev_actions[agent] = torch.zeros(
-                    self.num_envs, 6, device=self.device
-                )
+            action_dim = self.cfg.action_spaces[agent]
+            self.prev_actions[agent] = torch.zeros(self.num_envs, action_dim, device=self.device)
 
         # 无人机状态变量初始化
         self.drone_positions = torch.zeros(self.num_envs, self._num_drones, 3, device=self.device)
@@ -129,7 +117,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
         # 外环控制器（几何控制器）
         self.geo_controllers = {}
-        for i in range(self._num_drones):
+        for i in range(self.cfg.num_drones):
             self.geo_controllers[i] = GeometricController(self.num_envs, self._control_mode)
         self._ll_counter = 0                                                      # 低层控制计数器
         self._constant_yaw = torch.zeros([self.num_envs, 1], device=self.device)  # 恒定偏航角
@@ -169,79 +157,415 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
         # 奖励统计（用于日志记录）
         self._episode_sums = {
-            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            key: torch.zeros(
+                self.num_envs,
+                dtype=torch.float,
+                device=self.device,
+            )
             for key in [
-                "target_reward",        # 目标奖励
-                "distance_penalty",     # 距离惩罚
-                "proximity_reward",     # 接近奖励
+                "distance_reward",
+                "tracking_reward",
+                "action_smoothness",
+                "body_rate_penalty",
+                "velocity_penalty",
+                "force_penalty",
+                "height_reward",
+                "safety_penalty",
             ]
         }
+
+        # 性能指标
+        self.metrics = {}
+        self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["orientation_error"] = torch.zeros(
+            self.num_envs, device=self.device
+        )
+
+        # 终止条件缓冲区
+        self.falcon_fly_low = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.illegal_contact = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.drone_collision = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.body_pos_outside = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        # 所有目标都被捕获的标志
+        self.all_targets_captured = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        # 持续跟随计时器
+        self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
+        self.targets_out_of_bounds = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.time_out = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+
+        # 归一化配置参数
+        self._norm_pos_scale = self.cfg.bounding_box_threshold
+        self._norm_vel_scale = 5.0
+        self._norm_dist_scale = self.cfg.bounding_box_threshold * 2
 
         # 初始化目标位置
         self._reset_targets(torch.arange(self.num_envs, device=self.device))
 
+        # 调试可视化设置
+        self.set_debug_vis(cfg.debug_vis)
+
     def _setup_scene(self):
         """设置场景：在悬停环境基础上添加跟随任务特有的元素"""
-        # # 先创建flycrane基础场景（无人机、传感器、地面、灯光）
-        # super()._setup_scene()
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # 轨道场景（仅用于可视化）
-        track_cfg = sim_utils.UsdFileCfg(
-            usd_path=self.cfg.track_usd_path,  # 轨道模型路径
-            scale=(0.1, 1.0, 1.0),            # 缩放比例
+        # 加载整套赛道与目标小车场景（flyfollow.usda内已包含轨道与目标初始位置）
+        flyfollow_scene_path = (
+            Path(__file__).resolve().parents[3] / "assets/data/AMR/flyfollow/flyfollow.usda"
         )
-        sim_utils.spawn_from_usd(
-            prim_path="/World/Track",
-            cfg=track_cfg,
-            translation=(-20.0, -21.0, 0.0),  # 位置
-            orientation=(0.7071068, 0.0, 0.0, -0.7071068),  # 朝向（绕y轴旋转90度）
-        )
+        scene_cfg = sim_utils.UsdFileCfg(usd_path=str(flyfollow_scene_path))
+        sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
 
-        # 目标小车（仅用于可视化）：使用XFormPrim避免RigidBodyAPI依赖
-        # 先创建父级prim，确保正则路径可解析
-        prim_utils.create_prim("/World/envs/env_0/targets", "Xform")
+        # Debug: print env roots and immediate children to verify USD hierarchy
+        try:
+            envs_children = sim_utils.get_all_matching_child_prims("/World/envs", depth=1)
+            print(f"[flyfollow] /World/envs children: {[p.GetName() for p in envs_children]}")
+            candidate_roots = [
+                "/World/envs/env_0",
+                "/World/envs/env_0/World",
+                "/World/envs/env_0/World/World",
+                "/World/envs/env_0/env_0",
+                "/World/envs/env_0/env_0/World",
+            ]
+            for root in candidate_roots:
+                if prim_utils.is_prim_path_valid(root):
+                    children = sim_utils.get_all_matching_child_prims(root, depth=1)
+                    print(f"[flyfollow] {root} children: {[p.GetName() for p in children]}")
+        except Exception as exc:
+            print(f"[flyfollow] Debug prim listing failed: {exc}")
+
+        # 复制 env_0 到其它环境
+        self.scene.clone_environments(copy_from_source=False)
+
+        # 解析 env_0 的实际根路径（有的 USD 会嵌一层 "World"）
+        env_root_base = "/World/envs/env_0"
+        if not prim_utils.is_prim_path_valid(env_root_base):
+            raise RuntimeError(f"Expected environment root prim at {env_root_base}, but it does not exist.")
+        env_root = env_root_base
+        if prim_utils.is_prim_path_valid(f"{env_root_base}/World"):
+            env_root = f"{env_root_base}/World"
+
+        def resolve_agent_prim_path(agent_name: str) -> str:
+            roots = [env_root]
+            if prim_utils.is_prim_path_valid(f"{env_root}/World"):
+                roots.append(f"{env_root}/World")
+            if prim_utils.is_prim_path_valid(f"{env_root}/env_0"):
+                roots.append(f"{env_root}/env_0")
+            for root in roots:
+                candidate_paths = [
+                    f"{root}/{agent_name}/Robot",
+                    f"{root}/{agent_name}/Falcon",
+                    f"{root}/{agent_name}",
+                ]
+                for path in candidate_paths:
+                    if prim_utils.is_prim_path_valid(path):
+                        return path
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: p.GetName() == agent_name
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: agent_name in p.GetName()
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+
+            prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/{agent_name}(/.*)?")
+            if prim is None:
+                prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/.*[Ff]alcon.*")
+            if prim is not None:
+                return prim.GetPath().pathString
+
+            child_names = []
+            try:
+                children = sim_utils.get_all_matching_child_prims(env_root_base, depth=1)
+                child_names = [child.GetName() for child in children if child.GetName()]
+            except Exception:
+                child_names = []
+            raise RuntimeError(
+                f"Could not resolve prim path for agent {agent_name} under {env_root_base}. "
+                f"Direct children: {child_names}"
+            )
+
+        # 创建多台独立无人机（使用 USD 中已有 prim）
+        self.robots = []
+        self._usd_root_state_rel = torch.zeros(
+            len(self.cfg.possible_agents), 7, device=self.device
+        )
+        for i, agent in enumerate(self.cfg.possible_agents):
+            env0_agent_prim = resolve_agent_prim_path(agent)
+            if env0_agent_prim.startswith(env_root_base):
+                env_agent_prim_pattern = env0_agent_prim.replace(
+                    env_root_base, "/World/envs/env_.*", 1
+                )
+            elif "/env_0" in env0_agent_prim:
+                env_agent_prim_pattern = env0_agent_prim.replace("/env_0", "/env_.*", 1)
+            else:
+                raise RuntimeError(
+                    f"Resolved prim path {env0_agent_prim} does not include env_0; cannot build pattern."
+                )
+            robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_agent_prim_pattern)
+            robot_cfg.spawn = None
+            robot = Articulation(robot_cfg)
+            self.robots.append(robot)
+            self.scene.articulations[f"robot_{i}"] = robot
+
+            # Cache USD-defined initial pose (env_0) so reset can restore it
+            try:
+                prim = XFormPrim(env0_agent_prim)
+                pos, ori = prim.get_world_poses()
+                self._usd_root_state_rel[i, :3] = pos[0] - self.scene.env_origins[0]
+                self._usd_root_state_rel[i, 3:7] = ori[0]
+            except Exception as exc:
+                print(f"[flyfollow] Failed to read USD pose for {env0_agent_prim}: {exc}")
+        if self.robots:
+            self.scene.articulations["robot"] = self.robots[0]
+
+        # 添加灯光
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+        # 目标小车（仅用于可视化）：直接引用 flyfollow.usda 中 env_0 的目标 prim
         self._target_prims: list[XFormPrim] = []
-        for i in range(self.cfg.num_targets):
-            prim_path = f"/World/envs/env_0/targets/target_{i}"
-            target_cfg = sim_utils.UsdFileCfg(usd_path=self.cfg.target_usd_path)  # 目标模型路径
-            sim_utils.spawn_from_usd(prim_path=prim_path, cfg=target_cfg)
-            self._target_prims.append(XFormPrim(prim_path))
+        self._usd_target_positions_rel = torch.zeros(self.cfg.num_targets, 3, device=self.device)
+        self._usd_target_orientations = torch.zeros(self.cfg.num_targets, 4, device=self.device)
+        target_names = [
+            "nova_carter_sim_optimized",
+            "nova_carter_sim_optimized_01",
+            "nova_carter_sim_optimized_02",
+            "nova_carter_sim_optimized_03",
+        ]
+        for name in target_names[: self.cfg.num_targets]:
+            prim_path = f"{env_root}/{name}"
+            prim = XFormPrim(prim_path)
+            self._target_prims.append(prim)
+            try:
+                pos, ori = prim.get_world_poses()
+                idx = len(self._target_prims) - 1
+                self._usd_target_positions_rel[idx, :] = pos[0] - self.scene.env_origins[0]
+                self._usd_target_orientations[idx, :] = ori[0]
+            except Exception as exc:
+                print(f"[flyfollow] Failed to read USD target pose for {prim_path}: {exc}")
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
-        """物理步骤前处理：先执行基础控制，再更新目标位置"""
-        # 先执行父类动作处理与控制（无人机控制）
-        super()._pre_physics_step(actions)
-        # 再更新目标小车位置
+        """物理步骤前处理：解析动作并更新目标位置"""
+        # 保存上一时刻动作并更新当前动作
+        for agent in self.cfg.possible_agents:
+            self.prev_actions[agent][:] = self.actions[agent]
+            self.actions[agent][:] = actions[agent]
+
+        # 解析每个无人机动作
+        for drone, action in actions.items():
+            if self._control_mode == "geometric":
+                # 几何控制模式：12维动作 [pos, lin_vel, lin_acc, jerk]
+                self._setpoints[drone]["pos"] = action[:, :3]
+                self._setpoints[drone]["lin_vel"] = action[:, 3:6]
+                self._setpoints[drone]["lin_acc"] = action[:, 6:9]
+                self._setpoints[drone]["jerk"] = action[:, 9:12]
+            elif self._control_mode == "ACCBR":
+                # ACCBR模式：优先支持6维 [lin_acc(3) + body_rates(3)]
+                self._setpoints[drone]["lin_acc"] = action[:, :3]
+                if action.shape[-1] >= 6:
+                    self._setpoints[drone]["body_rates"] = action[:, 3:6]
+                else:
+                    # 兼容5维：body_rates仅xy，z保持恒定
+                    self._setpoints[drone]["body_rates"] = torch.cat(
+                        (action[:, 3:], self._constant_yaw), dim=-1
+                    )
+
+            # 维持恒定偏航角设定
+            self._setpoints[drone]["yaw"] = self._constant_yaw
+            self._setpoints[drone]["yaw_rate"] = self._constant_yaw
+            self._setpoints[drone]["yaw_acc"] = self._constant_yaw
+
+        # 更新目标小车位置
         self._update_targets()
+
+    def _apply_action(self) -> None:
+        """应用控制动作：计算并施加推力和力矩到无人机"""
+        if self._ll_counter % self.cfg.low_level_decimation == 0:
+            # 读取无人机当前状态
+            for i, robot in enumerate(self.robots):
+                root_state = robot.data.root_state_w
+                self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+                self.drone_orientations[:, i] = root_state[:, 3:7]
+                self.drone_linear_velocities[:, i] = root_state[:, 7:10]
+                self.drone_angular_velocities[:, i] = root_state[:, 10:13]
+
+                body_acc = robot.data.body_acc_w
+                self.drone_linear_accelerations[:, i] = body_acc[:, 0, :3]
+                self.drone_angular_accelerations[:, i] = body_acc[:, 0, 3:6]
+
+            # 计算每架无人机控制指令
+            for i in range(self._num_drones):
+                drone_states: dict = {}
+                drone_states["pos"] = self.drone_positions[:, i]
+                drone_states["quat"] = self.drone_orientations[:, i]
+                drone_states["lin_vel"] = self.drone_linear_velocities[:, i]
+                drone_states["ang_vel"] = self.drone_angular_velocities[:, i]
+                drone_states["lin_acc"] = self.drone_linear_accelerations[:, i]
+                drone_states["ang_acc"] = self.drone_angular_accelerations[:, i]
+
+                # jerk
+                self._drone_jerk[:, i] = (drone_states["lin_acc"] - self._drone_prev_acc[:, i]) / (self.step_dt)
+                drone_states["jerk"] = self._drone_jerk[:, i]
+                self._drone_prev_acc[:, i] = drone_states["lin_acc"]
+
+                # 外环几何控制器
+                agent = self.cfg.possible_agents[i]
+                alpha_cmd, acc_load, acc_cmd, q_cmd = self.geo_controllers[i].getCommand(
+                    drone_states, self._forces[i], self._setpoints[agent]
+                )
+
+                # 内环INDI控制器
+                target_rpm = self._indi_controllers[i].getCommand(
+                    drone_states, self._forces[i], alpha_cmd, acc_cmd, acc_load
+                )
+
+                # 电机模型
+                thrusts, moments = self.motor_models[i].get_motor_thrusts_moments(target_rpm, self.sampling_time)
+                self._forces[i][..., 2] = thrusts
+
+                self._rotor_forces[i][:] = 0.0
+                self._rotor_forces[i][..., 2] = thrusts
+
+                self._moments[:, i, :] = 0.0
+                self._moments[:, i, 2] = moments.sum(-1)
+
+            self._ll_counter = 0
+
+        self._ll_counter += 1
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        """设置调试可视化"""
+        if not debug_vis:
+            return
+
+        # Create simple shape prims for visualization to avoid PointInstancer warnings
+        if not hasattr(self, "_vis_root"):
+            self._vis_root = "/World/envs/env_0/Visuals/FlyFollow"
+        if not prim_utils.is_prim_path_valid(self._vis_root):
+            prim_utils.create_prim(self._vis_root, "Xform")
+
+        targets_root = f"{self._vis_root}/targets"
+        drones_root = f"{self._vis_root}/drones"
+        if not prim_utils.is_prim_path_valid(targets_root):
+            prim_utils.create_prim(targets_root, "Xform")
+        if not prim_utils.is_prim_path_valid(drones_root):
+            prim_utils.create_prim(drones_root, "Xform")
+
+        # Cache visualization prims
+        if not hasattr(self, "_target_vis_prims"):
+            self._target_vis_prims = []
+            sphere_cfg = sim_utils.SphereCfg(radius=0.15)
+            for i in range(self.cfg.num_targets):
+                prim_path = f"{targets_root}/target_{i}"
+                if not prim_utils.is_prim_path_valid(prim_path):
+                    sim_utils.spawn_sphere(prim_path=prim_path, cfg=sphere_cfg)
+                self._target_vis_prims.append(XFormPrim(prim_path))
+
+        if not hasattr(self, "_drone_vis_prims"):
+            self._drone_vis_prims = []
+            cuboid_cfg = sim_utils.CuboidCfg(size=(0.25, 0.25, 0.06))
+            for i in range(self._num_drones):
+                prim_path = f"{drones_root}/drone_{i}"
+                if not prim_utils.is_prim_path_valid(prim_path):
+                    sim_utils.spawn_cuboid(prim_path=prim_path, cfg=cuboid_cfg)
+                self._drone_vis_prims.append(XFormPrim(prim_path))
+
+    def _debug_vis_callback(self, event):
+        """调试可视化回调函数"""
+        if not self.robots:
+            return
+        if not self.robots[0].is_initialized:
+            return
+        if not hasattr(self, "_target_vis_prims") or not hasattr(self, "_drone_vis_prims"):
+            return
+
+        # 仅显示 env_0 的目标与无人机
+        target_pos = self._target_positions[0] + self.scene.env_origins[0]
+        target_ori = self._target_orientations[0]
+        for i, prim in enumerate(self._target_vis_prims):
+            prim.set_world_poses(
+                positions=target_pos[i : i + 1],
+                orientations=target_ori[i : i + 1],
+            )
+
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            pos = root_state[0:1, :3]
+            ori = root_state[0:1, 3:7]
+            self._drone_vis_prims[i].set_world_poses(positions=pos, orientations=ori)
+
+        # 施加力矩到机体，施加推力到旋翼
+        for i, robot in enumerate(self.robots):
+            body_torque = self._moments[:, i : i + 1, :]
+            robot.set_external_force_and_torque(
+                torch.zeros_like(body_torque),
+                body_torque,
+                body_ids=self._base_body_ids[i],
+            )
+            robot.set_external_force_and_torque(
+                self._rotor_forces[i],
+                torch.zeros_like(self._rotor_forces[i]),
+                body_ids=self._rotor_body_ids[i],
+            )
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         """获取观测值：构建各智能体的局部观测空间"""
-        # 获取无人机状态（位置 + 速度）
-        self.drone_positions[:] = (
-            self.robot.data.body_com_state_w[:, self._falcon_idx, :3] - self.scene.env_origins.unsqueeze(1)
-        )
-        self.drone_linear_velocities[:] = self.robot.data.body_com_state_w[:, self._falcon_idx, 7:10]
+        # 获取无人机状态（位置 + 姿态 + 速度）
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+            self.drone_orientations[:, i] = root_state[:, 3:7]
+            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
+            self.drone_angular_velocities[:, i] = root_state[:, 10:13]
+
+        # 计算旋转矩阵
+        self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
 
         # 提取XY平面坐标用于2D跟随任务
         drone_pos_xy = self.drone_positions[:, :, :2]
+        drone_lin_vel_xy = self.drone_linear_velocities[:, :, :2]
         target_pos_xy = self._target_positions[:, :, :2]
+        target_vel_xy = self._target_velocities[:, :, :2]
 
         # 计算无人机到各目标的相对位置与距离（仅XY平面）
         rel_xy = target_pos_xy.unsqueeze(1) - drone_pos_xy.unsqueeze(2)  # (num_envs, num_drones, num_targets, 2)
         dist_xy = torch.norm(rel_xy, dim=-1)  # 各无人机到各目标的XY平面距离
+        closest_drone = dist_xy.argmin(dim=1)  # (num_envs, num_targets)
+        closest_drone_one_hot = torch.zeros(
+            self.num_envs, self._num_targets, self._num_drones, device=self.device
+        )
+        closest_drone_one_hot.scatter_(2, closest_drone.unsqueeze(-1), 1.0)
 
-        obs = {}
-        for i, agent in enumerate(self.cfg.possible_agents):
+        observations = {}
+        for drone_idx, agent in enumerate(self.cfg.possible_agents):
             # one-hot标识当前智能体（用于区分不同无人机的观测）
             one_hot = torch.zeros(self.num_envs, self._num_drones, device=self.device)
-            one_hot[:, i] = 1.0
+            one_hot[:, drone_idx] = 1.0
 
             # 当前无人机到各目标的相对位置和距离
-            own_rel_xy = rel_xy[:, i].reshape(self.num_envs, -1)  # 展平为(num_envs, num_targets*2)
-            own_dist = dist_xy[:, i]  # (num_envs, num_targets)
+            own_rel_xy = rel_xy[:, drone_idx].reshape(self.num_envs, -1)  # 展平为(num_envs, num_targets*2)
+            own_dist = dist_xy[:, drone_idx]  # (num_envs, num_targets)
 
             # 其他无人机到各目标的距离（用于协作信息）
-            other_ids = [j for j in range(self._num_drones) if j != i]
+            other_ids = [j for j in range(self._num_drones) if j != drone_idx]
+            other_rel_xy = (
+                drone_pos_xy[:, other_ids] - drone_pos_xy[:, drone_idx].unsqueeze(1)
+            ).reshape(self.num_envs, -1)
             other_dist = dist_xy[:, other_ids].reshape(self.num_envs, -1)  # (num_envs, (num_drones-1)*num_targets)
 
             # 目标价值信息
@@ -251,11 +575,16 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             obs_t = torch.cat(
                 (
                     one_hot,                    # 智能体标识
-                    self.drone_positions[:, i], # 本机位置(3维)
-                    self.drone_linear_velocities[:, i], # 本机速度(3维)
+                    drone_pos_xy[:, drone_idx],          # 本机位置XY(2维)
+                    self.drone_rot_matrices[:, drone_idx].reshape(self.num_envs, -1),  # 本机姿态(9维)
+                    drone_lin_vel_xy[:, drone_idx],      # 本机速度XY(2维)
+                    self.drone_angular_velocities[:, drone_idx],  # 本机角速度(3维)
                     own_rel_xy,                 # 到各目标相对位置(2*num_targets维)
                     own_dist,                   # 到各目标距离(num_targets维)
+                    other_rel_xy,               # 其他无人机相对位置XY(2*(num_drones-1)维)
                     other_dist,                 # 其他无人机到目标距离((num_drones-1)*num_targets维)
+                    target_vel_xy.reshape(self.num_envs, -1),  # 目标速度XY(2*num_targets维)
+                    closest_drone_one_hot.reshape(self.num_envs, -1),  # 最近无人机one-hot(num_targets*num_drones维)
                     target_values,              # 目标价值(num_targets维)
                 ),
                 dim=-1,
@@ -263,81 +592,148 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
             # 存入观测缓冲区并返回展平后的观测
             self._observation_buffers[agent].append(obs_t)
-            obs[agent] = self._observation_buffers[agent].buffer.reshape(self.num_envs, -1)
+            observations[agent] = self._observation_buffers[agent].buffer.reshape(self.num_envs, -1)
 
-        return obs
+        return observations
+
+    def _get_states(self) -> torch.Tensor:
+        """
+        获取全局状态（评论家输入）
+        
+        包含所有无人机和目标的完整状态信息，用于集中式训练。
+        """
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+            self.drone_orientations[:, i] = root_state[:, 3:7]
+            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
+            self.drone_angular_velocities[:, i] = root_state[:, 10:13]
+        self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
+
+        states = torch.cat(
+            (
+                self.drone_positions.view(self.num_envs, -1),  # 无人机位置 (9)
+                self.drone_rot_matrices.view(self.num_envs, -1),  # 旋转矩阵 (27)
+                self.drone_linear_velocities.view(self.num_envs, -1),  # 线速度 (9)
+                self.drone_angular_velocities.view(self.num_envs, -1),  # 角速度 (9)
+                self._target_positions.view(self.num_envs, -1),  # 目标位置 (12)
+                self._target_velocities.view(self.num_envs, -1),  # 目标速度 (12)
+                self._target_claimed.float().view(self.num_envs, -1),  # 捕获状态 (4)
+                self._target_values.unsqueeze(0).repeat(self.num_envs, 1),  # 目标价值 (4)
+            ),
+            dim=-1,
+        )
+        return states
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         """计算奖励函数：多目标优化的奖励设计"""
-        # 计算奖励所需的无人机位置
-        self.drone_positions[:] = (
-            self.robot.data.body_com_state_w[:, self._falcon_idx, :3] - self.scene.env_origins.unsqueeze(1)
-        )
+        # 更新无人机状态
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+            self.drone_orientations[:, i] = root_state[:, 3:7]
+            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
+            self.drone_angular_velocities[:, i] = root_state[:, 10:13]
+
         drone_pos_xy = self.drone_positions[:, :, :2]
+        drone_vel_xy = self.drone_linear_velocities[:, :, :2]
         target_pos_xy = self._target_positions[:, :, :2]
 
         # 计算相对位置和距离
         rel_xy = target_pos_xy.unsqueeze(1) - drone_pos_xy.unsqueeze(2)
         dist_xy = torch.norm(rel_xy, dim=-1)  # (num_envs, num_drones, num_targets)
+        min_dist = dist_xy.min(dim=-1).values  # (num_envs, num_drones)
 
-        # 距离相关统计
-        mean_dist = dist_xy.mean(dim=-1)      # 平均距离 (num_envs, num_drones)
-        min_dist = dist_xy.min(dim=-1).values # 最近距离 (num_envs, num_drones)
+        # 1) 距离奖励：越接近目标越大
+        distance_reward = self.cfg.distance_reward_weight * torch.exp(-min_dist)
 
-        # 距离惩罚：鼓励无人机靠近目标
-        distance_penalty = self.cfg.distance_penalty_weight * (
-            self.cfg.mean_distance_weight * mean_dist + self.cfg.min_distance_weight * min_dist
-        )
-        
-        # 接近奖励：指数衰减形式，距离越近奖励越高
-        proximity_reward = self.cfg.proximity_reward_weight * torch.exp(-min_dist / self.cfg.proximity_sigma)
-
-        # 目标奖励：当无人机首次成功跟踪目标时获得相应价值奖励
-        target_reward = torch.zeros_like(mean_dist)  # 初始化为0
-
-        # 找到每个目标最近的无人机
+        # 2) 追踪奖励：每个目标最近的无人机在距离阈值内获得目标价值奖励
         closest_dist, closest_drone = dist_xy.min(dim=1)  # (num_envs, num_targets)
-        # 判断是否有无人机在跟踪距离内
-        has_tracker = closest_dist <= self.cfg.track_distance_xy
-        # 找到新被认领的目标（之前未被认领但现在被跟踪）
-        newly_claimed = has_tracker & (~self._target_claimed)
-
-        # 为新认领的目标分配奖励
-        if newly_claimed.any():
+        within_track = closest_dist <= self.cfg.track_distance_xy
+        tracking_reward = torch.zeros_like(min_dist)
+        if within_track.any():
             for t in range(self._num_targets):
-                claim_envs = newly_claimed[:, t]
-                if not claim_envs.any():
+                env_mask = within_track[:, t]
+                if not env_mask.any():
                     continue
-                # 获取负责跟踪该目标的无人机ID
-                drone_ids = closest_drone[claim_envs, t]
-                # 给对应的无人机分配目标价值奖励
-                target_reward[claim_envs, drone_ids] += self._target_values[t]
-                # 标记目标已被认领并记录分配关系
-                self._target_claimed[claim_envs, t] = True
-                self._target_assignment[claim_envs, t] = drone_ids
+                drone_ids = closest_drone[env_mask, t]
+                tracking_reward[env_mask, drone_ids] += self._target_values[t]
+        tracking_reward = self.cfg.tracking_reward_weight * tracking_reward
 
-        # 总奖励：目标奖励 + (接近奖励 - 距离惩罚)
-        total_reward = target_reward + (proximity_reward - distance_penalty) * self.step_dt
+        # 3) 动作平滑性奖励
+        current_actions = torch.stack(
+            [self.actions[agent] for agent in self.cfg.possible_agents], dim=1
+        )
+        prev_actions = torch.stack(
+            [self.prev_actions[agent] for agent in self.cfg.possible_agents], dim=1
+        )
+        action_diff = (current_actions - prev_actions).abs().mean(dim=-1)
+        action_smoothness = self.cfg.action_smoothness_weight * torch.exp(-action_diff)
 
-        # 累计奖励用于日志记录
-        # 记录每个环境的总目标奖励（对 3 个无人机求和）
-        self._episode_sums["target_reward"] += target_reward.sum(dim=-1)
-        # 记录每个环境的距离惩罚与接近奖励（对 3 个无人机求和）
-        self._episode_sums["distance_penalty"] += distance_penalty.sum(dim=-1)
-        self._episode_sums["proximity_reward"] += proximity_reward.sum(dim=-1)
+        # 4) 机体角速率惩罚
+        body_rate_penalty = self.cfg.body_rate_penalty_weight * torch.norm(
+            self.drone_angular_velocities, dim=-1
+        )
 
-        # 为每个智能体分配对应的奖励
-        rewards = {}
-        for i, agent in enumerate(self.cfg.possible_agents):
-            rewards[agent] = total_reward[:, i]
+        # 5) 速度惩罚
+        velocity_penalty = self.cfg.velocity_penalty_weight * torch.norm(
+            drone_vel_xy, dim=-1
+        )
+
+        # 6) 推力惩罚
+        thrust_norm = torch.stack(
+            [torch.max(f[..., 2], dim=-1).values for f in self._forces], dim=1
+        ) / self.cfg.max_thrust_pp
+        force_penalty = self.cfg.force_penalty_weight * thrust_norm
+
+        # 7) 高度奖励
+        height_error = (self.drone_positions[:, :, 2] - self.cfg.desired_height).abs()
+        height_reward = self.cfg.height_reward_weight * torch.exp(-height_error)
+
+        # 8) 安全惩罚（碰撞 + 越界 + 过低）
+        pos_xy = self.drone_positions[:, :, :2]
+        diff = pos_xy.unsqueeze(2) - pos_xy.unsqueeze(1)
+        dist = torch.norm(diff, dim=-1)
+        eye = torch.eye(self._num_drones, device=self.device).bool()
+        dist.masked_fill_(eye.unsqueeze(0), float("inf"))
+        min_sep = dist.min(dim=-1).values
+        collision = min_sep < self.cfg.drone_collision_threshold
+        out_of_bounds = (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1)
+        fly_low = self.drone_positions[:, :, 2] < self.cfg.min_altitude
+        safety_violation = collision | out_of_bounds | fly_low
+        safety_penalty = self.cfg.safety_penalty_weight * safety_violation.float()
+
+        # 汇总奖励（按每个无人机）
+        total_reward = (
+            distance_reward
+            + tracking_reward
+            + action_smoothness
+            + height_reward
+            - body_rate_penalty
+            - velocity_penalty
+            - force_penalty
+            - safety_penalty
+        ) * self.step_dt
+
+        # 记录日志（按环境求和）
+        self._episode_sums["distance_reward"] += distance_reward.sum(dim=-1)
+        self._episode_sums["tracking_reward"] += tracking_reward.sum(dim=-1)
+        self._episode_sums["action_smoothness"] += action_smoothness.sum(dim=-1)
+        self._episode_sums["body_rate_penalty"] += body_rate_penalty.sum(dim=-1)
+        self._episode_sums["velocity_penalty"] += velocity_penalty.sum(dim=-1)
+        self._episode_sums["force_penalty"] += force_penalty.sum(dim=-1)
+        self._episode_sums["height_reward"] += height_reward.sum(dim=-1)
+        self._episode_sums["safety_penalty"] += safety_penalty.sum(dim=-1)
+
+        rewards = {agent: total_reward[:, i] for i, agent in enumerate(self.cfg.possible_agents)}
         return rewards
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """判断终止条件"""
         # 获取无人机位置用于终止判断
-        self.drone_positions[:] = (
-            self.robot.data.body_com_state_w[:, self._falcon_idx, :3] - self.scene.env_origins.unsqueeze(1)
-        )
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
 
         # 高度过低终止：防止撞击地面
         falcon_fly_low = (self.drone_positions[:, :, 2] < self.cfg.min_altitude).any(dim=-1)
@@ -352,6 +748,29 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         terminations = falcon_fly_low | body_pos_outside
         timed_outs = self.time_out
 
+        # 调试日志（每步）- 记录到全局 log 以及每个 agent 的 extras 中
+        fly_low_rate = falcon_fly_low.float().mean()
+        out_of_bounds_rate = body_pos_outside.float().mean()
+        time_out_rate = self.time_out.float().mean()
+        any_rate = terminations.float().mean()
+        min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
+        self.extras["log"] = {
+            "Debug/Termination/fly_low_rate": fly_low_rate,
+            "Debug/Termination/out_of_bounds_rate": out_of_bounds_rate,
+            "Debug/Termination/time_out_rate": time_out_rate,
+            "Debug/Termination/any_rate": any_rate,
+            "Debug/Termination/min_height": min_height,
+        }
+        for agent in self.cfg.possible_agents:
+            if "log" not in self.extras[agent]:
+                self.extras[agent]["log"] = {}
+            log = self.extras[agent]["log"]
+            log["Debug/Termination/fly_low_rate"] = fly_low_rate
+            log["Debug/Termination/out_of_bounds_rate"] = out_of_bounds_rate
+            log["Debug/Termination/time_out_rate"] = time_out_rate
+            log["Debug/Termination/any_rate"] = any_rate
+            log["Debug/Termination/min_height"] = min_height
+
         # 所有智能体共享相同终止信号
         terminated = {agent: terminations for agent in self.cfg.possible_agents}
         time_outs = {agent: timed_outs for agent in self.cfg.possible_agents}
@@ -361,13 +780,24 @@ class MARLFlyFollowEnv(DirectMARLEnv):
     def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None):
         """重置指定环境索引"""
         if env_ids is None:
-            env_ids = self.robot._ALL_INDICES
+            env_ids = torch.arange(self.num_envs, device=self.device)
 
         # 重置articulation和rigid body属性
         from isaaclab.envs import DirectMARLEnv
 
         # 基类重置（包含场景和事件）
         DirectMARLEnv._reset_idx(self, env_ids)
+
+        # 还原无人机到 USD 中定义的初始位姿（覆盖 reset_base 的随机化）
+        if hasattr(self, "_usd_root_state_rel") and self._usd_root_state_rel is not None:
+            env_origins = self.scene.env_origins[env_ids]
+            num_ids = env_ids.numel()
+            zeros_vel = torch.zeros(num_ids, 6, device=self.device)
+            for i, robot in enumerate(self.robots):
+                pos = self._usd_root_state_rel[i, :3].unsqueeze(0).repeat(num_ids, 1) + env_origins
+                ori = self._usd_root_state_rel[i, 3:7].unsqueeze(0).repeat(num_ids, 1)
+                root_state = torch.cat([pos, ori, zeros_vel], dim=-1)
+                robot.write_root_state_to_sim(root_state, env_ids=env_ids)
 
         # 重置目标状态
         self._reset_targets(env_ids)
@@ -381,23 +811,38 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 日志记录初始化
         if "log" not in self.extras:
             self.extras["log"] = dict()
+        for agent in self.cfg.possible_agents:
+            if "log" not in self.extras[agent]:
+                self.extras[agent]["log"] = dict()
 
         # 记录终止原因统计
-        self.drone_positions[:] = (
-            self.robot.data.body_com_state_w[:, self._falcon_idx, :3] - self.scene.env_origins.unsqueeze(1)
-        )
-        self.extras["log"]["Episode_Termination/falcon_fly_low"] = torch.count_nonzero(
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+        fly_low_count = torch.count_nonzero(
             (self.drone_positions[:, :, 2] < self.cfg.min_altitude).any(dim=-1)[env_ids]
         ).item()
-        self.extras["log"]["Episode_Termination/bounding_box"] = torch.count_nonzero(
+        out_of_bounds_count = torch.count_nonzero(
             (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1).any(dim=-1)[env_ids]
         ).item()
-        self.extras["log"]["Episode_Termination/time_out"] = torch.count_nonzero(self.time_out[env_ids]).item()
+        time_out_count = torch.count_nonzero(self.time_out[env_ids]).item()
+        self.extras["log"]["Episode_Termination/falcon_fly_low"] = fly_low_count
+        self.extras["log"]["Episode_Termination/bounding_box"] = out_of_bounds_count
+        self.extras["log"]["Episode_Termination/time_out"] = time_out_count
+        for agent in self.cfg.possible_agents:
+            log = self.extras[agent]["log"]
+            log["Episode_Termination/falcon_fly_low"] = fly_low_count
+            log["Episode_Termination/bounding_box"] = out_of_bounds_count
+            log["Episode_Termination/time_out"] = time_out_count
 
         # 记录奖励成分平均值
         for key in self._episode_sums.keys():
             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
             self.extras["log"]["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            for agent in self.cfg.possible_agents:
+                self.extras[agent]["log"]["Episode_Reward/" + key] = (
+                    episodic_sum_avg / self.max_episode_length_s
+                )
             self._episode_sums[key][env_ids] = 0.0
 
     def _reset_targets(self, env_ids: torch.Tensor):
@@ -405,11 +850,19 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         if env_ids.numel() == 0:
             return
 
-        # 初始化目标位置（起点x坐标 + 固定的y坐标分布）
-        target_y = torch.tensor(self.cfg.target_y_positions, device=self.device)  # 各目标的y坐标
-        self._target_positions[env_ids, :, 0] = self.cfg.target_start_x  # 所有目标起始x坐标相同
-        self._target_positions[env_ids, :, 1] = target_y.unsqueeze(0).repeat(env_ids.numel(), 1)  # y坐标分布
-        self._target_positions[env_ids, :, 2] = 0.0  # z坐标为0（地面高度）
+        # 初始化目标位置：优先使用 USD 中定义的初始位置
+        if hasattr(self, "_usd_target_positions_rel") and self._usd_target_positions_rel is not None:
+            rel = self._usd_target_positions_rel.unsqueeze(0).repeat(env_ids.numel(), 1, 1)
+            self._target_positions[env_ids] = rel
+            self._target_orientations[env_ids] = self._usd_target_orientations.unsqueeze(0).repeat(
+                env_ids.numel(), 1, 1
+            )
+        else:
+            # 回退：使用配置参数中的起点
+            target_y = torch.tensor(self.cfg.target_y_positions, device=self.device)  # 各目标的y坐标
+            self._target_positions[env_ids, :, 0] = self.cfg.target_start_x  # 所有目标起始x坐标相同
+            self._target_positions[env_ids, :, 1] = target_y.unsqueeze(0).repeat(env_ids.numel(), 1)  # y坐标分布
+            self._target_positions[env_ids, :, 2] = 0.0  # z坐标为0（地面高度）
 
         # 重置目标状态
         self._target_claimed[env_ids] = False      # 未被认领

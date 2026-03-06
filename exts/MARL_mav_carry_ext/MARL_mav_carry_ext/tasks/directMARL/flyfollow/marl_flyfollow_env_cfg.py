@@ -9,8 +9,8 @@ import math
 from pathlib import Path
 from typing import Sequence
 
-# 导入飞 crane 机器人配置
-from MARL_mav_carry_ext.assets import FLYCRANE_CFG
+# 导入单机 Falcon 机器人配置
+from MARL_mav_carry_ext.assets import FALCON_CFG
 
 # 导入IsaacLab相关模块
 import isaaclab.envs.mdp as mdp
@@ -56,8 +56,8 @@ class EventCfg:
                 "x": (-1.0, 1.0),      # x坐标范围：-1到1米（相对起始位置）
                 "y": (-1.0, 1.0),      # y坐标范围：-1到1米
                 "z": (1.5, 2.5),       # z坐标范围：1.5到2.5米（起始高度）
-                "roll": (0.0, 0.0),    # 滚转角：保持水平
-                "pitch": (0.0, 0.0),   # 俯仰角：保持水平
+                "roll": (-0.0, 0.0),    # 滚转角：保持水平
+                "pitch": (-0.0, 0.0),   # 俯仰角：保持水平
                 "yaw": (-math.pi, math.pi),  # 偏航角：任意朝向
             },
             # 速度范围配置（初始速度为0）
@@ -93,13 +93,13 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     # 环境基本参数
     decimation = 3              # 决策降频因子（物理步数/决策步数）
-    episode_length_s = 20       # 回合长度（秒）
+    episode_length_s = 60       # 回合长度（秒）
 
     # 观测历史配置
     history_len = 1             # 观测历史长度（跟随任务中通常不需要历史信息）
 
     # 多智能体配置
-    possible_agents = ["falcon1", "falcon2", "falcon3"]  # 三架Falcon无人机
+    possible_agents = ["falcon", "falcon_01", "falcon_02"]  # 默认三架Falcon无人机
     num_drones = len(possible_agents)                   # 无人机数量
 
     # 目标小车参数配置
@@ -112,44 +112,33 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         (0.0, 0.4, 1.0),  # 蓝色 - 最低价值目标
     )
     target_start_x = -20.0                              # 目标起始x坐标
-    target_end_x = -12.0                                # 目标结束x坐标
-    target_y_positions: Sequence[float] = (-24.5, -22.5, -20.0, -17.5)  # 各目标的y坐标分布
-    target_speed = 0.35                                 # 目标移动速度（m/s）
+    target_end_x = 60.0                                # 目标结束x坐标
+    target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
+    target_speed = 1.5                                  # 目标移动速度（m/s）
     track_distance_xy = 0.6                             # 成功跟踪的XY平面距离阈值
 
     # 奖励塑形参数
-    distance_penalty_weight = 0.12                      # 距离惩罚权重
-    mean_distance_weight = 0.35                         # 平均距离权重
-    min_distance_weight = 1.0                           # 最短距离权重
-    proximity_reward_weight = 0.25                      # 接近奖励权重
-    proximity_sigma = 1.0                               # 接近奖励的衰减系数
+    distance_reward_weight = 1.0                        # 距离奖励权重
+    tracking_reward_weight = 1.0                        # 追踪奖励权重
+    action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
+    body_rate_penalty_weight = 0.2                      # 机体角速率惩罚权重
+    velocity_penalty_weight = 0.2                       # 速度惩罚权重
+    force_penalty_weight = 0.2                          # 推力惩罚权重
+    height_reward_weight = 0.5                          # 高度奖励权重
+    safety_penalty_weight = 1.0                         # 安全惩罚权重
+
+    # 高度与碰撞相关
+    desired_height = 2.0                                # 期望高度
+    drone_collision_threshold = 0.6                     # 无人机碰撞阈值
 
     # 终止条件参数
     min_altitude = 0.2                                  # 最小飞行高度（防撞地）
-    bounding_box_threshold = 10.0                       # 边界框阈值（防飞出区域）
+    bounding_box_threshold = 60.0                       # 边界框阈值（防飞出区域）
 
-    # 动作/观测空间尺寸计算
-    obs_dim_per_step = (
-        num_drones  # one-hot智能体标识（3维）
-        + 3  # 无人机位置（3维）
-        + 3  # 无人机速度（3维）
-        + (num_targets * 2)  # 到各目标的相对XY位置（8维）
-        + num_targets  # 到各目标的距离（4维）
-        + ((num_drones - 1) * num_targets)  # 其他无人机到目标的距离（8维）
-        + num_targets  # 目标价值（4维）
-    )  # 总计：3+3+3+8+4+8+4 = 33维（单步观测）
-    
-    # 根据控制模式设置动作空间和观测空间
-    if control_mode == "geometric":
-        action_dim_geo = 12     # 几何控制的动作维度
-        action_spaces = {"falcon1": action_dim_geo, "falcon2": action_dim_geo, "falcon3": action_dim_geo}
-        obs_dim_geo = obs_dim_per_step * history_len  # 考虑历史长度
-        observation_spaces = {"falcon1": obs_dim_geo, "falcon2": obs_dim_geo, "falcon3": obs_dim_geo}
-    elif control_mode == "ACCBR":
-        action_dim_accbr = 5    # ACCBR控制的动作维度（3个线加速度 + 2个角速度）
-        action_spaces = {"falcon1": action_dim_accbr, "falcon2": action_dim_accbr, "falcon3": action_dim_accbr}
-        obs_dim_accbr = obs_dim_per_step * history_len
-        observation_spaces = {"falcon1": obs_dim_accbr, "falcon2": obs_dim_accbr, "falcon3": obs_dim_accbr}
+    # 动作/观测空间尺寸（在 __post_init__ 中根据数量动态计算）
+    obs_dim_per_step = 0
+    action_spaces = {}
+    observation_spaces = {}
 
     state_space = -1  # 状态空间维度（跟随任务中不使用全局状态）
 
@@ -160,13 +149,13 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         gravity=(0.0, 0.0, -9.8066), # 重力加速度（m/s²）
     )
 
-    # 机器人配置（飞行吊挂系统）
-    robot_cfg: ArticulationCfg = FLYCRANE_CFG.replace(prim_path="/World/envs/env_.*/flycrane")
+    # 机器人配置（单机 Falcon）
+    robot_cfg: ArticulationCfg = FALCON_CFG.replace(prim_path="/World/envs/env_.*/falcon")
     robot_cfg.spawn.activate_contact_sensors = True  # 激活接触传感器
 
     # 接触力传感器配置
     contact_forces = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/flycrane/.*",  # 传感器路径
+        prim_path="/World/envs/env_.*/falcon.*/.*",  # 传感器路径
         update_period=0.0,                           # 更新周期
         history_length=3,                            # 历史长度
         debug_vis=False                              # 调试可视化
@@ -199,13 +188,39 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     events = EventCfg()
 
     # 调试可视化配置
-    debug_vis: bool = False  # 调试可视化开关
+    debug_vis: bool = True   # 调试可视化开关
     
     # 兼容 MARLHoverEnv 的可视化接口：即使 debug_vis=False 也要有字段
     marker_cfg_goal = FRAME_MARKER_CFG.copy()
     marker_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)  # 标记缩放
-    marker_cfg_goal.prim_path = "/Visuals/Command/goal_pose"  # 目标姿态路径
+    marker_cfg_goal.prim_path = "/World/envs/env_0/Visuals/FlyFollow/goal_pose"  # 目标姿态路径
 
     marker_cfg_body = FRAME_MARKER_CFG.copy()
     marker_cfg_body.markers["frame"].scale = (0.1, 0.1, 0.1)  # 标记缩放
-    marker_cfg_body.prim_path = "/Visuals/Command/body_pose"  # 机体姿态路径
+    marker_cfg_body.prim_path = "/World/envs/env_0/Visuals/FlyFollow/body_pose"  # 机体姿态路径
+
+    def __post_init__(self):
+        self.num_drones = len(self.possible_agents)
+        self.obs_dim_per_step = (
+            self.num_drones
+            + 2
+            + 9
+            + 2
+            + 3
+            + (self.num_targets * 2)
+            + self.num_targets
+            + ((self.num_drones - 1) * 2)
+            + ((self.num_drones - 1) * self.num_targets)
+            + (self.num_targets * 2)
+            + (self.num_targets * self.num_drones)
+            + self.num_targets
+        )
+
+        if self.control_mode == "geometric":
+            action_dim = 12
+        else:
+            action_dim = 5
+
+        obs_dim = self.obs_dim_per_step * self.history_len
+        self.action_spaces = {agent: action_dim for agent in self.possible_agents}
+        self.observation_spaces = {agent: obs_dim for agent in self.possible_agents}
