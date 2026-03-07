@@ -56,8 +56,18 @@ class DirectMARLPlotter:
         self.control_mode = control_mode  # 控制模式
         self.env = env                    # 环境实例
         self.robot = env.scene[asset_cfg.name]  # 机器人实体
-        self.load_id = self.robot.find_bodies("load_odometry_sensor_link")[0]  # 负载ID
-        self.drone_idx = self.robot.find_bodies("Falcon.*base_link")[0]        # 无人机索引
+        # 负载ID（若环境不含负载则为None）
+        self.load_id = None
+        try:
+            self.load_id = self.robot.find_bodies("load_odometry_sensor_link")[0]
+        except Exception:
+            self.load_id = None
+
+        # 无人机索引（兼容不同命名）
+        try:
+            self.drone_idx = self.robot.find_bodies("Falcon.*base_link_inertia")[0]
+        except Exception:
+            self.drone_idx = self.robot.find_bodies("Falcon.*base_link")[0]
         self.sim_dt = env.sim.get_rendering_dt()  # 仿真时间步长
 
         # 数据缓冲区
@@ -89,6 +99,8 @@ class DirectMARLPlotter:
         收集负载的位置、姿态、速度、角速度等状态信息，
         以及对应的参考值，用于对比分析控制效果。
         """
+        if self.load_id is None:
+            return
         # 收集负载的实际状态数据
         load_pos = self.robot.data.body_com_state_w[:, self.load_id, :3].squeeze(1)[0]           # 位置
         load_orientation = self.robot.data.body_com_state_w[:, self.load_id, 3:7].squeeze(1)[0]  # 姿态四元数
