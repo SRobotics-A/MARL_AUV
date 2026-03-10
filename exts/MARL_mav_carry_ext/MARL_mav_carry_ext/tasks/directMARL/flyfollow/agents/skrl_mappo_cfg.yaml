@@ -74,5 +74,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 600000
+  timesteps: 400000
   environment_info: log

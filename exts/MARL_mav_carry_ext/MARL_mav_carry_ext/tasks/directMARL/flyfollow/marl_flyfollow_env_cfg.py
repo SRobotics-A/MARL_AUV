@@ -111,11 +111,20 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         (0.0, 1.0, 0.0),  # 绿色 - 中等价值目标
         (0.0, 0.4, 1.0),  # 蓝色 - 最低价值目标
     )
-    target_start_x = -20.0                              # 目标起始x坐标
-    target_end_x = 60.0                                # 目标结束x坐标
+    target_start_x = 0                              # 目标起始x坐标
+    target_end_x = 100.0                                # 目标结束x坐标
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 1.5                                  # 目标移动速度（m/s）
     track_distance_xy = 0.6                             # 成功跟踪的XY平面距离阈值
+
+    distance_reward_sigma = 2.0
+    tracking_reward_sigma = 1.5
+    height_reward_sigma = 1.0
+    action_smoothness_sigma = 0.25
+    collision_soft_margin = 0.5
+    boundary_soft_margin = 1.0
+    altitude_soft_margin = 1.0
+    alive_reward_weight = 0.0
 
     # 奖励塑形参数
     distance_reward_weight = 1.0                        # 距离奖励权重
