@@ -165,11 +165,15 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             for key in [
                 "distance_reward",
                 "tracking_reward",
+                "velocity_follow_reward",
                 "action_smoothness",
                 "body_rate_penalty",
                 "velocity_penalty",
                 "force_penalty",
                 "height_reward",
+                "height_error_penalty",
+                "vertical_direction_penalty",
+                "high_altitude_penalty",
                 "safety_penalty",
             ]
         }
@@ -229,24 +233,6 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         )
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(flyfollow_scene_path))
         sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
-
-        # Debug: print env roots and immediate children to verify USD hierarchy
-        try:
-            envs_children = sim_utils.get_all_matching_child_prims("/World/envs", depth=1)
-            print(f"[flyfollow] /World/envs children: {[p.GetName() for p in envs_children]}")
-            candidate_roots = [
-                "/World/envs/env_0",
-                "/World/envs/env_0/World",
-                "/World/envs/env_0/World/World",
-                "/World/envs/env_0/env_0",
-                "/World/envs/env_0/env_0/World",
-            ]
-            for root in candidate_roots:
-                if prim_utils.is_prim_path_valid(root):
-                    children = sim_utils.get_all_matching_child_prims(root, depth=1)
-                    print(f"[flyfollow] {root} children: {[p.GetName() for p in children]}")
-        except Exception as exc:
-            print(f"[flyfollow] Debug prim listing failed: {exc}")
 
         # 复制 env_0 到其它环境
         self.scene.clone_environments(copy_from_source=False)
@@ -666,6 +652,18 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         collision_margin = getattr(self.cfg, "collision_soft_margin", 0.5)
         boundary_soft_margin = getattr(self.cfg, "boundary_soft_margin", 1.0)
         altitude_soft_margin = getattr(self.cfg, "altitude_soft_margin", 1.0)
+        altitude_upper_soft_threshold = getattr(self.cfg, "altitude_upper_soft_threshold", self.cfg.desired_height + 1.0)
+        high_altitude_soft_margin = getattr(self.cfg, "high_altitude_soft_margin", 1.0)
+        high_altitude_penalty_weight = getattr(self.cfg, "high_altitude_penalty_weight", 1.0)
+        height_error_penalty_weight = getattr(self.cfg, "height_error_penalty_weight", 0.0)
+        height_error_above_extra_weight = getattr(self.cfg, "height_error_above_extra_weight", 0.0)
+        height_error_quadratic_weight = getattr(self.cfg, "height_error_quadratic_weight", 0.0)
+        height_hold_deadband = getattr(self.cfg, "height_hold_deadband", 0.0)
+        vertical_direction_penalty_weight = getattr(self.cfg, "vertical_direction_penalty_weight", 0.0)
+        velocity_follow_sigma = getattr(self.cfg, "velocity_follow_sigma", 0.8)
+        velocity_follow_progress_weight = getattr(self.cfg, "velocity_follow_progress_weight", 0.3)
+        velocity_follow_overspeed_weight = getattr(self.cfg, "velocity_follow_overspeed_weight", 0.2)
+        velocity_follow_overspeed_margin = getattr(self.cfg, "velocity_follow_overspeed_margin", 0.3)
     
         eps = 1e-6
     
@@ -699,6 +697,34 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             tracking_reward[torch.arange(self.num_envs, device=self.device), drone_ids] += continuous_track_value[:, t]
     
         tracking_reward = self.cfg.tracking_reward_weight * tracking_reward
+
+        # =========================
+        # 3.1) 速度跟随奖励（与最近目标保持速度一致并向前推进）
+        # =========================
+        nearest_target_idx = dist_xy.argmin(dim=-1)  # (E, D)
+        gather_idx = nearest_target_idx.unsqueeze(-1).expand(-1, -1, 2)
+        assigned_target_vel_xy = torch.gather(self._target_velocities[:, :, :2], dim=1, index=gather_idx)  # (E, D, 2)
+
+        vel_err_xy = drone_vel_xy - assigned_target_vel_xy
+        vel_err_norm = torch.norm(vel_err_xy, dim=-1)  # (E, D)
+        vel_match_reward = torch.exp(- (vel_err_norm / (velocity_follow_sigma + eps)) ** 2)
+
+        target_speed = torch.norm(assigned_target_vel_xy, dim=-1)  # (E, D)
+        target_dir = assigned_target_vel_xy / (target_speed.unsqueeze(-1) + eps)
+        progress_speed = torch.sum(drone_vel_xy * target_dir, dim=-1)
+        progress_reward = torch.clamp(progress_speed / (target_speed + eps), min=0.0, max=1.5)
+
+        drone_speed_xy = torch.norm(drone_vel_xy, dim=-1)
+        overspeed = torch.clamp(
+            drone_speed_xy - (target_speed + velocity_follow_overspeed_margin),
+            min=0.0,
+        ) / (target_speed + velocity_follow_overspeed_margin + eps)
+
+        velocity_follow_reward = self.cfg.velocity_follow_weight * (
+            vel_match_reward
+            + velocity_follow_progress_weight * progress_reward
+            - velocity_follow_overspeed_weight * overspeed
+        )
     
         # =========================
         # 4) 动作平滑奖励
@@ -749,10 +775,24 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # =========================
         # 8) 高度奖励（连续且更宽）
         # =========================
-        height_error = torch.abs(drone_z - self.cfg.desired_height)
+        height_error_raw = torch.abs(drone_z - self.cfg.desired_height)
+        height_error = torch.clamp(height_error_raw - height_hold_deadband, min=0.0)
+        above_height_error = torch.clamp(drone_z - self.cfg.desired_height, min=0.0)
         height_reward = self.cfg.height_reward_weight * torch.exp(
-            - (height_error / (height_sigma + eps)) ** 2
+            - (height_error_raw / (height_sigma + eps)) ** 2
         )
+        height_error_penalty = (
+            height_error_penalty_weight * height_error
+            + height_error_above_extra_weight * above_height_error
+            + height_error_quadratic_weight * (height_error ** 2)
+        )
+        # 方向性惩罚：高于目标还在上升、低于目标还在下降
+        moving_away_vz = torch.where(
+            drone_z >= self.cfg.desired_height,
+            torch.clamp(drone_vel_z, min=0.0),
+            torch.clamp(-drone_vel_z, min=0.0),
+        )
+        vertical_direction_penalty = vertical_direction_penalty_weight * moving_away_vz
     
         # =========================
         # 9) 安全软惩罚
@@ -799,10 +839,16 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             altitude_soft_margin - altitude_margin,
             min=0.0
         ) / (altitude_soft_margin + eps)
-    
+
+        # 9.4 超高软惩罚
+        high_altitude_excess = torch.clamp(drone_z - altitude_upper_soft_threshold, min=0.0)
+        high_altitude_penalty = high_altitude_penalty_weight * (
+            high_altitude_excess / (high_altitude_soft_margin + eps)
+        )
+
         # 合并安全软惩罚
         safety_penalty = self.cfg.safety_penalty_weight * (
-            collision_penalty + boundary_penalty + low_altitude_penalty
+            collision_penalty + boundary_penalty + low_altitude_penalty + high_altitude_penalty
         )
     
         # =========================
@@ -819,11 +865,14 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             alive_reward
             + distance_reward
             + tracking_reward
+            + velocity_follow_reward
             + action_smoothness
             + height_reward
             - body_rate_penalty
             - velocity_penalty
             - force_penalty
+            - height_error_penalty
+            - vertical_direction_penalty
             - safety_penalty
         ) * self.step_dt
 
@@ -835,8 +884,12 @@ class MARLFlyFollowEnv(DirectMARLEnv):
                 f"total={total_reward.mean().item():.4f}, "
                 f"dist={distance_reward.mean().item():.4f}, "
                 f"track={tracking_reward.mean().item():.4f}, "
+                f"vel_follow={velocity_follow_reward.mean().item():.4f}, "
                 f"smooth={action_smoothness.mean().item():.4f}, "
                 f"height={height_reward.mean().item():.4f}, "
+                f"height_err_pen={height_error_penalty.mean().item():.4f}, "
+                f"vz_dir_pen={vertical_direction_penalty.mean().item():.4f}, "
+                f"high_alt_pen={high_altitude_penalty.mean().item():.4f}, "
                 f"rate_pen={body_rate_penalty.mean().item():.4f}, "
                 f"vel_pen={velocity_penalty.mean().item():.4f}, "
                 f"force_pen={force_penalty.mean().item():.4f}, "
@@ -849,11 +902,15 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # =========================
         self._episode_sums["distance_reward"] += distance_reward.sum(dim=-1)
         self._episode_sums["tracking_reward"] += tracking_reward.sum(dim=-1)
+        self._episode_sums["velocity_follow_reward"] += velocity_follow_reward.sum(dim=-1)
         self._episode_sums["action_smoothness"] += action_smoothness.sum(dim=-1)
         self._episode_sums["body_rate_penalty"] += body_rate_penalty.sum(dim=-1)
         self._episode_sums["velocity_penalty"] += velocity_penalty.sum(dim=-1)
         self._episode_sums["force_penalty"] += force_penalty.sum(dim=-1)
         self._episode_sums["height_reward"] += height_reward.sum(dim=-1)
+        self._episode_sums["height_error_penalty"] += height_error_penalty.sum(dim=-1)
+        self._episode_sums["vertical_direction_penalty"] += vertical_direction_penalty.sum(dim=-1)
+        self._episode_sums["high_altitude_penalty"] += high_altitude_penalty.sum(dim=-1)
         self._episode_sums["safety_penalty"] += safety_penalty.sum(dim=-1)
 
         if "alive_reward" in self._episode_sums:
@@ -874,6 +931,8 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
         # 高度过低终止：防止撞击地面
         falcon_fly_low = (self.drone_positions[:, :, 2] < self.cfg.min_altitude).any(dim=-1)
+        # 高度过高终止：防止长期高空逃逸
+        falcon_fly_high = (self.drone_positions[:, :, 2] > self.cfg.max_altitude).any(dim=-1)
         
         # 越界终止：防止飞出限定区域
         body_pos_outside = (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1).any(dim=-1)
@@ -882,31 +941,37 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         self.time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         # 综合终止条件
-        terminations = falcon_fly_low | body_pos_outside
+        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside
         timed_outs = self.time_out
 
         # 调试日志（每步）- 记录到全局 log 以及每个 agent 的 extras 中
         fly_low_rate = falcon_fly_low.float().mean()
+        fly_high_rate = falcon_fly_high.float().mean()
         out_of_bounds_rate = body_pos_outside.float().mean()
         time_out_rate = self.time_out.float().mean()
         any_rate = terminations.float().mean()
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
+        max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
         self.extras["log"] = {
             "Debug/Termination/fly_low_rate": fly_low_rate,
+            "Debug/Termination/fly_high_rate": fly_high_rate,
             "Debug/Termination/out_of_bounds_rate": out_of_bounds_rate,
             "Debug/Termination/time_out_rate": time_out_rate,
             "Debug/Termination/any_rate": any_rate,
             "Debug/Termination/min_height": min_height,
+            "Debug/Termination/max_height": max_height,
         }
         for agent in self.cfg.possible_agents:
             if "log" not in self.extras[agent]:
                 self.extras[agent]["log"] = {}
             log = self.extras[agent]["log"]
             log["Debug/Termination/fly_low_rate"] = fly_low_rate
+            log["Debug/Termination/fly_high_rate"] = fly_high_rate
             log["Debug/Termination/out_of_bounds_rate"] = out_of_bounds_rate
             log["Debug/Termination/time_out_rate"] = time_out_rate
             log["Debug/Termination/any_rate"] = any_rate
             log["Debug/Termination/min_height"] = min_height
+            log["Debug/Termination/max_height"] = max_height
 
         # 所有智能体共享相同终止信号
         terminated = {agent: terminations for agent in self.cfg.possible_agents}
@@ -922,14 +987,42 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 基类重置（包含场景和事件）
         super()._reset_idx(env_ids)
 
-        # 还原无人机到 USD 中定义的初始位姿（覆盖 reset_base 的随机化）
-        if hasattr(self, "_usd_root_state_rel") and self._usd_root_state_rel is not None:
+        # 根据配置决定 reset 策略：
+        # - event_randomized: 保留 EventCfg.reset_base 的随机化
+        # - usd_fixed / usd_perturbed: 使用 USD 位姿（可选小扰动）
+        reset_pose_mode = getattr(self.cfg, "reset_pose_mode", "event_randomized")
+        if (
+            reset_pose_mode in {"usd_fixed", "usd_perturbed"}
+            and hasattr(self, "_usd_root_state_rel")
+            and self._usd_root_state_rel is not None
+        ):
             env_origins = self.scene.env_origins[env_ids]
             num_ids = env_ids.numel()
             zeros_vel = torch.zeros(num_ids, 6, device=self.device)
+            position_noise = torch.zeros(num_ids, 3, device=self.device)
+            yaw_noise = torch.zeros(num_ids, device=self.device)
+            if reset_pose_mode == "usd_perturbed":
+                noise_xy = float(getattr(self.cfg, "usd_reset_position_noise_xy", 0.0))
+                noise_z = float(getattr(self.cfg, "usd_reset_position_noise_z", 0.0))
+                yaw_range = float(getattr(self.cfg, "usd_reset_yaw_noise", 0.0))
+                if noise_xy > 0.0:
+                    position_noise[:, :2] = (2.0 * torch.rand(num_ids, 2, device=self.device) - 1.0) * noise_xy
+                if noise_z > 0.0:
+                    position_noise[:, 2] = (2.0 * torch.rand(num_ids, device=self.device) - 1.0) * noise_z
+                if yaw_range > 0.0:
+                    yaw_noise = (2.0 * torch.rand(num_ids, device=self.device) - 1.0) * yaw_range
             for i, robot in enumerate(self.robots):
-                pos = self._usd_root_state_rel[i, :3].unsqueeze(0).repeat(num_ids, 1) + env_origins
+                pos = (
+                    self._usd_root_state_rel[i, :3].unsqueeze(0).repeat(num_ids, 1)
+                    + env_origins
+                    + position_noise
+                )
                 ori = self._usd_root_state_rel[i, 3:7].unsqueeze(0).repeat(num_ids, 1)
+                if reset_pose_mode == "usd_perturbed" and yaw_noise.abs().max() > 0.0:
+                    yaw_axis = torch.zeros(num_ids, 3, device=self.device)
+                    yaw_axis[:, 2] = 1.0
+                    yaw_quat = quat_from_angle_axis(yaw_noise, yaw_axis)
+                    ori = quat_mul(yaw_quat, ori)
                 root_state = torch.cat([pos, ori, zeros_vel], dim=-1)
                 robot.write_root_state_to_sim(root_state, env_ids=env_ids)
 
@@ -956,16 +1049,21 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         fly_low_count = torch.count_nonzero(
             (self.drone_positions[:, :, 2] < self.cfg.min_altitude).any(dim=-1)[env_ids]
         ).item()
+        fly_high_count = torch.count_nonzero(
+            (self.drone_positions[:, :, 2] > self.cfg.max_altitude).any(dim=-1)[env_ids]
+        ).item()
         out_of_bounds_count = torch.count_nonzero(
             (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1).any(dim=-1)[env_ids]
         ).item()
         time_out_count = torch.count_nonzero(self.time_out[env_ids]).item()
         self.extras["log"]["Episode_Termination/falcon_fly_low"] = fly_low_count
+        self.extras["log"]["Episode_Termination/falcon_fly_high"] = fly_high_count
         self.extras["log"]["Episode_Termination/bounding_box"] = out_of_bounds_count
         self.extras["log"]["Episode_Termination/time_out"] = time_out_count
         for agent in self.cfg.possible_agents:
             log = self.extras[agent]["log"]
             log["Episode_Termination/falcon_fly_low"] = fly_low_count
+            log["Episode_Termination/falcon_fly_high"] = fly_high_count
             log["Episode_Termination/bounding_box"] = out_of_bounds_count
             log["Episode_Termination/time_out"] = time_out_count
 
@@ -1019,9 +1117,10 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 边界处理：到达终点后回到起点
         overflow = self._target_positions[..., 0] > self.cfg.target_end_x
         if overflow.any():
+            start_x = self._usd_target_positions_rel[:, 0].unsqueeze(0).expand(self.num_envs, -1)
             self._target_positions[..., 0] = torch.where(
                 overflow,
-                torch.full_like(self._target_positions[..., 0], self.cfg.target_start_x),
+                start_x,
                 self._target_positions[..., 0],
             )
             # 到达终点后回到起点，允许重新奖励
