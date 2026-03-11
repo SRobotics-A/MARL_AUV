@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import Sequence
 
 # 导入单机 Falcon 机器人配置
@@ -24,17 +23,6 @@ from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
-
-
-# 资产根目录（与本机 Isaac Sim 资产路径一致）
-_ASSET_ROOT = Path(
-    "/media/xtj/1CC8D044C8D01DB8/RL-download/isaac-sim/v5.1.0/Assets/Isaac/5.1/Isaac"
-)
-
-# 目标小车与场地 USD 模型路径
-_NOVA_CARTER_USD = _ASSET_ROOT / "Robots/NVIDIA/NovaCarter/Variants/nova_carter_sim_optimized.usd"  # 目标小车模型
-_JETRACER_TRACK_USD = _ASSET_ROOT / "Environments/Jetracer/jetracer_track_solid.usd"              # 赛道模型
-
 
 @configclass
 class EventCfg:
@@ -105,20 +93,17 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     # 目标小车参数配置
     num_targets = 4                                     # 目标小车数量
     target_values: Sequence[float] = (4.0, 3.0, 2.0, 1.0)  # 各目标的价值（红黄绿蓝）
-    target_colors: Sequence[tuple[float, float, float]] = (
-        (1.0, 0.0, 0.0),  # 红色 - 最高价值目标
-        (1.0, 1.0, 0.0),  # 黄色 - 次高价值目标
-        (0.0, 1.0, 0.0),  # 绿色 - 中等价值目标
-        (0.0, 0.4, 1.0),  # 蓝色 - 最低价值目标
-    )
     target_start_x = 0                                  # 目标起始x坐标
     target_end_x = 50.0                                 # 目标结束x坐标
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 0.8                                  # 目标移动速度（m/s）
-    track_distance_xy = 2.5                             # 成功跟踪的XY平面距离阈值
+    track_distance_xy = 3.0                             # 成功跟踪的XY平面距离阈值（放宽）
+    tracking_bonus_distance_xy = 1.5                   # 进入该小范围后给予额外 tracking bonus（放宽）
+    success_hold_time = 1.0                            # 持续进入跟踪范围多少秒后判定成功（放宽）
+    success_height_tolerance = 0.8                     # 成功跟随时允许的高度误差（放宽）
+    success_velocity_tolerance = 1.0                   # 成功跟随时允许的XY速度误差（放宽）
 
     distance_reward_sigma = 28
-    tracking_reward_sigma = 18
     height_reward_sigma = 1.0
     action_smoothness_sigma = 0.25
     collision_soft_margin = 0.5
@@ -126,7 +111,7 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     altitude_soft_margin = 1.0
     altitude_upper_soft_threshold = 2.8                # 高度软上限，超过后开始惩罚
     high_altitude_soft_margin = 0.6                    # 高度超上限惩罚归一化范围
-    high_altitude_penalty_weight = 0.6                 # 超高飞行惩罚权重（上调）
+    high_altitude_penalty_weight = 0.12                # 超高飞行惩罚权重（降权，主要交给 done 约束）
     alive_reward_weight = 0.05
 
     # 奖励塑形参数
@@ -140,22 +125,25 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
     body_rate_penalty_weight = 0.2                      # 机体角速率惩罚权重
     velocity_penalty_weight = 0.2                       # 速度惩罚权重
+    velocity_penalty_xy_safe = 1.2                      # XY 安全速度阈值（m/s）
+    velocity_penalty_z_safe = 0.5                       # Z 安全速度阈值（m/s）
+    velocity_penalty_z_scale = 0.25                     # Z 超速惩罚相对权重
     force_penalty_weight = 0.2                          # 推力惩罚权重
     height_reward_weight = 0.5                          # 高度奖励权重
-    height_error_penalty_weight = 0.35                  # 对称高度误差惩罚权重 |z-desired_height|
-    height_error_above_extra_weight = 0.35              # 高于目标高度时的额外惩罚权重
-    height_error_quadratic_weight = 0.08                # 高度误差二次惩罚权重（拉回2m）
+    height_error_penalty_weight = 0.08                  # 对称高度误差惩罚权重 |z-desired_height|（降权）
+    height_error_above_extra_weight = 0.05              # 高于目标高度时的额外惩罚权重（弱化）
+    height_error_quadratic_weight = 0.01                # 高度误差二次惩罚权重（弱化）
     height_hold_deadband = 0.10                         # 高度保持死区（米），死区内不罚
-    vertical_direction_penalty_weight = 0.25            # 反方向垂直速度惩罚（高处继续上升/低处继续下降）
+    vertical_direction_penalty_weight = 0.05            # 反方向垂直速度惩罚（降权，避免主导学习）
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
     # 高度与碰撞相关
     desired_height = 2.0                                # 期望高度
-    drone_collision_threshold = 0.6                     # 无人机碰撞阈值
+    drone_collision_threshold = 1.0                     # 无人机碰撞阈值
 
     # 终止条件参数
-    min_altitude = 0.2                                  # 最小飞行高度（防撞地）
-    max_altitude = 6.0                                  # 最大飞行高度（超出即终止）
+    min_altitude = 1.0                                 # 最小飞行高度（防撞地）
+    max_altitude = 7.0                                  # 最大飞行高度（略放宽，减少误终止）
     bounding_box_threshold = 150.0                      # 边界框阈值（防飞出区域）
 
     # reset 位姿策略：
@@ -192,22 +180,9 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         history_length=3,                            # 历史长度
         debug_vis=False                              # 调试可视化
     )
-    sensor_cfg = SceneEntityCfg("contact_forces", body_names=".*")  # 传感器实体配置
-    contact_sensor_threshold = 0.1                  # 接触传感器阈值
-
-    # 机体部件名称配置
-    falcon_names = "Falcon.*_base_link_inertia"     # 无人机质心链接名称
-    falcon_rotor_names = "Falcon.*_rotor_.*"        # 旋翼名称
-    payload_name = "load_odometry_sensor_link"      # 负载名称
-    rope_name = "rope_.*_link"                      # 绳索名称
-
     # 底层控制参数
     low_level_decimation: int = 1                   # 底层控制降频因子
     max_thrust_pp = 6.25                            # 单个推进器最大推力（牛顿）
-
-    # 可视化资产路径配置
-    track_usd_path: str = str(_JETRACER_TRACK_USD)  # 赛道模型路径
-    target_usd_path: str = str(_NOVA_CARTER_USD)    # 目标小车模型路径
 
     # 场景配置
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
@@ -233,19 +208,21 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     def __post_init__(self):
         self.num_drones = len(self.possible_agents)
+        # Keep this in the same order as _get_observations()
         self.obs_dim_per_step = (
-            self.num_drones
-            + 2
-            + 9
-            + 2
-            + 3
-            + (self.num_targets * 2)
-            + self.num_targets
-            + ((self.num_drones - 1) * 2)
-            + ((self.num_drones - 1) * self.num_targets)
-            + (self.num_targets * 2)
-            + (self.num_targets * self.num_drones)
-            + self.num_targets
+            self.num_drones                          # agent one-hot
+            + 2                                      # own position xy
+            + 9                                      # own rotation matrix
+            + 2                                      # own linear velocity xy
+            + 3                                      # own angular velocity
+            + (self.num_targets * 2)                # own relative target xy
+            + self.num_targets                      # own target distances
+            + ((self.num_drones - 1) * 2)           # relative xy to other drones
+            + ((self.num_drones - 1) * self.num_targets)  # other drones to target distances
+            + (self.num_targets * 2)                # target velocities xy
+            + (self.num_targets * self.num_drones)  # closest drone one-hot for each target
+            + self.num_targets                      # target values
+            + self.num_targets                      # assigned target one-hot
         )
 
         if self.control_mode == "geometric":

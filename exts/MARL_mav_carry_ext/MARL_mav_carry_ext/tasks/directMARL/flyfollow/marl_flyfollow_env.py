@@ -205,8 +205,8 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         self.all_targets_captured = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
-        # 持续跟随计时器
-        self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
+        # # 持续跟随计时器
+        # self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
         self.targets_out_of_bounds = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -216,12 +216,59 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         self._norm_pos_scale = self.cfg.bounding_box_threshold
         self._norm_vel_scale = 5.0
         self._norm_dist_scale = self.cfg.bounding_box_threshold * 2
+        self._norm_ang_vel_scale = 10.0
+        self._norm_target_value_scale = torch.clamp(self._target_values.max(), min=1.0)
+
+        # 每个 episode 固定的 target assignment（每架无人机一个目标）
+        self._assigned_target_idx = torch.zeros(
+            (self.num_envs, self._num_drones), dtype=torch.long, device=self.device
+        )
+
+        # 持续跟随计时器（按 env、drone）
+        self._sustained_follow_timer = torch.zeros(
+            (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
+        )
 
         # 初始化目标位置
         self._reset_targets(torch.arange(self.num_envs, device=self.device))
 
         # 调试可视化设置
         self.set_debug_vis(cfg.debug_vis)
+
+    def _assign_targets_for_envs(self, env_ids: torch.Tensor) -> None:
+        """为指定环境固定每架无人机的目标，保持一个 episode 内不变。"""
+        if env_ids.numel() == 0:
+            return
+
+        drone_pos_xy = self.drone_positions[env_ids, :, :2]
+        target_pos_xy = self._target_positions[env_ids, :, :2]
+
+        self._assigned_target_idx[env_ids] = 0
+        self._target_assignment[env_ids] = -1
+
+        for local_env_idx, env_id in enumerate(env_ids.tolist()):
+            dist = torch.norm(
+                target_pos_xy[local_env_idx].unsqueeze(0) - drone_pos_xy[local_env_idx].unsqueeze(1),
+                dim=-1,
+            )
+            free_drones = set(range(self._num_drones))
+            free_targets = set(range(self._num_targets))
+
+            while free_drones and free_targets:
+                best_pair = None
+                best_dist = None
+                for drone_idx in free_drones:
+                    for target_idx in free_targets:
+                        value = float(dist[drone_idx, target_idx].item())
+                        if best_dist is None or value < best_dist:
+                            best_dist = value
+                            best_pair = (drone_idx, target_idx)
+
+                drone_idx, target_idx = best_pair
+                self._assigned_target_idx[env_id, drone_idx] = target_idx
+                self._target_assignment[env_id, target_idx] = drone_idx
+                free_drones.remove(drone_idx)
+                free_targets.remove(target_idx)
 
     def _setup_scene(self):
         """设置场景：在悬停环境基础上添加跟随任务特有的元素"""
@@ -518,6 +565,8 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         for i, robot in enumerate(self.robots):
             root_state = robot.data.root_state_w
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
+            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
             self.drone_orientations[:, i] = root_state[:, 3:7]
             self.drone_linear_velocities[:, i] = root_state[:, 7:10]
             self.drone_angular_velocities[:, i] = root_state[:, 10:13]
@@ -539,6 +588,21 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             self.num_envs, self._num_targets, self._num_drones, device=self.device
         )
         closest_drone_one_hot.scatter_(2, closest_drone.unsqueeze(-1), 1.0)
+        assigned_target_one_hot = torch.zeros(
+            self.num_envs, self._num_drones, self._num_targets, device=self.device
+        )
+        assigned_target_one_hot.scatter_(2, self._assigned_target_idx.unsqueeze(-1), 1.0)
+
+        # 统一归一化连续物理量，降低不同量纲对策略学习的干扰
+        drone_pos_xy_norm = drone_pos_xy / self._norm_pos_scale
+        drone_lin_vel_xy_norm = drone_lin_vel_xy / self._norm_vel_scale
+        drone_ang_vel_norm = self.drone_angular_velocities / self._norm_ang_vel_scale
+        rel_xy_norm = rel_xy / self._norm_pos_scale
+        dist_xy_norm = dist_xy / self._norm_dist_scale
+        target_vel_xy_norm = target_vel_xy / self._norm_vel_scale
+        target_values_norm = (
+            self._target_values.unsqueeze(0).repeat(self.num_envs, 1) / self._norm_target_value_scale
+        )
 
         observations = {}
         for drone_idx, agent in enumerate(self.cfg.possible_agents):
@@ -547,34 +611,32 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             one_hot[:, drone_idx] = 1.0
 
             # 当前无人机到各目标的相对位置和距离
-            own_rel_xy = rel_xy[:, drone_idx].reshape(self.num_envs, -1)  # 展平为(num_envs, num_targets*2)
-            own_dist = dist_xy[:, drone_idx]  # (num_envs, num_targets)
+            own_rel_xy = rel_xy_norm[:, drone_idx].reshape(self.num_envs, -1)  # 展平为(num_envs, num_targets*2)
+            own_dist = dist_xy_norm[:, drone_idx]  # (num_envs, num_targets)
 
             # 其他无人机到各目标的距离（用于协作信息）
             other_ids = [j for j in range(self._num_drones) if j != drone_idx]
             other_rel_xy = (
-                drone_pos_xy[:, other_ids] - drone_pos_xy[:, drone_idx].unsqueeze(1)
+                drone_pos_xy_norm[:, other_ids] - drone_pos_xy_norm[:, drone_idx].unsqueeze(1)
             ).reshape(self.num_envs, -1)
-            other_dist = dist_xy[:, other_ids].reshape(self.num_envs, -1)  # (num_envs, (num_drones-1)*num_targets)
-
-            # 目标价值信息
-            target_values = self._target_values.unsqueeze(0).repeat(self.num_envs, 1)  # (num_envs, num_targets)
+            other_dist = dist_xy_norm[:, other_ids].reshape(self.num_envs, -1)  # (num_envs, (num_drones-1)*num_targets)
 
             # 构建观测向量
             obs_t = torch.cat(
                 (
                     one_hot,                    # 智能体标识
-                    drone_pos_xy[:, drone_idx],          # 本机位置XY(2维)
+                    drone_pos_xy_norm[:, drone_idx],          # 本机位置XY(2维)
                     self.drone_rot_matrices[:, drone_idx].reshape(self.num_envs, -1),  # 本机姿态(9维)
-                    drone_lin_vel_xy[:, drone_idx],      # 本机速度XY(2维)
-                    self.drone_angular_velocities[:, drone_idx],  # 本机角速度(3维)
+                    drone_lin_vel_xy_norm[:, drone_idx],      # 本机速度XY(2维)
+                    drone_ang_vel_norm[:, drone_idx],  # 本机角速度(3维)
                     own_rel_xy,                 # 到各目标相对位置(2*num_targets维)
                     own_dist,                   # 到各目标距离(num_targets维)
                     other_rel_xy,               # 其他无人机相对位置XY(2*(num_drones-1)维)
                     other_dist,                 # 其他无人机到目标距离((num_drones-1)*num_targets维)
-                    target_vel_xy.reshape(self.num_envs, -1),  # 目标速度XY(2*num_targets维)
+                    target_vel_xy_norm.reshape(self.num_envs, -1),  # 目标速度XY(2*num_targets维)
                     closest_drone_one_hot.reshape(self.num_envs, -1),  # 最近无人机one-hot(num_targets*num_drones维)
-                    target_values,              # 目标价值(num_targets维)
+                    target_values_norm,         # 目标价值(num_targets维)
+                    assigned_target_one_hot[:, drone_idx],  # 固定分配目标one-hot(num_targets维)
                 ),
                 dim=-1,
             )
@@ -599,16 +661,28 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             self.drone_angular_velocities[:, i] = root_state[:, 10:13]
         self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
 
+        drone_positions_norm = self.drone_positions / self._norm_pos_scale
+        drone_linear_velocities_norm = self.drone_linear_velocities / self._norm_vel_scale
+        drone_angular_velocities_norm = self.drone_angular_velocities / self._norm_ang_vel_scale
+        target_positions_norm = self._target_positions / self._norm_pos_scale
+        target_velocities_norm = self._target_velocities / self._norm_vel_scale
+        target_values_norm = self._target_values.unsqueeze(0).repeat(self.num_envs, 1) / self._norm_target_value_scale
+        assigned_target_one_hot = torch.zeros(
+            self.num_envs, self._num_drones, self._num_targets, device=self.device
+        )
+        assigned_target_one_hot.scatter_(2, self._assigned_target_idx.unsqueeze(-1), 1.0)
+
         states = torch.cat(
             (
-                self.drone_positions.view(self.num_envs, -1),  # 无人机位置 (9)
+                drone_positions_norm.view(self.num_envs, -1),  # 无人机位置 (9)
                 self.drone_rot_matrices.view(self.num_envs, -1),  # 旋转矩阵 (27)
-                self.drone_linear_velocities.view(self.num_envs, -1),  # 线速度 (9)
-                self.drone_angular_velocities.view(self.num_envs, -1),  # 角速度 (9)
-                self._target_positions.view(self.num_envs, -1),  # 目标位置 (12)
-                self._target_velocities.view(self.num_envs, -1),  # 目标速度 (12)
+                drone_linear_velocities_norm.view(self.num_envs, -1),  # 线速度 (9)
+                drone_angular_velocities_norm.view(self.num_envs, -1),  # 角速度 (9)
+                target_positions_norm.view(self.num_envs, -1),  # 目标位置 (12)
+                target_velocities_norm.view(self.num_envs, -1),  # 目标速度 (12)
                 self._target_claimed.float().view(self.num_envs, -1),  # 捕获状态 (4)
-                self._target_values.unsqueeze(0).repeat(self.num_envs, 1),  # 目标价值 (4)
+                target_values_norm,  # 目标价值 (4)
+                assigned_target_one_hot.view(self.num_envs, -1),  # 固定分配关系 (num_drones*num_targets)
             ),
             dim=-1,
         )
@@ -637,16 +711,29 @@ class MARLFlyFollowEnv(DirectMARLEnv):
     
         target_pos_xy = self._target_positions[:, :, :2]             # (E, T, 2)
     
+        assigned_target_idx = self._assigned_target_idx
+        gather_idx_xy = assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
+        assigned_target_pos_xy = torch.gather(target_pos_xy.unsqueeze(1).expand(-1, self._num_drones, -1, -1), 2, gather_idx_xy).squeeze(2)
+        assigned_target_vel_xy = torch.gather(
+            self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
+            2,
+            gather_idx_xy,
+        ).squeeze(2)
+        assigned_target_values = self._target_values[assigned_target_idx]
+
         # =========================
         # 1) 相对位置 / 距离
         # =========================
         rel_xy = target_pos_xy.unsqueeze(1) - drone_pos_xy.unsqueeze(2)   # (E, D, T, 2)
         dist_xy = torch.norm(rel_xy, dim=-1)                               # (E, D, T)
-        min_dist = dist_xy.min(dim=-1).values                              # (E, D)
+        assigned_rel_xy = assigned_target_pos_xy - drone_pos_xy
+        assigned_dist = torch.norm(assigned_rel_xy, dim=-1)
     
         # 推荐在 cfg 里新增这些参数
         dist_sigma = getattr(self.cfg, "distance_reward_sigma", 2.0)
-        track_sigma = getattr(self.cfg, "tracking_reward_sigma", self.cfg.track_distance_xy)
+        tracking_bonus_distance_xy = getattr(
+            self.cfg, "tracking_bonus_distance_xy", self.cfg.track_distance_xy * 0.5
+        )
         height_sigma = getattr(self.cfg, "height_reward_sigma", 1.0)
         smooth_sigma = getattr(self.cfg, "action_smoothness_sigma", 0.25)
         collision_margin = getattr(self.cfg, "collision_soft_margin", 0.5)
@@ -664,6 +751,9 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         velocity_follow_progress_weight = getattr(self.cfg, "velocity_follow_progress_weight", 0.3)
         velocity_follow_overspeed_weight = getattr(self.cfg, "velocity_follow_overspeed_weight", 0.2)
         velocity_follow_overspeed_margin = getattr(self.cfg, "velocity_follow_overspeed_margin", 0.3)
+        velocity_penalty_xy_safe = getattr(self.cfg, "velocity_penalty_xy_safe", 0.0)
+        velocity_penalty_z_safe = getattr(self.cfg, "velocity_penalty_z_safe", 0.0)
+        velocity_penalty_z_scale = getattr(self.cfg, "velocity_penalty_z_scale", 0.25)
     
         eps = 1e-6
     
@@ -673,38 +763,22 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         #    新版 exp(-(d/sigma)^2)
         # =========================
         distance_reward = self.cfg.distance_reward_weight * torch.exp(
-            - (min_dist / (dist_sigma + eps)) ** 2
+            - (assigned_dist / (dist_sigma + eps)) ** 2
         )
     
         # =========================
-        # 3) 追踪奖励（连续型）
-        #    不再完全依赖硬阈值
-        #    这里仍按“目标分配给最近无人机”做 credit assignment，
-        #    但 reward 连续衰减，不是进圈才有
+        # 3) 追踪奖励（阈值 bonus）
+        #    distance_reward 负责连续拉近；
+        #    tracking_reward 只在进入更小跟随圈时给额外奖励
         # =========================
-        closest_dist, closest_drone = dist_xy.min(dim=1)  # (E, T), (E, T)
-    
-        tracking_reward = torch.zeros_like(min_dist)
-    
-        # 连续追踪奖励：距离越近越大，并乘目标价值
-        # 形式可理解为 target-centric credit
-        continuous_track_value = torch.exp(
-            - (closest_dist / (track_sigma + eps)) ** 2
-        ) * self._target_values.unsqueeze(0)  # (E, T)
-    
-        for t in range(self._num_targets):
-            drone_ids = closest_drone[:, t]  # (E,)
-            tracking_reward[torch.arange(self.num_envs, device=self.device), drone_ids] += continuous_track_value[:, t]
-    
-        tracking_reward = self.cfg.tracking_reward_weight * tracking_reward
+        tracking_bonus_mask = assigned_dist < tracking_bonus_distance_xy
+        tracking_reward = self.cfg.tracking_reward_weight * (
+            tracking_bonus_mask.float() * assigned_target_values
+        )
 
         # =========================
         # 3.1) 速度跟随奖励（与最近目标保持速度一致并向前推进）
         # =========================
-        nearest_target_idx = dist_xy.argmin(dim=-1)  # (E, D)
-        gather_idx = nearest_target_idx.unsqueeze(-1).expand(-1, -1, 2)
-        assigned_target_vel_xy = torch.gather(self._target_velocities[:, :, :2], dim=1, index=gather_idx)  # (E, D, 2)
-
         vel_err_xy = drone_vel_xy - assigned_target_vel_xy
         vel_err_norm = torch.norm(vel_err_xy, dim=-1)  # (E, D)
         vel_match_reward = torch.exp(- (vel_err_norm / (velocity_follow_sigma + eps)) ** 2)
@@ -755,14 +829,15 @@ class MARLFlyFollowEnv(DirectMARLEnv):
     
         # =========================
         # 6) 速度惩罚
-        #    建议同时考虑 xy 和 z，避免“竖直方向逃逸”
-        #    若你只想管 xy，可删去 vel_z_penalty
+        #    改成阈值型：只惩罚超出安全速度的部分
         # =========================
-        vel_xy_penalty = torch.norm(drone_vel_xy, dim=-1)
-        vel_z_penalty = torch.abs(drone_vel_z)
-    
+        vel_xy_speed = torch.norm(drone_vel_xy, dim=-1)
+        vel_z_speed = torch.abs(drone_vel_z)
+        vel_xy_penalty = torch.clamp(vel_xy_speed - velocity_penalty_xy_safe, min=0.0)
+        vel_z_penalty = torch.clamp(vel_z_speed - velocity_penalty_z_safe, min=0.0)
+
         velocity_penalty = self.cfg.velocity_penalty_weight * (
-            vel_xy_penalty + 0.25 * vel_z_penalty
+            vel_xy_penalty + velocity_penalty_z_scale * vel_z_penalty
         )
     
         # =========================
@@ -856,7 +931,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         #    防止 reward 总体过负，也有助于稳定训练
         # =========================
         alive_reward_weight = getattr(self.cfg, "alive_reward_weight", 0.0)
-        alive_reward = alive_reward_weight * torch.ones_like(min_dist)
+        alive_reward = alive_reward_weight * torch.ones_like(assigned_dist)
     
         # =========================
         # 11) 汇总
@@ -928,6 +1003,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         for i, robot in enumerate(self.robots):
             root_state = robot.data.root_state_w
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
 
         # 高度过低终止：防止撞击地面
         falcon_fly_low = (self.drone_positions[:, :, 2] < self.cfg.min_altitude).any(dim=-1)
@@ -940,14 +1016,41 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 时间超时
         self.time_out = self.episode_length_buf >= self.max_episode_length - 1
 
+        assigned_target_pos_xy = torch.gather(
+            self._target_positions[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
+            2,
+            self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
+        ).squeeze(2)
+        assigned_target_vel_xy = torch.gather(
+            self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
+            2,
+            self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
+        ).squeeze(2)
+        assigned_dist_xy = torch.norm(self.drone_positions[:, :, :2] - assigned_target_pos_xy, dim=-1)
+        height_error = torch.abs(self.drone_positions[:, :, 2] - self.cfg.desired_height)
+        vel_error_xy = torch.norm(self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy, dim=-1)
+
+        success_mask = (
+            (assigned_dist_xy <= self.cfg.track_distance_xy)
+            & (height_error <= self.cfg.success_height_tolerance)
+            & (vel_error_xy <= self.cfg.success_velocity_tolerance)
+        )
+        self._sustained_follow_timer = torch.where(
+            success_mask,
+            self._sustained_follow_timer + self.step_dt,
+            torch.zeros_like(self._sustained_follow_timer),
+        )
+        sustained_success = (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)
+
         # 综合终止条件
-        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside
+        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | sustained_success
         timed_outs = self.time_out
 
         # 调试日志（每步）- 记录到全局 log 以及每个 agent 的 extras 中
         fly_low_rate = falcon_fly_low.float().mean()
         fly_high_rate = falcon_fly_high.float().mean()
         out_of_bounds_rate = body_pos_outside.float().mean()
+        sustained_success_rate = sustained_success.float().mean()
         time_out_rate = self.time_out.float().mean()
         any_rate = terminations.float().mean()
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
@@ -956,6 +1059,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             "Debug/Termination/fly_low_rate": fly_low_rate,
             "Debug/Termination/fly_high_rate": fly_high_rate,
             "Debug/Termination/out_of_bounds_rate": out_of_bounds_rate,
+            "Debug/Termination/sustained_success_rate": sustained_success_rate,
             "Debug/Termination/time_out_rate": time_out_rate,
             "Debug/Termination/any_rate": any_rate,
             "Debug/Termination/min_height": min_height,
@@ -968,6 +1072,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             log["Debug/Termination/fly_low_rate"] = fly_low_rate
             log["Debug/Termination/fly_high_rate"] = fly_high_rate
             log["Debug/Termination/out_of_bounds_rate"] = out_of_bounds_rate
+            log["Debug/Termination/sustained_success_rate"] = sustained_success_rate
             log["Debug/Termination/time_out_rate"] = time_out_rate
             log["Debug/Termination/any_rate"] = any_rate
             log["Debug/Termination/min_height"] = min_height
@@ -1029,6 +1134,13 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 重置目标状态
         self._reset_targets(env_ids)
 
+        # 在 reset 后基于当前初始几何关系固定 assignment
+        for i, robot in enumerate(self.robots):
+            root_state = robot.data.root_state_w
+            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
+        self._assign_targets_for_envs(env_ids)
+        self._sustained_follow_timer[env_ids] = 0.0
+
         # 重置观测缓冲区和动作历史
         for agent in self.cfg.possible_agents:
             self._observation_buffers[agent].reset(env_ids)
@@ -1059,12 +1171,17 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         self.extras["log"]["Episode_Termination/falcon_fly_low"] = fly_low_count
         self.extras["log"]["Episode_Termination/falcon_fly_high"] = fly_high_count
         self.extras["log"]["Episode_Termination/bounding_box"] = out_of_bounds_count
+        success_count = torch.count_nonzero(
+            (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)[env_ids]
+        ).item()
+        self.extras["log"]["Episode_Termination/sustained_success"] = success_count
         self.extras["log"]["Episode_Termination/time_out"] = time_out_count
         for agent in self.cfg.possible_agents:
             log = self.extras[agent]["log"]
             log["Episode_Termination/falcon_fly_low"] = fly_low_count
             log["Episode_Termination/falcon_fly_high"] = fly_high_count
             log["Episode_Termination/bounding_box"] = out_of_bounds_count
+            log["Episode_Termination/sustained_success"] = success_count
             log["Episode_Termination/time_out"] = time_out_count
 
         # 记录奖励成分平均值
@@ -1123,14 +1240,6 @@ class MARLFlyFollowEnv(DirectMARLEnv):
                 start_x,
                 self._target_positions[..., 0],
             )
-            # 到达终点后回到起点，允许重新奖励
-            self._target_claimed = torch.where(
-                overflow, torch.zeros_like(self._target_claimed), self._target_claimed
-            )
-            self._target_assignment = torch.where(
-                overflow, torch.full_like(self._target_assignment, -1), self._target_assignment
-            )
-
         # 可视化更新（仅更新env_0环境以提高性能）
         positions_world = self._target_positions + self.scene.env_origins.unsqueeze(1)
         for i, prim in enumerate(self._target_prims):
