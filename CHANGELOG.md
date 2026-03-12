@@ -1,3 +1,24 @@
+## [2026-03-12] 修复训练局部最优
+
+**修改文件：**
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env.py`
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+- `.gitignore`（修正 `.claude` 路径）
+- 删除废弃文件 `marl_move_env-zy.py`
+
+**修改原因：**
+训练稳定卡在"接近目标但进不了成功区、被高度/速度惩罚长期压制"的局部最优。根因是三个约束共同封死了追近行为：distance_reward_sigma=28 导致近程梯度几乎为零；overspeed_margin=0.3m/s 限制无人机只能以 0.3m/s 的速度优势追近；velocity_penalty_xy_safe=1.2m/s 与前者叠加后实际速度上限约 1.1m/s，严重不足。
+
+**主要变更：**
+- `distance_reward_sigma` 从 28 降至 10，d=5m→3m 的梯度增强约 10 倍，策略可感知靠近成功区的价值
+- `tracking_reward_weight` 从 1.0 增至 2.5，增大进入 1.5m 成功圈的激励
+- `velocity_follow_overspeed_margin` 从 0.3 增至 2.0 m/s，允许无人机以更高速冲入成功区
+- `velocity_follow_overspeed_weight` 从 0.2 降至 0.05，大幅削减超速惩罚
+- `velocity_penalty_xy_safe` 从 1.2 增至 2.5 m/s，彻底打开追近时的速度上限
+- 新增 `dist_progress_reward`（势函数距离进度奖励）：每步奖励 `w × (prev_dist - curr_dist)`，提供直接的时序梯度信号驱动无人机主动缩短与目标的距离
+
+---
+
 # Reward 设计变更记录
 
 本文档记录 fly-follow 多无人机强化学习任务中 **reward 设计的演进过程**。

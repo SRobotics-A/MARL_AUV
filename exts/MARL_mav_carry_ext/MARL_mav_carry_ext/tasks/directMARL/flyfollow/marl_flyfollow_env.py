@@ -155,6 +155,11 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 目标沿x轴匀速移动
         self._target_velocities[..., 0] = cfg.target_speed
 
+        # 势函数距离进度奖励：记录上一步各无人机到分配目标的距离
+        self._prev_assigned_dist = torch.full(
+            (self.num_envs, self._num_drones), 100.0, device=self.device
+        )
+
         # 奖励统计（用于日志记录）
         self._episode_sums = {
             key: torch.zeros(
@@ -164,6 +169,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             )
             for key in [
                 "distance_reward",
+                "dist_progress_reward", 
                 "tracking_reward",
                 "velocity_follow_reward",
                 "action_smoothness",
@@ -759,12 +765,24 @@ class MARLFlyFollowEnv(DirectMARLEnv):
     
         # =========================
         # 2) 距离奖励（连续型，更宽）
-        #    旧版 exp(-d) 衰减太快
-        #    新版 exp(-(d/sigma)^2)
+        #    新版 exp(-(d/sigma)^2)，sigma=10 在 5m 以内梯度显著
         # =========================
         distance_reward = self.cfg.distance_reward_weight * torch.exp(
             - (assigned_dist / (dist_sigma + eps)) ** 2
         )
+
+        # 2.5) 距离进度奖励（势函数 shaping）
+        #    reward = w * (prev_dist - curr_dist) / step_dt，在 total 乘以 step_dt 后 
+        #    等价于：每步奖励 w * ∆dist（减少距离即得正奖励）
+        #    这提供了直接的时序梯度，驱动无人机主动缩短与目标的距离
+        # =========================
+        dist_progress_weight = getattr(self.cfg, "dist_progress_weight", 0.0)
+        dist_progress = self._prev_assigned_dist - assigned_dist   # (E, D)，正值=拉近
+        dist_progress_reward = dist_progress_weight * torch.clamp(
+            dist_progress / (self.step_dt + eps), min=-10.0, max=10.0
+        )
+        self._prev_assigned_dist = assigned_dist.detach().clone()
+        # =========================  
     
         # =========================
         # 3) 追踪奖励（阈值 bonus）
@@ -939,6 +957,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         total_reward = (
             alive_reward
             + distance_reward
+            + dist_progress_reward
             + tracking_reward
             + velocity_follow_reward
             + action_smoothness
@@ -958,6 +977,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
                 "[flyfollow][reward_mean] "
                 f"total={total_reward.mean().item():.4f}, "
                 f"dist={distance_reward.mean().item():.4f}, "
+                f"progress={dist_progress_reward.mean().item():.4f}, "
                 f"track={tracking_reward.mean().item():.4f}, "
                 f"vel_follow={velocity_follow_reward.mean().item():.4f}, "
                 f"smooth={action_smoothness.mean().item():.4f}, "
@@ -976,6 +996,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 12) 日志（按环境求和）
         # =========================
         self._episode_sums["distance_reward"] += distance_reward.sum(dim=-1)
+        self._episode_sums["dist_progress_reward"] += dist_progress_reward.sum(dim=-1)
         self._episode_sums["tracking_reward"] += tracking_reward.sum(dim=-1)
         self._episode_sums["velocity_follow_reward"] += velocity_follow_reward.sum(dim=-1)
         self._episode_sums["action_smoothness"] += action_smoothness.sum(dim=-1)
@@ -1140,6 +1161,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
         self._assign_targets_for_envs(env_ids)
         self._sustained_follow_timer[env_ids] = 0.0
+        self._prev_assigned_dist[env_ids] = 100.0  # 重置进度奖励基准距离
 
         # 重置观测缓冲区和动作历史
         for agent in self.cfg.possible_agents:

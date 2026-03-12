@@ -103,7 +103,7 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     success_height_tolerance = 0.8                     # 成功跟随时允许的高度误差（放宽）
     success_velocity_tolerance = 1.0                   # 成功跟随时允许的XY速度误差（放宽）
 
-    distance_reward_sigma = 28
+    distance_reward_sigma = 10                              # 从28降至10：更强的近程梯度（5m内明显提升）
     height_reward_sigma = 1.0
     action_smoothness_sigma = 0.25
     collision_soft_margin = 0.5
@@ -116,16 +116,17 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     # 奖励塑形参数
     distance_reward_weight = 1.0                        # 距离奖励权重
-    tracking_reward_weight = 1.0                        # 追踪奖励权重
+    tracking_reward_weight = 2.5                        # 追踪奖励权重（从1.0增至2.5：进入成功区更大激励）
+    dist_progress_weight: float = 0.3                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
     velocity_follow_weight = 0.8                        # 速度跟随主权重
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数
-    velocity_follow_overspeed_weight = 0.2              # 超速惩罚系数（速度跟随项内部）
+    velocity_follow_overspeed_weight = 0.05             # 超速惩罚系数（从0.2降至0.05：允许积极追近）
     velocity_follow_sigma = 0.8                         # 速度匹配高斯核宽度
-    velocity_follow_overspeed_margin = 0.3              # 超速容忍裕量（m/s）
+    velocity_follow_overspeed_margin = 2.0              # 超速容忍裕量（从0.3增至2.0 m/s：允许以高速冲入成功区）
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
     body_rate_penalty_weight = 0.2                      # 机体角速率惩罚权重
     velocity_penalty_weight = 0.2                       # 速度惩罚权重
-    velocity_penalty_xy_safe = 1.2                      # XY 安全速度阈值（m/s）
+    velocity_penalty_xy_safe = 2.5                      # XY 安全速度阈值（从1.2增至2.5 m/s：追近时允许更高速度）
     velocity_penalty_z_safe = 0.5                       # Z 安全速度阈值（m/s）
     velocity_penalty_z_scale = 0.25                     # Z 超速惩罚相对权重
     force_penalty_weight = 0.2                          # 推力惩罚权重
