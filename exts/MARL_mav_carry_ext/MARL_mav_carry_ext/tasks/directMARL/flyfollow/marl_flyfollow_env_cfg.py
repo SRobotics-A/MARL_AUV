@@ -100,7 +100,7 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     track_distance_xy = 3.0                             # 成功跟踪的XY平面距离阈值（放宽）
     tracking_bonus_distance_xy = 1.5                   # 进入该小范围后给予额外 tracking bonus（放宽）
     success_hold_time = 1.0                            # 持续进入跟踪范围多少秒后判定成功（放宽）
-    success_height_tolerance = 0.8                     # 成功跟随时允许的高度误差（放宽）
+
     success_velocity_tolerance = 1.0                   # 成功跟随时允许的XY速度误差（放宽）
 
     distance_reward_sigma = 10                              # 从28降至10：更强的近程梯度（5m内明显提升）
@@ -108,10 +108,10 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     action_smoothness_sigma = 0.25
     collision_soft_margin = 0.5
     boundary_soft_margin = 1.0
-    altitude_soft_margin = 1.0
-    altitude_upper_soft_threshold = 2.8                # 高度软上限，超过后开始惩罚
-    high_altitude_soft_margin = 0.6                    # 高度超上限惩罚归一化范围
-    high_altitude_penalty_weight = 0.12                # 超高飞行惩罚权重（降权，主要交给 done 约束）
+    altitude_soft_margin = 1.0                         # 低高度软惩罚区间：z < min_altitude+1.0=2.0m 时开始罚
+    altitude_upper_soft_threshold = 5.5                # 高度软上限：z > 5.5m 才开始罚（硬终止 7.0m，留 1.5m 缓冲）
+    high_altitude_soft_margin = 1.5                    # 超高软惩罚归一化区间（5.5~7.0m 线性增大）
+    high_altitude_penalty_weight = 0.4                 # 超高软惩罚权重
     alive_reward_weight = 0.05
 
     # 奖励塑形参数
@@ -122,20 +122,22 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数
     velocity_follow_overspeed_weight = 0.05             # 超速惩罚系数（从0.2降至0.05：允许积极追近）
     velocity_follow_sigma = 0.8                         # 速度匹配高斯核宽度
-    velocity_follow_overspeed_margin = 2.0              # 超速容忍裕量（从0.3增至2.0 m/s：允许以高速冲入成功区）
+    velocity_follow_overspeed_margin = 1.0              # 超速容忍裕量（从2.0降至1.0：避免无人机5m/s乱飞）
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
     body_rate_penalty_weight = 0.2                      # 机体角速率惩罚权重
     velocity_penalty_weight = 0.2                       # 速度惩罚权重
-    velocity_penalty_xy_safe = 2.5                      # XY 安全速度阈值（从1.2增至2.5 m/s：追近时允许更高速度）
+    velocity_penalty_xy_safe = 2.0                      # XY 安全速度阈值（从2.5降至2.0：稍微收紧以防5m/s乱飞）
     velocity_penalty_z_safe = 0.5                       # Z 安全速度阈值（m/s）
     velocity_penalty_z_scale = 0.25                     # Z 超速惩罚相对权重
     force_penalty_weight = 0.2                          # 推力惩罚权重
-    height_reward_weight = 0.5                          # 高度奖励权重
-    height_error_penalty_weight = 0.08                  # 对称高度误差惩罚权重 |z-desired_height|（降权）
-    height_error_above_extra_weight = 0.05              # 高于目标高度时的额外惩罚权重（弱化）
-    height_error_quadratic_weight = 0.01                # 高度误差二次惩罚权重（弱化）
-    height_hold_deadband = 0.10                         # 高度保持死区（米），死区内不罚
-    vertical_direction_penalty_weight = 0.05            # 反方向垂直速度惩罚（降权，避免主导学习）
+    # 不要求定高悬停，只需保持在安全高度带内（不超高/不超低）
+    # 高度控制完全交给软边界惩罚（safety_penalty 中的 low/high_altitude_penalty）和终止条件（fly_low/fly_high）
+    height_reward_weight = 0.0                          # 关闭"靠近 desired_height"的高斯奖励（不需要定高）
+    height_error_penalty_weight = 0.0                   # 关闭高度误差惩罚（不需要贴 2m 飞）
+    height_error_above_extra_weight = 0.0               # 关闭超高额外惩罚（由 high_altitude_penalty 统一处理）
+    height_error_quadratic_weight = 0.0                 # 关闭高度二次惩罚
+    height_hold_deadband = 0.10                         # 保留参数（已不生效）
+    vertical_direction_penalty_weight = 0.0             # 关闭方向性垂直速度惩罚（不需要定高）
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
     # 高度与碰撞相关
@@ -212,9 +214,9 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         # Keep this in the same order as _get_observations()
         self.obs_dim_per_step = (
             self.num_drones                          # agent one-hot
-            + 2                                      # own position xy
+            + 3                                      # own position xyz（含高度 z）
             + 9                                      # own rotation matrix
-            + 2                                      # own linear velocity xy
+            + 3                                      # own linear velocity xyz（含垂直速度 vz）
             + 3                                      # own angular velocity
             + (self.num_targets * 2)                # own relative target xy
             + self.num_targets                      # own target distances

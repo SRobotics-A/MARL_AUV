@@ -580,9 +580,11 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 计算旋转矩阵
         self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
 
-        # 提取XY平面坐标用于2D跟随任务
+        # 提取XY平面坐标用于2D跟随任务，以及Z高度和Z速度用于高度控制
         drone_pos_xy = self.drone_positions[:, :, :2]
+        drone_pos_z = self.drone_positions[:, :, 2:3]              # (E, D, 1)，高度
         drone_lin_vel_xy = self.drone_linear_velocities[:, :, :2]
+        drone_lin_vel_z = self.drone_linear_velocities[:, :, 2:3]  # (E, D, 1)，垂直速度
         target_pos_xy = self._target_positions[:, :, :2]
         target_vel_xy = self._target_velocities[:, :, :2]
 
@@ -601,7 +603,9 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
         # 统一归一化连续物理量，降低不同量纲对策略学习的干扰
         drone_pos_xy_norm = drone_pos_xy / self._norm_pos_scale
+        drone_pos_z_norm = drone_pos_z / 5.0                       # z归一化：0~10m → 0~2.0
         drone_lin_vel_xy_norm = drone_lin_vel_xy / self._norm_vel_scale
+        drone_lin_vel_z_norm = drone_lin_vel_z / self._norm_vel_scale
         drone_ang_vel_norm = self.drone_angular_velocities / self._norm_ang_vel_scale
         rel_xy_norm = rel_xy / self._norm_pos_scale
         dist_xy_norm = dist_xy / self._norm_dist_scale
@@ -632,8 +636,10 @@ class MARLFlyFollowEnv(DirectMARLEnv):
                 (
                     one_hot,                    # 智能体标识
                     drone_pos_xy_norm[:, drone_idx],          # 本机位置XY(2维)
+                    drone_pos_z_norm[:, drone_idx],           # 本机高度Z(1维)，用于高度控制
                     self.drone_rot_matrices[:, drone_idx].reshape(self.num_envs, -1),  # 本机姿态(9维)
                     drone_lin_vel_xy_norm[:, drone_idx],      # 本机速度XY(2维)
+                    drone_lin_vel_z_norm[:, drone_idx],       # 本机垂直速度Vz(1维)，用于高度控制
                     drone_ang_vel_norm[:, drone_idx],  # 本机角速度(3维)
                     own_rel_xy,                 # 到各目标相对位置(2*num_targets维)
                     own_dist,                   # 到各目标距离(num_targets维)
@@ -981,9 +987,6 @@ class MARLFlyFollowEnv(DirectMARLEnv):
                 f"track={tracking_reward.mean().item():.4f}, "
                 f"vel_follow={velocity_follow_reward.mean().item():.4f}, "
                 f"smooth={action_smoothness.mean().item():.4f}, "
-                f"height={height_reward.mean().item():.4f}, "
-                f"height_err_pen={height_error_penalty.mean().item():.4f}, "
-                f"vz_dir_pen={vertical_direction_penalty.mean().item():.4f}, "
                 f"high_alt_pen={high_altitude_penalty.mean().item():.4f}, "
                 f"rate_pen={body_rate_penalty.mean().item():.4f}, "
                 f"vel_pen={velocity_penalty.mean().item():.4f}, "
@@ -1048,13 +1051,16 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
         ).squeeze(2)
         assigned_dist_xy = torch.norm(self.drone_positions[:, :, :2] - assigned_target_pos_xy, dim=-1)
-        height_error = torch.abs(self.drone_positions[:, :, 2] - self.cfg.desired_height)
         vel_error_xy = torch.norm(self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy, dim=-1)
+        drone_z = self.drone_positions[:, :, 2]
 
+        # 成功判定：仅要求 XY 距离 + 速度匹配 + 在安全高度带内（不要求定高）
+        # 高度安全由终止条件（fly_low/fly_high）和软惩罚（high/low_altitude_penalty）保证
+        in_height_band = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
         success_mask = (
             (assigned_dist_xy <= self.cfg.track_distance_xy)
-            & (height_error <= self.cfg.success_height_tolerance)
             & (vel_error_xy <= self.cfg.success_velocity_tolerance)
+            & in_height_band
         )
         self._sustained_follow_timer = torch.where(
             success_mask,

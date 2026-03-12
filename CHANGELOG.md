@@ -1,3 +1,21 @@
+## [2026-03-12] 修复高度观测缺失 + 去除定高约束
+
+**修改文件：**
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env.py`
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+
+**修改原因：**
+训练分析发现无人机长期悬停在 3.7~4.7m（目标 2.0m），根因是观测向量缺少 z 位置和 vz 速度，导致高度控制无从学习。同时明确任务不要求定高，只需保持在安全高度带内，因此移除所有与"悬停在 2m"相关的奖励惩罚项，并将 success 判定中的高度精度条件改为高度带检查。
+
+**主要变更：**
+- 观测向量新增本机高度 z（归一化 /5.0）和垂直速度 vz，`obs_dim_per_step` +2
+- 关闭所有定高相关奖励/惩罚：`height_reward_weight=0`、`height_error_penalty_weight=0`、`vertical_direction_penalty_weight=0`
+- success 判定移除 `|z - desired_height| ≤ tolerance` 条件，改为 `min_altitude ≤ z ≤ max_altitude` 高度带检查
+- 删除已失效的 `success_height_tolerance` 参数
+- 高度软边界重新对齐硬终止边界：低惩罚区 z < 2.0m，高惩罚区 z > 5.5m（硬终止 7.0m），中间段完全自由
+
+---
+
 ## [2026-03-12] 修复训练局部最优
 
 **修改文件：**
