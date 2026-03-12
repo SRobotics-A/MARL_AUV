@@ -1,3 +1,23 @@
+## [2026-03-13] 升级 tracking_reward 为持续稳定跟随奖励
+
+**修改文件：**
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env.py`
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+
+**修改原因：**
+原 tracking_reward 采用纯 binary mask（距离 < 1.5m 即给固定奖励），梯度不连续且无法区分"抖动进出"与"稳定贴近"两种截然不同的行为质量。升级为三因子相乘的持续奖励机制，使策略可感知"更近、更稳、持续更久"的方向梯度。
+
+**主要变更：**
+- 新增 `_tracking_stable_timer` 缓冲区（shape: `E×D`），记录各无人机连续满足近距+速度匹配条件的持续时间，并在 `_reset_idx` 中正确重置
+- `tracking_reward` 从 `binary_mask × target_value` 升级为 `target_value × dist_factor × vel_match_factor × persistence_bonus` 三因子乘积
+- `dist_factor = exp(-(dist/bonus_dist)²)`：在 bonus_distance_xy=1.5m 内有连续梯度，消除 1.5m 处断崖
+- `vel_match_factor = exp(-(vel_err/sigma)²)`（sigma=1.5m/s）：速度不匹配时即使距离近也无法获得高奖励，抑制抖动进出行为
+- `persistence_bonus = 1 + alpha × clamp(timer/T_ref, 0, 1)`（alpha=0.5, T_ref=2.0s）：稳定跟随 2 秒可获最多 +50% 额外加成，激励持续维持跟随状态
+- 新增 cfg 参数：`tracking_vel_match_sigma=1.5`、`tracking_persistence_alpha=0.5`、`tracking_persistence_time=2.0`
+- 将 `vel_err_xy/vel_err_norm` 的计算提前至 tracking_reward 之前，供 tracking 和 velocity_follow 两部分共用，消除重复计算
+
+---
+
 ## [2026-03-12] 弱化速度惩罚为防失控约束
 
 **修改文件：**

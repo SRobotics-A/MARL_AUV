@@ -235,6 +235,12 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
         )
 
+        # 近距稳定跟随计时器（tracking_reward 持续时间加成用）
+        # 条件：dist < tracking_bonus_distance_xy AND vel_err < 2*tracking_vel_match_sigma
+        self._tracking_stable_timer = torch.zeros(
+            (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
+        )
+
         # 初始化目标位置
         self._reset_targets(torch.arange(self.num_envs, device=self.device))
 
@@ -768,7 +774,11 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         velocity_penalty_z_scale = getattr(self.cfg, "velocity_penalty_z_scale", 0.25)
     
         eps = 1e-6
-    
+
+        # 速度误差（提前计算，供 tracking_reward 和 velocity_follow_reward 共用）
+        vel_err_xy = drone_vel_xy - assigned_target_vel_xy
+        vel_err_norm = torch.norm(vel_err_xy, dim=-1)  # (E, D)
+
         # =========================
         # 2) 距离奖励（连续型，更宽）
         #    新版 exp(-(d/sigma)^2)，sigma=10 在 5m 以内梯度显著
@@ -778,7 +788,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         )
 
         # 2.5) 距离进度奖励（势函数 shaping）
-        #    reward = w * (prev_dist - curr_dist) / step_dt，在 total 乘以 step_dt 后 
+        #    reward = w * (prev_dist - curr_dist) / step_dt，在 total 乘以 step_dt 后
         #    等价于：每步奖励 w * ∆dist（减少距离即得正奖励）
         #    这提供了直接的时序梯度，驱动无人机主动缩短与目标的距离
         # =========================
@@ -788,23 +798,41 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             dist_progress / (self.step_dt + eps), min=-10.0, max=10.0
         )
         self._prev_assigned_dist = assigned_dist.detach().clone()
-        # =========================  
-    
         # =========================
-        # 3) 追踪奖励（阈值 bonus）
-        #    distance_reward 负责连续拉近；
-        #    tracking_reward 只在进入更小跟随圈时给额外奖励
+
         # =========================
-        tracking_bonus_mask = assigned_dist < tracking_bonus_distance_xy
-        tracking_reward = self.cfg.tracking_reward_weight * (
-            tracking_bonus_mask.float() * assigned_target_values
+        # 3) 追踪奖励（升级版：近距 × 速度匹配 × 持续时间加成）
+        #    旧版：纯 binary mask（在 bonus_dist 内给固定奖励），梯度不连续
+        #    新版：三因子相乘，只有"距离近 AND 速度匹配 AND 持续稳定"才能获得高奖励
+        #      - dist_factor: 在 bonus_dist 内有连续梯度，鼓励真正贴近
+        #      - vel_match_factor: 速度匹配越好奖励越高，抑制抖动进出
+        #      - persistence_bonus: 持续满足条件最多额外 +alpha 比例，奖励稳定跟随
+        # =========================
+        tracking_vel_sigma = getattr(self.cfg, "tracking_vel_match_sigma", 1.5)
+        tracking_persistence_alpha = getattr(self.cfg, "tracking_persistence_alpha", 0.5)
+        tracking_persistence_time = getattr(self.cfg, "tracking_persistence_time", 2.0)
+
+        dist_factor = torch.exp(- (assigned_dist / (tracking_bonus_distance_xy + eps)) ** 2)
+        vel_match_factor = torch.exp(- (vel_err_norm / (tracking_vel_sigma + eps)) ** 2)
+        persistence_bonus = 1.0 + tracking_persistence_alpha * torch.clamp(
+            self._tracking_stable_timer / (tracking_persistence_time + eps), max=1.0
+        )
+        tracking_reward = self.cfg.tracking_reward_weight * assigned_target_values * (
+            dist_factor * vel_match_factor * persistence_bonus
+        )
+
+        # 更新近距稳定计时器：需同时满足距离 < bonus_dist 且速度误差 < 2*sigma
+        tracking_active = (assigned_dist < tracking_bonus_distance_xy) & (vel_err_norm < tracking_vel_sigma * 2.0)
+        self._tracking_stable_timer = torch.where(
+            tracking_active,
+            self._tracking_stable_timer + self.step_dt,
+            torch.zeros_like(self._tracking_stable_timer),
         )
 
         # =========================
         # 3.1) 速度跟随奖励（与最近目标保持速度一致并向前推进）
         # =========================
-        vel_err_xy = drone_vel_xy - assigned_target_vel_xy
-        vel_err_norm = torch.norm(vel_err_xy, dim=-1)  # (E, D)
+        # vel_err_xy / vel_err_norm 已在上方提前计算
         vel_match_reward = torch.exp(- (vel_err_norm / (velocity_follow_sigma + eps)) ** 2)
 
         target_speed = torch.norm(assigned_target_vel_xy, dim=-1)  # (E, D)
@@ -1167,6 +1195,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
         self._assign_targets_for_envs(env_ids)
         self._sustained_follow_timer[env_ids] = 0.0
+        self._tracking_stable_timer[env_ids] = 0.0  # 重置近距稳定计时器
         self._prev_assigned_dist[env_ids] = 100.0  # 重置进度奖励基准距离
 
         # 重置观测缓冲区和动作历史
