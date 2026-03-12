@@ -1,3 +1,18 @@
+## [2026-03-12] 弱化速度惩罚为防失控约束
+
+**修改文件：**
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+
+**修改原因：**
+速度惩罚过激导致贴近保持不稳定——惩罚权重过高且阈值过低，干扰了正常追踪机动。将 velocity_penalty 定位为"防失控的最后一道约束"而非行为塑形工具，行为塑形职责完全交给 velocity_follow_reward 和 dist_progress_reward。
+
+**主要变更：**
+- `velocity_penalty_weight` 从 0.2 降至 0.05，惩罚力度降低 4 倍
+- `velocity_penalty_xy_safe` 从 2.0 升至 4.0 m/s，正常追踪机动（≤2.3 m/s）完全不触发
+- `velocity_penalty_z_safe` 从 0.5 升至 2.0 m/s，允许高度调整时的正常爬升/下降
+
+---
+
 ## [2026-03-12] 修复高度观测缺失 + 去除定高约束
 
 **修改文件：**

@@ -125,9 +125,9 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     velocity_follow_overspeed_margin = 1.0              # 超速容忍裕量（从2.0降至1.0：避免无人机5m/s乱飞）
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
     body_rate_penalty_weight = 0.2                      # 机体角速率惩罚权重
-    velocity_penalty_weight = 0.2                       # 速度惩罚权重
-    velocity_penalty_xy_safe = 2.0                      # XY 安全速度阈值（从2.5降至2.0：稍微收紧以防5m/s乱飞）
-    velocity_penalty_z_safe = 0.5                       # Z 安全速度阈值（m/s）
+    velocity_penalty_weight = 0.05                      # 速度惩罚权重（从0.2降至0.05：仅作防失控约束，不主导行为塑形）
+    velocity_penalty_xy_safe = 4.0                      # XY 安全速度阈值（从2.0升至4.0 m/s：正常追踪机动完全不触发）
+    velocity_penalty_z_safe = 2.0                       # Z 安全速度阈值（从0.5升至2.0 m/s：允许正常高度调整）
     velocity_penalty_z_scale = 0.25                     # Z 超速惩罚相对权重
     force_penalty_weight = 0.2                          # 推力惩罚权重
     # 不要求定高悬停，只需保持在安全高度带内（不超高/不超低）
