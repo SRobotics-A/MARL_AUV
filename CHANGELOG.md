@@ -1,3 +1,22 @@
+## [2026-03-13] 重构 tracking_reward 为加法结构，强化稳定保持
+
+**修改文件：**
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env.py`
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/assets/data/AMR/flyfollow/city.usd`
+
+**修改原因：**
+原三因子相乘结构（dist_factor × vel_match_factor × persistence_bonus）导致任何单项偏低都会让整体奖励跌近零，表现为偶发 spike 而非可持续的区内奖励抬升。重构为加法结构，使无人机进入 bonus 区后每步赚到明确保底收益，速度质量和持续时间作为叠加项而非乘法门控。
+
+**主要变更：**
+- `tracking_reward` 公式从 `w×v×dist_factor×vel_factor×persistence` 重构为 `w×v×in_zone_factor×(1 + vel_bonus + persistence_gain)`，消除乘法清零效应
+- 新增 `in_zone_factor = sigmoid((bonus_dist - dist) × sharpness)`：sigmoid 软边界替代高斯 dist_factor，区内深处稳定趋近 1，每步保底基础收益清晰可见
+- 速度质量和持续时间从乘法约束改为叠加项：即使速度不完全匹配，仅损失额外加成而不影响基础保底（最多各 +50%）
+- 计时器激活条件简化为 `dist < bonus_dist`（不再叠加速度门槛），速度激励完全交给 vel_quality 叠加项独立处理
+- cfg 新增 `tracking_zone_sharpness=4.0`（软边界陡度，约 0.25m 过渡区间）和 `tracking_vel_quality_alpha=0.5`（速度叠加项权重）
+
+---
+
 ## [2026-03-13] 升级 tracking_reward 为持续稳定跟随奖励
 
 **修改文件：**

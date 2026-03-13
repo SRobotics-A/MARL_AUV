@@ -116,10 +116,12 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     # 奖励塑形参数
     distance_reward_weight = 1.0                        # 距离奖励权重
-    tracking_reward_weight = 2.5                        # 追踪奖励权重（升级版：近距×速度匹配×持续时间加成）
-    tracking_vel_match_sigma: float = 1.5               # 速度匹配高斯核宽度（m/s），同时作为计时器激活阈值的 1/2
-    tracking_persistence_alpha: float = 0.5             # 持续跟随最大额外奖励比例（1.0 = 最多 +100%）
-    tracking_persistence_time: float = 2.0              # 达到满加成所需的持续跟随时间（s）
+    tracking_reward_weight = 2.5                        # 追踪奖励权重（稳定保持版：区内每步保底+叠加加成）
+    tracking_zone_sharpness: float = 4.0               # sigmoid 软边界陡度（1/m）：4.0 → 约 0.25m 内完成过渡
+    tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响叠加项 vel_bonus
+    tracking_vel_quality_alpha: float = 0.5             # 速度质量叠加项最大权重（最多 +50% 基础收益）
+    tracking_persistence_alpha: float = 0.5             # 持续时间叠加项最大权重（最多 +50% 基础收益）
+    tracking_persistence_time: float = 2.0              # 达到满加成所需的持续在区时间（s）
     dist_progress_weight: float = 0.3                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
     velocity_follow_weight = 0.8                        # 速度跟随主权重
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数

@@ -801,28 +801,43 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # =========================
 
         # =========================
-        # 3) 追踪奖励（升级版：近距 × 速度匹配 × 持续时间加成）
-        #    旧版：纯 binary mask（在 bonus_dist 内给固定奖励），梯度不连续
-        #    新版：三因子相乘，只有"距离近 AND 速度匹配 AND 持续稳定"才能获得高奖励
-        #      - dist_factor: 在 bonus_dist 内有连续梯度，鼓励真正贴近
-        #      - vel_match_factor: 速度匹配越好奖励越高，抑制抖动进出
-        #      - persistence_bonus: 持续满足条件最多额外 +alpha 比例，奖励稳定跟随
+        # 3) 追踪奖励（稳定保持版：加法结构，区内每步赚到明确基础收益）
+        #
+        #    设计理念：
+        #      旧版三因子相乘 → 任何一项小就让奖励跌近零（偶发 spike）
+        #      新版加法结构  → in_zone_factor 做区内/区外门控，速度质量和持续时间是叠加项
+        #
+        #      tracking = w × v × in_zone_factor × (1 + vel_bonus + persistence_gain)
+        #        - in_zone_factor: sigmoid 软边界，区内 ≈1（每步稳定基础收益），区外快速衰减
+        #        - vel_bonus: 速度质量叠加项，不匹配时只少赚而非清零
+        #        - persistence_gain: 在区内持续停留越久，叠加奖励越高（最多 +alpha）
         # =========================
+        tracking_zone_sharpness = getattr(self.cfg, "tracking_zone_sharpness", 4.0)
         tracking_vel_sigma = getattr(self.cfg, "tracking_vel_match_sigma", 1.5)
+        tracking_vel_quality_alpha = getattr(self.cfg, "tracking_vel_quality_alpha", 0.5)
         tracking_persistence_alpha = getattr(self.cfg, "tracking_persistence_alpha", 0.5)
         tracking_persistence_time = getattr(self.cfg, "tracking_persistence_time", 2.0)
 
-        dist_factor = torch.exp(- (assigned_dist / (tracking_bonus_distance_xy + eps)) ** 2)
-        vel_match_factor = torch.exp(- (vel_err_norm / (tracking_vel_sigma + eps)) ** 2)
-        persistence_bonus = 1.0 + tracking_persistence_alpha * torch.clamp(
-            self._tracking_stable_timer / (tracking_persistence_time + eps), max=1.0
-        )
-        tracking_reward = self.cfg.tracking_reward_weight * assigned_target_values * (
-            dist_factor * vel_match_factor * persistence_bonus
+        # 软边界区内因子：sharpness=4 → 约 0.25m 内从 0→1 过渡，区内深处趋近 1
+        in_zone_factor = torch.sigmoid(
+            (tracking_bonus_distance_xy - assigned_dist) * tracking_zone_sharpness
         )
 
-        # 更新近距稳定计时器：需同时满足距离 < bonus_dist 且速度误差 < 2*sigma
-        tracking_active = (assigned_dist < tracking_bonus_distance_xy) & (vel_err_norm < tracking_vel_sigma * 2.0)
+        # 速度质量加成（叠加项，不匹配时只少得，不清零基础收益）
+        vel_quality = torch.exp(-(vel_err_norm / (tracking_vel_sigma + eps)) ** 2)
+
+        # 持续时间加成（在区内停留 tracking_persistence_time 秒后达到满加成）
+        persistence_gain = tracking_persistence_alpha * torch.clamp(
+            self._tracking_stable_timer / (tracking_persistence_time + eps), max=1.0
+        )
+
+        # 奖励 = 基础保底 × (1 + 速度质量加成 + 持续时间加成)
+        tracking_reward = self.cfg.tracking_reward_weight * assigned_target_values * in_zone_factor * (
+            1.0 + tracking_vel_quality_alpha * vel_quality + persistence_gain
+        )
+
+        # 更新计时器：只要在区内就积累（速度维度由 vel_quality 另行激励，不设双重门控）
+        tracking_active = assigned_dist < tracking_bonus_distance_xy
         self._tracking_stable_timer = torch.where(
             tracking_active,
             self._tracking_stable_timer + self.step_dt,
