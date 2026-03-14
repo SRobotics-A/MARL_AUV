@@ -1,3 +1,21 @@
+## [2026-03-14] 增强持续贴近激励：tracking_reward 拆分为 entry + holding 独立两项
+
+**修改文件：**
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env.py`
+- `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+
+**修改原因：**
+原 persistence_gain 作为 entry_reward 的叠加项（最多 +50%），"持续贴近"只是进入奖励的小加成，策略没有足够动机维持在区内。拆分为 entry + holding 两个独立奖励项，holding 权重大于 entry，稳定待在区内后 holding 成为主要激励来源，形成"进去容易，待在里面才赚大"的梯度信号。
+
+**主要变更：**
+- `tracking_reward` 拆分为 `entry_reward`（进入即有）和 `holding_reward`（从 0 线性增长）两个独立项并行求和
+- `entry_reward = w_entry × v × in_zone_factor × (1 + vel_quality_alpha × vel_quality)`：进入区立即获得，速度质量作为加成
+- `holding_reward = w_hold × v × in_zone_factor × clamp(timer / ramp_time, 0, 1)`：在区内持续停留 ramp_time 秒后线性增长至满值
+- `tracking_hold_weight=3.0 > tracking_reward_weight=2.5`：稳定贴近后 holding 超过 entry，成为主要激励来源
+- cfg 中 `tracking_persistence_alpha/time` 替换为 `tracking_hold_weight=3.0` 和 `tracking_hold_ramp_time=3.0`，语义更直观
+
+---
+
 ## [2026-03-13] 重构 tracking_reward 为加法结构，强化稳定保持
 
 **修改文件：**

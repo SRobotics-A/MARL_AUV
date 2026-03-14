@@ -801,42 +801,46 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # =========================
 
         # =========================
-        # 3) 追踪奖励（稳定保持版：加法结构，区内每步赚到明确基础收益）
+        # 3) 追踪奖励（进入 + 持续保持 独立两项）
         #
-        #    设计理念：
-        #      旧版三因子相乘 → 任何一项小就让奖励跌近零（偶发 spike）
-        #      新版加法结构  → in_zone_factor 做区内/区外门控，速度质量和持续时间是叠加项
+        #    进入奖励（entry）：进入区立即获得，幅度固定，速度质量是加成
+        #    持续保持奖励（holding）：独立项，从 0 线性增长，稳定在区内 ramp_time 秒后达满值
         #
-        #      tracking = w × v × in_zone_factor × (1 + vel_bonus + persistence_gain)
-        #        - in_zone_factor: sigmoid 软边界，区内 ≈1（每步稳定基础收益），区外快速衰减
-        #        - vel_bonus: 速度质量叠加项，不匹配时只少赚而非清零
-        #        - persistence_gain: 在区内持续停留越久，叠加奖励越高（最多 +alpha）
+        #    tracking = entry_reward + holding_reward
+        #      entry   = w_entry × v × in_zone × (1 + vel_q_alpha × vel_q)
+        #      holding = w_hold  × v × in_zone × clamp(timer / ramp_time, 0, 1)
+        #
+        #    w_hold > w_entry：稳定贴近后 holding 超过 entry，成为主要激励来源
+        #    → 策略会学到"进去容易，待在里面才赚大"
         # =========================
-        tracking_zone_sharpness = getattr(self.cfg, "tracking_zone_sharpness", 4.0)
-        tracking_vel_sigma = getattr(self.cfg, "tracking_vel_match_sigma", 1.5)
+        tracking_zone_sharpness    = getattr(self.cfg, "tracking_zone_sharpness", 4.0)
+        tracking_vel_sigma         = getattr(self.cfg, "tracking_vel_match_sigma", 1.5)
         tracking_vel_quality_alpha = getattr(self.cfg, "tracking_vel_quality_alpha", 0.5)
-        tracking_persistence_alpha = getattr(self.cfg, "tracking_persistence_alpha", 0.5)
-        tracking_persistence_time = getattr(self.cfg, "tracking_persistence_time", 2.0)
+        tracking_hold_weight       = getattr(self.cfg, "tracking_hold_weight", 3.0)
+        tracking_hold_ramp_time    = getattr(self.cfg, "tracking_hold_ramp_time", 3.0)
 
-        # 软边界区内因子：sharpness=4 → 约 0.25m 内从 0→1 过渡，区内深处趋近 1
+        # 软边界区内因子：sharpness=4 → 约 0.25m 内完成 0→1 过渡
         in_zone_factor = torch.sigmoid(
             (tracking_bonus_distance_xy - assigned_dist) * tracking_zone_sharpness
         )
 
-        # 速度质量加成（叠加项，不匹配时只少得，不清零基础收益）
+        # 速度质量（仅影响 entry 的加成，不影响 holding 的门控）
         vel_quality = torch.exp(-(vel_err_norm / (tracking_vel_sigma + eps)) ** 2)
 
-        # 持续时间加成（在区内停留 tracking_persistence_time 秒后达到满加成）
-        persistence_gain = tracking_persistence_alpha * torch.clamp(
-            self._tracking_stable_timer / (tracking_persistence_time + eps), max=1.0
+        # 进入奖励：进入区即有，速度质量好时可多赚 tracking_vel_quality_alpha 倍
+        entry_reward = self.cfg.tracking_reward_weight * assigned_target_values * in_zone_factor * (
+            1.0 + tracking_vel_quality_alpha * vel_quality
         )
 
-        # 奖励 = 基础保底 × (1 + 速度质量加成 + 持续时间加成)
-        tracking_reward = self.cfg.tracking_reward_weight * assigned_target_values * in_zone_factor * (
-            1.0 + tracking_vel_quality_alpha * vel_quality + persistence_gain
+        # 持续保持奖励：在区内持续 ramp_time 秒后线性增长至满值 w_hold × v
+        holding_ramp = torch.clamp(
+            self._tracking_stable_timer / (tracking_hold_ramp_time + eps), max=1.0
         )
+        holding_reward = tracking_hold_weight * assigned_target_values * in_zone_factor * holding_ramp
 
-        # 更新计时器：只要在区内就积累（速度维度由 vel_quality 另行激励，不设双重门控）
+        tracking_reward = entry_reward + holding_reward
+
+        # 更新计时器：只要在区内就积累
         tracking_active = assigned_dist < tracking_bonus_distance_xy
         self._tracking_stable_timer = torch.where(
             tracking_active,
