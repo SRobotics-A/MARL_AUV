@@ -1135,6 +1135,10 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         any_rate = terminations.float().mean()
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
         max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
+        # success 条件分解：诊断哪个条件阻止了成功
+        success_dist_rate = (assigned_dist_xy <= self.cfg.track_distance_xy).float().mean()
+        success_vel_rate = (vel_error_xy <= self.cfg.success_velocity_tolerance).float().mean()
+        success_mask_rate = success_mask.float().mean()
         self.extras["log"] = {
             "Debug/Termination/fly_low_rate": fly_low_rate,
             "Debug/Termination/fly_high_rate": fly_high_rate,
@@ -1144,6 +1148,9 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             "Debug/Termination/any_rate": any_rate,
             "Debug/Termination/min_height": min_height,
             "Debug/Termination/max_height": max_height,
+            "Debug/Success/dist_rate": success_dist_rate,
+            "Debug/Success/vel_rate": success_vel_rate,
+            "Debug/Success/mask_rate": success_mask_rate,
         }
         for agent in self.cfg.possible_agents:
             if "log" not in self.extras[agent]:
@@ -1157,6 +1164,9 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             log["Debug/Termination/any_rate"] = any_rate
             log["Debug/Termination/min_height"] = min_height
             log["Debug/Termination/max_height"] = max_height
+            log["Debug/Success/dist_rate"] = success_dist_rate
+            log["Debug/Success/vel_rate"] = success_vel_rate
+            log["Debug/Success/mask_rate"] = success_mask_rate
 
         # 所有智能体共享相同终止信号
         terminated = {agent: terminations for agent in self.cfg.possible_agents}
