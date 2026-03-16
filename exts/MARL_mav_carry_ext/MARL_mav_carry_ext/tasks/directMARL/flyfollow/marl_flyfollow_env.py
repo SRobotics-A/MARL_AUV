@@ -824,7 +824,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             (tracking_bonus_distance_xy - assigned_dist) * tracking_zone_sharpness
         )
 
-        # 速度质量（仅影响 entry 的加成，不影响 holding 的门控）
+        # 速度质量：连续权重，entry 加成 + holding 乘数
         vel_quality = torch.exp(-(vel_err_norm / (tracking_vel_sigma + eps)) ** 2)
 
         # 进入奖励：进入区即有，速度质量好时可多赚 tracking_vel_quality_alpha 倍
@@ -832,16 +832,20 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             1.0 + tracking_vel_quality_alpha * vel_quality
         )
 
-        # 持续保持奖励：在区内持续 ramp_time 秒后线性增长至满值 w_hold × v
+        # 持续保持奖励：ramp 线性增长 + vel_quality 乘数
+        # → 只有"在圈内 + 速度匹配"才能积累最大 holding 奖励
         holding_ramp = torch.clamp(
             self._tracking_stable_timer / (tracking_hold_ramp_time + eps), max=1.0
         )
-        holding_reward = tracking_hold_weight * assigned_target_values * in_zone_factor * holding_ramp
+        holding_reward = (
+            tracking_hold_weight * assigned_target_values * in_zone_factor * holding_ramp * vel_quality
+        )
 
         tracking_reward = entry_reward + holding_reward
 
-        # 更新计时器：只要在区内就积累
-        tracking_active = assigned_dist < tracking_bonus_distance_xy
+        # 更新计时器：需同时满足"在区内 + 速度误差 < 2σ"（轻量 vel_error_xy 条件）
+        vel_close_enough = vel_err_norm < (2.0 * tracking_vel_sigma + eps)
+        tracking_active = (assigned_dist < tracking_bonus_distance_xy) & vel_close_enough
         self._tracking_stable_timer = torch.where(
             tracking_active,
             self._tracking_stable_timer + self.step_dt,
