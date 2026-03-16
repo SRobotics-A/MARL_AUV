@@ -100,6 +100,7 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     track_distance_xy = 3.5                             # 成功跟踪的XY平面距离阈值（从3.0放宽至3.5）
     tracking_bonus_distance_xy = 2.0                   # 进入该小范围后给予额外 tracking bonus（从1.5放宽至2.0）
     success_hold_time = 0.5                            # 持续进入跟踪范围多少秒后判定成功（降低门槛加快正反馈）
+    success_timer_decay_rate: float = 2.0              # 离开 success zone 时 timer 衰减速率（× step_dt/step，clamp≥0）
 
     success_velocity_tolerance = 1.2                   # 成功跟随时允许的XY速度误差（从1.0放宽至1.2）
 

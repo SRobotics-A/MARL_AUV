@@ -1114,11 +1114,12 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             & (vel_error_xy <= self.cfg.success_velocity_tolerance)
             & in_height_band
         )
+        decay_rate = getattr(self.cfg, "success_timer_decay_rate", 2.0)
         self._sustained_follow_timer = torch.where(
             success_mask,
             self._sustained_follow_timer + self.step_dt,
-            torch.zeros_like(self._sustained_follow_timer),
-        )
+            self._sustained_follow_timer - decay_rate * self.step_dt,
+        ).clamp(min=0.0)
         sustained_success = (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)
 
         # 综合终止条件
