@@ -109,8 +109,8 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     collision_soft_margin = 0.5
     boundary_soft_margin = 1.0
     altitude_soft_margin = 1.0                         # 低高度软惩罚区间：z < min_altitude+1.0=2.0m 时开始罚
-    altitude_upper_soft_threshold = 3.5                # 高度软上限：z > 3.5m 开始罚（从5.5降低，覆盖4-5m飞行区间）
-    high_altitude_soft_margin = 3.5                    # 超高软惩罚归一化区间（3.5~7.0m 线性增大）
+    altitude_upper_soft_threshold = 5.5                # 高度软上限：z > 5.5m 才开始罚（硬终止 7.0m，留 1.5m 缓冲）
+    high_altitude_soft_margin = 1.5                    # 超高软惩罚归一化区间（5.5~7.0m 线性增大）
     high_altitude_penalty_weight = 0.4                 # 超高软惩罚权重
     alive_reward_weight = 0.05
 
@@ -120,8 +120,8 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     tracking_zone_sharpness: float = 4.0               # sigmoid 软边界陡度（1/m）：4.0 → 约 0.25m 内完成过渡
     tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响 entry 的速度加成
     tracking_vel_quality_alpha: float = 0.5             # 速度质量加成权重（entry 额外最多 +50%）
-    tracking_hold_weight: float = 8.0                  # 持续保持奖励权重（从5.0升至8.0，提高圈内累计价值上限）
-    tracking_hold_ramp_time: float = 1.5               # 持续保持奖励从 0 增长至满值所需时间（从3.0降至1.5s，更快正反馈）
+    tracking_hold_weight: float = 5.0                  # 持续保持奖励权重（holding component，提高上限强化圈内累计价值）
+    tracking_hold_ramp_time: float = 3.0               # 持续保持奖励从 0 增长至满值所需时间（s）
     dist_progress_weight: float = 0.3                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
     velocity_follow_weight = 0.8                        # 速度跟随主权重
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数
