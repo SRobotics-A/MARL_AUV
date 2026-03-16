@@ -97,8 +97,8 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     target_end_x = 50.0                                 # 目标结束x坐标
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 0.8                                  # 目标移动速度（m/s）
-    track_distance_xy = 3.0                             # 成功跟踪的XY平面距离阈值（放宽）
-    tracking_bonus_distance_xy = 1.5                   # 进入该小范围后给予额外 tracking bonus（放宽）
+    track_distance_xy = 3.5                             # 成功跟踪的XY平面距离阈值（从3.0放宽至3.5）
+    tracking_bonus_distance_xy = 2.0                   # 进入该小范围后给予额外 tracking bonus（从1.5放宽至2.0）
     success_hold_time = 0.5                            # 持续进入跟踪范围多少秒后判定成功（降低门槛加快正反馈）
 
     success_velocity_tolerance = 1.0                   # 成功跟随时允许的XY速度误差（放宽）
