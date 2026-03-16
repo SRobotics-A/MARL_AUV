@@ -843,12 +843,13 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
         tracking_reward = entry_reward + holding_reward
 
-        # 更新计时器：需同时满足"在区内 + 速度误差 < 2σ"（轻量 vel_error_xy 条件）
-        vel_close_enough = vel_err_norm < (2.0 * tracking_vel_sigma + eps)
-        tracking_active = (assigned_dist < tracking_bonus_distance_xy) & vel_close_enough
+        # 更新计时器：在圈内时以 vel_quality 软加权增长（轻量速度一致性条件）
+        # → 速度匹配越好 → 计时越快 → ramp 达到满值越快 → holding 奖励越大
+        # → 进圈但速度差 → 计时慢，不会轻易达满，鼓励真正的速度匹配
+        in_zone_hard = assigned_dist < tracking_bonus_distance_xy
         self._tracking_stable_timer = torch.where(
-            tracking_active,
-            self._tracking_stable_timer + self.step_dt,
+            in_zone_hard,
+            self._tracking_stable_timer + self.step_dt * vel_quality,
             torch.zeros_like(self._tracking_stable_timer),
         )
 

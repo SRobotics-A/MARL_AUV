@@ -120,7 +120,7 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     tracking_zone_sharpness: float = 4.0               # sigmoid 软边界陡度（1/m）：4.0 → 约 0.25m 内完成过渡
     tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响 entry 的速度加成
     tracking_vel_quality_alpha: float = 0.5             # 速度质量加成权重（entry 额外最多 +50%）
-    tracking_hold_weight: float = 3.0                  # 持续保持奖励权重（holding component，> entry → 稳定才赚大）
+    tracking_hold_weight: float = 5.0                  # 持续保持奖励权重（holding component，提高上限强化圈内累计价值）
     tracking_hold_ramp_time: float = 3.0               # 持续保持奖励从 0 增长至满值所需时间（s）
     dist_progress_weight: float = 0.3                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
     velocity_follow_weight = 0.8                        # 速度跟随主权重
