@@ -236,7 +236,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         )
 
         # 近距稳定跟随计时器（tracking_reward 持续时间加成用）
-        # 条件：dist < tracking_bonus_distance_xy AND vel_err < 2*tracking_vel_match_sigma
+        # 条件：dist < tracking_distance_xy AND vel_err < 2*tracking_vel_match_sigma
         self._tracking_stable_timer = torch.zeros(
             (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
         )
@@ -749,10 +749,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
     
         # 推荐在 cfg 里新增这些参数
         dist_sigma = getattr(self.cfg, "distance_reward_sigma", 2.0)
-        tracking_bonus_distance_xy = getattr(
-            self.cfg, "tracking_distance_xy",
-            getattr(self.cfg, "tracking_bonus_distance_xy", self.cfg.track_distance_xy * 0.5),
-        )
+        tracking_distance_xy = self.cfg.tracking_distance_xy
         height_sigma = getattr(self.cfg, "height_reward_sigma", 1.0)
         smooth_sigma = getattr(self.cfg, "action_smoothness_sigma", 0.25)
         collision_margin = getattr(self.cfg, "collision_soft_margin", 0.5)
@@ -822,7 +819,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
 
         # 软边界区内因子：sharpness=4 → 约 0.25m 内完成 0→1 过渡
         in_zone_factor = torch.sigmoid(
-            (tracking_bonus_distance_xy - assigned_dist) * tracking_zone_sharpness
+            (tracking_distance_xy - assigned_dist) * tracking_zone_sharpness
         )
 
         # 速度质量：连续权重，entry 加成 + holding 乘数
@@ -847,7 +844,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 更新计时器：在圈内时以 vel_quality 软加权增长（轻量速度一致性条件）
         # → 速度匹配越好 → 计时越快 → ramp 达到满值越快 → holding 奖励越大
         # → 进圈但速度差 → 计时慢，不会轻易达满，鼓励真正的速度匹配
-        in_zone_hard = assigned_dist < tracking_bonus_distance_xy
+        in_zone_hard = assigned_dist < tracking_distance_xy
         self._tracking_stable_timer = torch.where(
             in_zone_hard,
             self._tracking_stable_timer + self.step_dt * vel_quality,
