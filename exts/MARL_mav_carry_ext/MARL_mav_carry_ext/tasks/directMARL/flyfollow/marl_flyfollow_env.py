@@ -18,7 +18,7 @@ from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
 import isaaclab.sim as sim_utils
 import isaacsim.core.utils.prims as prim_utils
 from isaacsim.core.prims import XFormPrim
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import CircularBuffer
@@ -386,8 +386,8 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        # 目标小车（仅用于可视化）：直接引用 flyfollow.usda 中 env_0 的目标 prim
-        self._target_prims: list[XFormPrim] = []
+        # 目标小车：注册为 Articulation，通过 write_root_state_to_sim 驱动（XFormPrim 对物理体无效）
+        self._target_articulations: list[Articulation] = []
         self._usd_target_positions_rel = torch.zeros(self.cfg.num_targets, 3, device=self.device)
         self._usd_target_orientations = torch.zeros(self.cfg.num_targets, 4, device=self.device)
         target_names = [
@@ -396,17 +396,26 @@ class MARLFlyFollowEnv(DirectMARLEnv):
             "nova_carter_sim_optimized_02",
             "nova_carter_sim_optimized_03",
         ]
-        for name in target_names[: self.cfg.num_targets]:
-            prim_path = f"{env_root}/{name}"
-            prim = XFormPrim(prim_path)
-            self._target_prims.append(prim)
+        for idx, name in enumerate(target_names[: self.cfg.num_targets]):
+            env0_prim_path = f"{env_root}/{name}"
+            all_envs_prim_path = env0_prim_path.replace(env_root_base, "/World/envs/env_.*", 1)
+            target_cfg = ArticulationCfg(
+                prim_path=all_envs_prim_path,
+                spawn=None,
+                init_state=ArticulationCfg.InitialStateCfg(),
+                actuators={},
+            )
+            target_art = Articulation(target_cfg)
+            self._target_articulations.append(target_art)
+            self.scene.articulations[f"target_{idx}"] = target_art
+            # 读取 USD 中的初始位置与朝向
             try:
+                prim = XFormPrim(env0_prim_path)
                 pos, ori = prim.get_world_poses()
-                idx = len(self._target_prims) - 1
                 self._usd_target_positions_rel[idx, :] = pos[0] - self.scene.env_origins[0]
                 self._usd_target_orientations[idx, :] = ori[0]
             except Exception as exc:
-                print(f"[flyfollow] Failed to read USD target pose for {prim_path}: {exc}")
+                print(f"[flyfollow] Failed to read USD target pose for {env0_prim_path}: {exc}")
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         """物理步骤前处理：解析动作并更新目标位置"""
@@ -1309,14 +1318,15 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         self._target_claimed[env_ids] = False      # 未被认领
         self._target_assignment[env_ids] = -1      # 未分配
 
-        # 将目标位置写入场景（XFormPrim可视化）
-        # 注意：仅 env_0 有可视化 prim，因此只在 env_0 被重置时更新可视化
-        if 0 in env_ids.tolist():
-            positions_world = self._target_positions[0:1] + self.scene.env_origins[0:1].unsqueeze(1)
-            for i, prim in enumerate(self._target_prims):
-                pos = positions_world[:, i, :]
-                ori = self._target_orientations[0:1, i, :]
-                prim.set_world_poses(positions=pos, orientations=ori)
+        # 将目标位置写入物理引擎（所有被重置的 env_ids）
+        n = env_ids.numel()
+        ang_vel_zero = torch.zeros(n, 3, device=self.device)
+        for i, target_art in enumerate(self._target_articulations):
+            pos = self._target_positions[env_ids, i, :] + self.scene.env_origins[env_ids]  # (n, 3)
+            ori = self._usd_target_orientations[i].unsqueeze(0).expand(n, -1)              # (n, 4)
+            vel = torch.zeros(n, 3, device=self.device)
+            root_state = torch.cat([pos, ori, vel, ang_vel_zero], dim=-1)                  # (n, 13)
+            target_art.write_root_state_to_sim(root_state, env_ids=env_ids)
 
     def _update_targets(self):
         """更新目标位置：实现目标的匀速移动"""
@@ -1332,13 +1342,15 @@ class MARLFlyFollowEnv(DirectMARLEnv):
                 start_x,
                 self._target_positions[..., 0],
             )
-        # 可视化更新（仅更新env_0环境以提高性能）
-        positions_world = self._target_positions + self.scene.env_origins.unsqueeze(1)
-        for i, prim in enumerate(self._target_prims):
-            pos = positions_world[0:1, i, :]
-            ori = self._target_orientations[0:1, i, :]
-            # 为性能考虑仅更新第一个环境的可视化
-            prim.set_world_poses(positions=pos, orientations=ori)
+        # 通过 write_root_state_to_sim 驱动所有环境的目标位置（覆盖物理引擎）
+        positions_world = self._target_positions + self.scene.env_origins.unsqueeze(1)  # (E, T, 3)
+        ang_vel_zero = torch.zeros(self.num_envs, 3, device=self.device)
+        for i, target_art in enumerate(self._target_articulations):
+            pos = positions_world[:, i, :]                                                          # (E, 3)
+            ori = self._usd_target_orientations[i].unsqueeze(0).expand(self.num_envs, -1)          # (E, 4)
+            vel = self._target_velocities[:, i, :]                                                  # (E, 3)
+            root_state = torch.cat([pos, ori, vel, ang_vel_zero], dim=-1)                          # (E, 13)
+            target_art.write_root_state_to_sim(root_state)
 
 
 # JIT编译的辅助函数
