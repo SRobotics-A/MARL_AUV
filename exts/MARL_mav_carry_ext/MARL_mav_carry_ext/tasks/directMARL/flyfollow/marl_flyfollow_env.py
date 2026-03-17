@@ -286,9 +286,10 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         """设置场景：在悬停环境基础上添加跟随任务特有的元素"""
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # 加载整套赛道与目标小车场景（flyfollow.usda内已包含轨道与目标初始位置）
+        # 加载整套赛道与目标小车场景（场景文件名由 cfg.scene_usd_filename 指定）
+        scene_usd_filename = getattr(self.cfg, "scene_usd_filename", "flyfollow.usda")
         flyfollow_scene_path = (
-            Path(__file__).resolve().parents[3] / "assets/data/AMR/flyfollow/flyfollow.usda"
+            Path(__file__).resolve().parents[3] / "assets/data/AMR/flyfollow" / scene_usd_filename
         )
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(flyfollow_scene_path))
         sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
