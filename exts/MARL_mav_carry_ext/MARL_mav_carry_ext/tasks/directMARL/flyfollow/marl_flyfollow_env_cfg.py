@@ -202,9 +202,6 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         replicate_physics=True  # 复制物理属性
     )
 
-    # 场景 USD 文件名（相对于 assets/data/AMR/flyfollow/）
-    scene_usd_filename: str = "flyfollow.usda"
-
     # 事件配置（重置等）
     events = EventCfg()
 
@@ -247,10 +244,3 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
         obs_dim = self.obs_dim_per_step * self.history_len
         self.action_spaces = {agent: action_dim for agent in self.possible_agents}
         self.observation_spaces = {agent: obs_dim for agent in self.possible_agents}
-
-
-@configclass
-class MARLFlyFollowRiverEnvCfg(MARLFlyFollowEnvCfg):
-    """Rivermark 场景的 flyfollow 环境配置（继承基础 cfg，仅切换 USD 场景文件）"""
-
-    scene_usd_filename: str = "river_flyfollow.usd"
