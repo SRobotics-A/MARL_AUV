@@ -750,7 +750,8 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 推荐在 cfg 里新增这些参数
         dist_sigma = getattr(self.cfg, "distance_reward_sigma", 2.0)
         tracking_bonus_distance_xy = getattr(
-            self.cfg, "tracking_bonus_distance_xy", self.cfg.track_distance_xy * 0.5
+            self.cfg, "tracking_distance_xy",
+            getattr(self.cfg, "tracking_bonus_distance_xy", self.cfg.track_distance_xy * 0.5),
         )
         height_sigma = getattr(self.cfg, "height_reward_sigma", 1.0)
         smooth_sigma = getattr(self.cfg, "action_smoothness_sigma", 0.25)
@@ -1109,8 +1110,9 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         # 成功判定：仅要求 XY 距离 + 速度匹配 + 在安全高度带内（不要求定高）
         # 高度安全由终止条件（fly_low/fly_high）和软惩罚（high/low_altitude_penalty）保证
         in_height_band = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
+        success_dist_threshold = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
         success_mask = (
-            (assigned_dist_xy <= self.cfg.track_distance_xy)
+            (assigned_dist_xy <= success_dist_threshold)
             & (vel_error_xy <= self.cfg.success_velocity_tolerance)
             & in_height_band
         )
@@ -1136,7 +1138,7 @@ class MARLFlyFollowEnv(DirectMARLEnv):
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
         max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
         # success 条件分解：诊断哪个条件阻止了成功
-        success_dist_rate = (assigned_dist_xy <= self.cfg.track_distance_xy).float().mean()
+        success_dist_rate = (assigned_dist_xy <= success_dist_threshold).float().mean()
         success_vel_rate = (vel_error_xy <= self.cfg.success_velocity_tolerance).float().mean()
         success_mask_rate = success_mask.float().mean()
         self.extras["log"] = {
