@@ -98,7 +98,7 @@ class MARLFlyFollowEnvCfg(DirectMARLEnvCfg):
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 0.8                                  # 目标移动速度（m/s）
     tracking_distance_xy = 2.0                          # tracking reward 激活的 XY 距离阈值（独立参数）
-    success_distance_xy = 4.0                          # success_mask 判定的 XY 距离阈值（独立参数，比 tracking 更宽松）
+    success_distance_xy = 5.0                          # success_mask 判定的 XY 距离阈值（从4.0放宽至5.0）
     track_distance_xy = 3.5                            # 保留旧参数供兼容（success_distance_xy 优先）
     tracking_bonus_distance_xy = 2.0                   # 保留旧参数供兼容（tracking_distance_xy 优先）
     success_hold_time = 0.5                            # 持续进入跟踪范围多少秒后判定成功（降低门槛加快正反馈）
