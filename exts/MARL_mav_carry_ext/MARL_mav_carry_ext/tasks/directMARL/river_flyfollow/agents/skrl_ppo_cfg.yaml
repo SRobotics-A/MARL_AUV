@@ -60,7 +60,7 @@ agent:
 #  rewards_shaper_scale: 1.0
   time_limit_bootstrap: False
   experiment:
-    directory: "marl_flyfollow"
+    directory: "marl_riverflyfollow"
     experiment_name: "ppo"
     write_interval: 100
     checkpoint_interval: 2000

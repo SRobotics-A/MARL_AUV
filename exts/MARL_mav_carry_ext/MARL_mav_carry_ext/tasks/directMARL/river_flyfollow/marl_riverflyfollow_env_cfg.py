@@ -197,7 +197,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     # 场景配置
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1,          # 环境数量
+        num_envs=64,          # 环境数量
         env_spacing=8.0,     # 环境间距
         replicate_physics=True  # 复制物理属性
     )
