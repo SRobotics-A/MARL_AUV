@@ -29,7 +29,7 @@ from isaaclab.utils.math import (
 )
 
 # 导入跟随环境配置
-from .marl_flyfollow_env_cfg import MARLRiverFlyFollowEnvCfg
+from .marl_riverflyfollow_env_cfg import MARLRiverFlyFollowEnvCfg
 
 
 class MARLRiverFlyFollowEnv(DirectMARLEnv):

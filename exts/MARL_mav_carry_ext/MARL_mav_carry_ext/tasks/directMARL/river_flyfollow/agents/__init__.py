@@ -1,1 +1,1 @@
-"""SKRL config registry for flyfollow task."""
+"""SKRL config registry for river flyfollow task."""
