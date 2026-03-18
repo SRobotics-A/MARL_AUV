@@ -104,7 +104,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     success_hold_time = 0.3                            # 持续满足 success 条件的秒数门槛（从0.5降至0.3：降低绝对持续时长要求）
     success_timer_decay_rate: float = 0.5              # 离开 success zone 时 timer 衰减倍率（从2.0降至0.5：在区50%占比即可净增长）
 
-    success_velocity_tolerance = 2.0                   # 成功跟随时允许的XY速度误差（从1.5小幅放宽至2.0）
+    success_velocity_tolerance = 1.5                   # 成功跟随时允许的XY速度误差（从1.2放宽至1.5：覆盖目标速度0.8m/s附近合理波动）
     success_proximity_weight: float = 3.0              # 成功区每步密集奖励权重：dist+vel+height 同时达标时发放，对齐 success_mask
     success_bonus_weight: float = 500.0                # 成功终止一次性奖励权重：val=1→5.0，val=4→20.0（×step_dt后）
 
