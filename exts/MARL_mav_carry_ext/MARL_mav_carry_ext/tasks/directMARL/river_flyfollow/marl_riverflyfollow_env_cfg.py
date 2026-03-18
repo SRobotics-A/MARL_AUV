@@ -123,8 +123,9 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     tracking_zone_sharpness: float = 1.5               # sigmoid 软边界陡度（1/m）：从4.0软化至1.5，梯度覆盖5m范围而非0.25m
     tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响 entry 的速度加成
     tracking_vel_quality_alpha: float = 0.5             # 速度质量加成权重（entry 额外最多 +50%）
-    tracking_hold_weight: float = 5.0                  # 持续保持奖励权重（holding component，提高上限强化圈内累计价值）
-    tracking_hold_ramp_time: float = 3.0               # 持续保持奖励从 0 增长至满值所需时间（s）
+    tracking_hold_weight: float = 10.0                 # 持续保持奖励权重（从5.0翻倍至10.0：圈内停留成为最高价值行为）
+    tracking_hold_ramp_time: float = 1.0               # ramp 达满值所需时间（从3.0降至1.0s：100步内即可体验满额 holding 正反馈）
+    tracking_stable_timer_decay_rate: float = 3.0      # 离圈时 timer 每秒衰减倍率（替代硬归零，防止短暂出圈蒸发所有积累）
     dist_progress_weight: float = 2.0                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
     velocity_follow_weight = 0.8                        # 速度跟随主权重
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数

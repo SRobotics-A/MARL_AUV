@@ -920,14 +920,18 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
 
         tracking_reward = entry_reward + holding_reward
 
-        # 更新计时器：在圈内时以 vel_quality 软加权增长（轻量速度一致性条件）
-        # → 速度匹配越好 → 计时越快 → ramp 达到满值越快 → holding 奖励越大
-        # → 进圈但速度差 → 计时慢，不会轻易达满，鼓励真正的速度匹配
+        # 更新计时器：
+        #   在圈内（dist < tracking_distance_xy）→ 以固定 step_dt 速率增长，不再由 vel_quality 节流。
+        #     vel_quality 仅作为 holding_reward 的幅度乘数，而非计时速率调节器。
+        #     早期训练中速度匹配差时，timer 仍能正常积累，策略获得清晰的"停留即有收益"信号。
+        #   离圈 → 以 decay_rate 倍速衰减（而非硬归零），防止轻微抖动蒸发全部积累。
+        #     decay_rate=3.0 意味着出圈 1/3s 后 timer 才清零，给策略一定容错余地。
         in_zone_hard = assigned_dist < tracking_distance_xy
+        timer_decay_rate = getattr(self.cfg, "tracking_stable_timer_decay_rate", 0.0)
         self._tracking_stable_timer = torch.where(
             in_zone_hard,
-            self._tracking_stable_timer + self.step_dt * vel_quality,
-            torch.zeros_like(self._tracking_stable_timer),
+            self._tracking_stable_timer + self.step_dt,                                          # 固定速率增长
+            torch.clamp(self._tracking_stable_timer - self.step_dt * timer_decay_rate, min=0.0), # 软衰减
         )
 
         # =========================
