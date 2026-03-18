@@ -256,24 +256,34 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.set_debug_vis(cfg.debug_vis)
 
     def _assign_targets_for_envs(self, env_ids: torch.Tensor) -> None:
-        """为指定环境固定每架无人机的目标，保持一个 episode 内不变。"""
+        """为指定环境固定每架无人机的目标，保持一个 episode 内不变。
+
+        采用贪心最近距离匹配：每轮找当前最近的（无人机, 目标）对完成配对，
+        直到无人机或目标耗尽。目标数多于无人机数时，多余目标不分配。
+        结果写入 _assigned_target_idx[env_id, drone_idx] = target_idx。
+        """
         if env_ids.numel() == 0:
             return
 
+        # 取当前帧无人机和目标的 XY 坐标，形状 (len(env_ids), num_drones/targets, 2)
         drone_pos_xy = self.drone_positions[env_ids, :, :2]
         target_pos_xy = self._target_positions[env_ids, :, :2]
 
+        # 初始化：所有无人机默认指向 target 0，所有目标标记为未分配（-1）
         self._assigned_target_idx[env_ids] = 0
         self._target_assignment[env_ids] = -1
 
         for local_env_idx, env_id in enumerate(env_ids.tolist()):
+            # dist[drone_idx, target_idx]：该环境内每对（无人机, 目标）的 XY 欧氏距离
+            # unsqueeze 分别扩维以广播：drone (D,1,2)，target (1,T,2) → (D,T,2) → norm → (D,T)
             dist = torch.norm(
                 target_pos_xy[local_env_idx].unsqueeze(0) - drone_pos_xy[local_env_idx].unsqueeze(1),
                 dim=-1,
             )
-            free_drones = set(range(self._num_drones))
-            free_targets = set(range(self._num_targets))
+            free_drones = set(range(self._num_drones))    # 尚未配对的无人机索引集合
+            free_targets = set(range(self._num_targets))  # 尚未配对的目标索引集合
 
+            # 贪心匹配：每轮在所有剩余（无人机, 目标）对中选最近的完成配对
             while free_drones and free_targets:
                 best_pair = None
                 best_dist = None
@@ -285,6 +295,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                             best_pair = (drone_idx, target_idx)
 
                 drone_idx, target_idx = best_pair
+                # 写入双向映射：无人机→目标，目标→无人机
                 self._assigned_target_idx[env_id, drone_idx] = target_idx
                 self._target_assignment[env_id, target_idx] = drone_idx
                 free_drones.remove(drone_idx)
@@ -292,43 +303,64 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
 
     def _setup_scene(self):
         """设置场景：在悬停环境基础上添加跟随任务特有的元素"""
+        # ── 1. 生成地面平面（物理碰撞用，不可见）────────────────────────────
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # 加载 River 场景（river_flyfollow.usda 内已包含 Rivermark 环境与目标小车初始位置）
+        # ── 2. 加载 River 场景 USD ──────────────────────────────────────────
+        # river_flyfollow.usda 内含：Rivermark 室外环境 + 4 辆 NovaCarter 目标小车 + 3 架 Falcon 无人机
+        # 挂载到 env_0 子树下，之后由 clone_environments 自动复制到所有并行环境
         flyfollow_scene_path = (
             Path(__file__).resolve().parents[3] / "assets/data/AMR/river_flyfollow/river_flyfollow.usda"
         )
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(flyfollow_scene_path))
         sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
 
-        # 复制 env_0 到其它环境
+        # ── 3. 克隆 env_0 到其他并行环境 ────────────────────────────────────
+        # copy_from_source=False：基于已创建的 env_0 实例进行复制，而非重新从 USD 加载
         self.scene.clone_environments(copy_from_source=False)
 
-        # 解析 env_0 的实际根路径（有的 USD 会嵌一层 "World"）
+        # ── 4. 解析 env_0 的实际 prim 根路径 ────────────────────────────────
+        # 某些 USD 会在 env_0 下多嵌一层 "World" 节点，需要动态判断
         env_root_base = "/World/envs/env_0"
         if not prim_utils.is_prim_path_valid(env_root_base):
             raise RuntimeError(f"Expected environment root prim at {env_root_base}, but it does not exist.")
         env_root = env_root_base
         if prim_utils.is_prim_path_valid(f"{env_root_base}/World"):
-            env_root = f"{env_root_base}/World"
+            env_root = f"{env_root_base}/World"  # 存在 World 子节点时，以其为实际根
 
         def resolve_agent_prim_path(agent_name: str) -> str:
+            """在 env_0 下定位指定 agent（如 "falcon"）真正带 ArticulationRootAPI 的 prim 路径。
+
+            查找策略（按优先级）：
+            1. 直接路径：<root>/<agent>/Robot、<root>/<agent>/Falcon、<root>/<agent>
+            2. Instanceable prim（instanceable=true）：内层子 prim 对 is_prim_path_valid 不可见，
+               通过 USD prototype 遍历，找到带 ArticulationRootAPI 的子节点，
+               返回 instance proxy 路径（<outer_path>/<child_name>）
+            3. 模糊名称匹配：get_all_matching_child_prims 按名称精确/包含匹配
+            4. 全局正则搜索：find_first_matching_prim 在整个 env_0.* 子树内搜索
+            """
+            # 候选根路径：env_root 本身，以及可能存在的双层 World/env_0 嵌套
             roots = [env_root]
             if prim_utils.is_prim_path_valid(f"{env_root}/World"):
                 roots.append(f"{env_root}/World")
             if prim_utils.is_prim_path_valid(f"{env_root}/env_0"):
                 roots.append(f"{env_root}/env_0")
+
             for root in roots:
+                # 策略 1：尝试常见的内层 prim 命名规范
                 candidate_paths = [
-                    f"{root}/{agent_name}/Robot",
-                    f"{root}/{agent_name}/Falcon",
-                    f"{root}/{agent_name}",
+                    f"{root}/{agent_name}/Robot",   # Isaac Lab 标准：外层 Xform + 内层 Robot
+                    f"{root}/{agent_name}/Falcon",  # Falcon 资产特有命名
+                    f"{root}/{agent_name}",         # 外层 Xform 本身即 ArticulationRoot
                 ]
                 for path in candidate_paths:
                     if prim_utils.is_prim_path_valid(path):
                         return path
-                # instanceable = true 时 inner prim 对 is_prim_path_valid 不可见，
-                # 通过 prototype 查找带 ArticulationRootAPI 的子 prim，返回 instance proxy 路径。
+
+                # 策略 2：instanceable prim 处理
+                # Isaac Sim 对 payload/reference 引入的 Xform 可能自动加 instanceable=true，
+                # 此时 prim 的子节点路径对 is_prim_path_valid 返回 False，
+                # 需通过 GetPrototype() 获取 master prim，遍历其子节点找 ArticulationRootAPI
                 outer_path = f"{root}/{agent_name}"
                 if prim_utils.is_prim_path_valid(outer_path):
                     import omni.usd
@@ -339,7 +371,10 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                         if proto:
                             for child in proto.GetAllChildren():
                                 if child.HasAPI(UsdPhysics.ArticulationRootAPI):
+                                    # 返回 instance proxy 路径（而非 prototype 路径）
                                     return f"{outer_path}/{child.GetName()}"
+
+                # 策略 3：模糊名称匹配（精确 → 包含）
                 prims = sim_utils.get_all_matching_child_prims(
                     root, predicate=lambda p: p.GetName() == agent_name
                 )
@@ -351,12 +386,14 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 if prims:
                     return prims[0].GetPath().pathString
 
+            # 策略 4：全局正则搜索，覆盖所有并行 env 子树（兜底）
             prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/{agent_name}(/.*)?")
             if prim is None:
                 prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/.*[Ff]alcon.*")
             if prim is not None:
                 return prim.GetPath().pathString
 
+            # 所有策略均失败：收集直接子节点名称以辅助调试
             child_names = []
             try:
                 children = sim_utils.get_all_matching_child_prims(env_root_base, depth=1)
@@ -368,13 +405,18 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 f"Direct children: {child_names}"
             )
 
-        # 创建多台独立无人机（使用 USD 中已有 prim）
+        # ── 5. 创建多台无人机 Articulation 对象 ─────────────────────────────
+        # spawn=None：不重新生成 prim，而是绑定到 USD 中已有的 ArticulationRoot prim
+        # robot_cfg.prim_path 使用 env_.* 通配符，Isaac Lab 会自动映射到所有并行环境
         self.robots = []
         self._usd_root_state_rel = torch.zeros(
             len(self.cfg.possible_agents), 7, device=self.device
-        )
+        )  # 缓存每架无人机在 env_0 中的初始位姿（相对 env_origin），用于 reset 时恢复
         for i, agent in enumerate(self.cfg.possible_agents):
+            # 定位 env_0 下该 agent 的真实 prim 路径
             env0_agent_prim = resolve_agent_prim_path(agent)
+
+            # 将 env_0 路径替换为 env_.* 通配符，构造跨所有环境的 prim_path 模式
             if env0_agent_prim.startswith(env_root_base):
                 env_agent_prim_pattern = env0_agent_prim.replace(
                     env_root_base, "/World/envs/env_.*", 1
@@ -385,13 +427,14 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 raise RuntimeError(
                     f"Resolved prim path {env0_agent_prim} does not include env_0; cannot build pattern."
                 )
+
             robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_agent_prim_pattern)
-            robot_cfg.spawn = None
+            robot_cfg.spawn = None  # 不重新生成，绑定已有 prim
             robot = Articulation(robot_cfg)
             self.robots.append(robot)
-            self.scene.articulations[f"robot_{i}"] = robot
+            self.scene.articulations[f"robot_{i}"] = robot  # 注册到 scene，确保物理更新
 
-            # Cache USD-defined initial pose (env_0) so reset can restore it
+            # 缓存 USD 初始位姿（相对于 env_0 原点），reset 时用于 usd_fixed/usd_perturbed 模式
             try:
                 prim = XFormPrim(env0_agent_prim)
                 pos, ori = prim.get_world_poses()
@@ -399,27 +442,34 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 self._usd_root_state_rel[i, 3:7] = ori[0]
             except Exception as exc:
                 print(f"[flyfollow] Failed to read USD pose for {env0_agent_prim}: {exc}")
+
+        # scene.articulations["robot"] 需指向至少一个机器人，用于 contact sensor 等基础接口
         if self.robots:
             self.scene.articulations["robot"] = self.robots[0]
 
-        # 添加灯光
+        # ── 6. 添加环境光照 ──────────────────────────────────────────────────
+        # USD 内已有 DistantLight，此处再添加 DomeLight 补充环境亮度
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        # 目标小车（仅用于可视化）：直接引用 flyfollow.usda 中 env_0 的目标 prim
+        # ── 7. 绑定目标小车 XFormPrim 并缓存初始位姿 ────────────────────────
+        # NovaCarter 小车不作为 Articulation 控制，仅作为可视化/位置参考对象（XFormPrim）
+        # 每步通过 write_root_state_to_sim / set_world_poses 直接驱动其位置
         self._target_prims: list[XFormPrim] = []
         self._usd_target_positions_rel = torch.zeros(self.cfg.num_targets, 3, device=self.device)
         self._usd_target_orientations = torch.zeros(self.cfg.num_targets, 4, device=self.device)
+        # USD 中小车 prim 命名约定：第一辆无后缀，其余依次加 _01/_02/_03
         target_names = [
-            "nova_carter_sim_optimized",
-            "nova_carter_sim_optimized_01",
-            "nova_carter_sim_optimized_02",
-            "nova_carter_sim_optimized_03",
+            "nova_carter_sim_optimized",        # 目标 0（最高价值，红色）
+            "nova_carter_sim_optimized_01",     # 目标 1（次高价值，黄色）
+            "nova_carter_sim_optimized_02",     # 目标 2（中等价值，绿色）
+            "nova_carter_sim_optimized_03",     # 目标 3（最低价值，蓝色）
         ]
         for name in target_names[: self.cfg.num_targets]:
             prim_path = f"{env_root}/{name}"
             prim = XFormPrim(prim_path)
             self._target_prims.append(prim)
+            # 缓存 USD 初始位姿（相对 env_origin），reset 时作为起始点基准
             try:
                 pos, ori = prim.get_world_poses()
                 idx = len(self._target_prims) - 1
