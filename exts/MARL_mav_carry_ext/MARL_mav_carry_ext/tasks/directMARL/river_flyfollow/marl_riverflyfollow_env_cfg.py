@@ -97,7 +97,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     target_end_x = 50.0                                 # 目标结束x坐标
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 0.8                                  # 目标移动速度（m/s）
-    tracking_distance_xy = 2.0                          # tracking reward 激活的 XY 距离阈值（独立参数）
+    tracking_distance_xy = 3.0                          # tracking reward 激活的 XY 距离阈值（从2.0扩至3.0：zone中心外移，holding提前介入）
     success_distance_xy = 5.0                          # success_mask 判定的 XY 距离阈值（从4.0放宽至5.0）
     track_distance_xy = 3.5                            # 保留旧参数供兼容（success_distance_xy 优先）
     tracking_bonus_distance_xy = 2.0                   # 保留旧参数供兼容（tracking_distance_xy 优先）
@@ -120,7 +120,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     # 奖励塑形参数
     distance_reward_weight = 2.0                        # 距离奖励权重（放大近场梯度）
     tracking_reward_weight = 2.5                        # 进入区奖励权重（entry component，进入即有）
-    tracking_zone_sharpness: float = 4.0               # sigmoid 软边界陡度（1/m）：4.0 → 约 0.25m 内完成过渡
+    tracking_zone_sharpness: float = 1.5               # sigmoid 软边界陡度（1/m）：从4.0软化至1.5，梯度覆盖5m范围而非0.25m
     tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响 entry 的速度加成
     tracking_vel_quality_alpha: float = 0.5             # 速度质量加成权重（entry 额外最多 +50%）
     tracking_hold_weight: float = 5.0                  # 持续保持奖励权重（holding component，提高上限强化圈内累计价值）
