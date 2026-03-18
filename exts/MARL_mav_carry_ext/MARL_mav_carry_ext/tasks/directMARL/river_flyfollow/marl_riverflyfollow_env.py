@@ -145,9 +145,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
 
         # 目标状态缓存（在环境坐标系中）
         self._target_positions = torch.zeros(self.num_envs, self._num_targets, 3, device=self.device)    # 位置
-        self._target_velocities = torch.zeros(self.num_envs, self._num_targets, 3, device=self.device)  # 速度
+        self._target_velocities = torch.zeros(self.num_envs, self._num_targets, 3, device=self.device)   # 速度
         self._target_orientations = torch.zeros(self.num_envs, self._num_targets, 4, device=self.device) # 姿态
-        self._target_orientations[..., 0] = 1.0  # 初始化为单位四元数
+        self._target_orientations[..., 0] = 1.0                                                          # 初始化为单位四元数
         self._target_claimed = torch.zeros(self.num_envs, self._num_targets, dtype=torch.bool, device=self.device)  # 是否已被认领
         self._target_assignment = torch.full(
             (self.num_envs, self._num_targets), -1, dtype=torch.long, device=self.device
@@ -169,20 +169,24 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 device=self.device,
             )
             for key in [
-                "distance_reward",
-                "dist_progress_reward", 
-                "tracking_reward",
-                "velocity_follow_reward",
-                "action_smoothness",
-                "body_rate_penalty",
-                "velocity_penalty",
-                "force_penalty",
-                "height_reward",
-                "height_error_penalty",
-                "vertical_direction_penalty",
-                "upward_vz_penalty",
-                "high_altitude_penalty",
-                "safety_penalty",
+                # ── 主奖励项 ──────────────────────────────────────────────
+                "distance_reward",          # 高斯距离奖励：exp(-(d/σ)²)，σ=10，近场梯度
+                "dist_progress_reward",     # 距离进度奖励（势函数 shaping）：每步缩短距离即得正值
+                "tracking_reward",          # 追踪区奖励：entry（进入即有）+ holding（持续保持线性增长）
+                "velocity_follow_reward",   # 速度跟随奖励：vel_match + 前向进度 - 超速惩罚
+                # ── 辅助约束项 ────────────────────────────────────────────
+                "action_smoothness",        # 动作平滑奖励：抑制相邻帧动作突变，防抖
+                "body_rate_penalty",        # 机体角速率惩罚：‖ω‖，辅助约束，防止过度翻滚
+                "velocity_penalty",         # 速度惩罚：XY/Z 超出安全阈值后按比例扣分
+                "force_penalty",            # 推力惩罚：总推力过大时扣分，节约能量
+                # ── 高度相关项 ────────────────────────────────────────────
+                "height_reward",            # 高度奖励：贴近 desired_height 的高斯奖励（当前已关闭，weight=0）
+                "height_error_penalty",     # 高度误差惩罚（当前已关闭，weight=0）
+                "vertical_direction_penalty", # 垂直方向速度惩罚（当前已关闭，weight=0）
+                "upward_vz_penalty",        # 上升速度惩罚：仅 vz>0 时生效，抑制起步无意义上窜
+                "high_altitude_penalty",    # 超高软惩罚：z > altitude_upper_soft_threshold 时线性增大
+                # ── 综合安全项 ────────────────────────────────────────────
+                "safety_penalty",           # 安全惩罚合计：碰撞软惩罚 + 边界软惩罚 + 低高度软惩罚 + 超高惩罚
             ]
         }
 
@@ -196,23 +200,25 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self._reward_debug_print_interval = 500
         self._reward_debug_counter = 0
 
-        # 终止条件缓冲区
+        # ── 终止条件缓冲区 ────────────────────────────────────────────────────
+        # 每个 bool 张量形状均为 (num_envs,)，在 _get_dones() 中更新，
+        # 任一条件为 True 时该 env 的 episode 提前结束。
         self.falcon_fly_low = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
-        )
+        )  # 无人机飞行高度低于 min_altitude，触发硬终止（撞地风险）
         self.illegal_contact = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
-        )
+        )  # 接触传感器检测到非法碰撞（与障碍物或地面）
         self.drone_collision = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
-        )
+        )  # 无人机间距离低于 drone_collision_threshold，相互碰撞
         self.body_pos_outside = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
-        )
-        # 所有目标都被捕获的标志
+        )  # 无人机飞出边界框（bounding_box_threshold），超出允许飞行区域
+        # 所有目标都被捕获的标志（当前任务中暂不启用提前终止）
         self.all_targets_captured = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
-        )
+        )  # 四个目标全部被持续跟随成功时置 True（当前由 sustained_success 触发终止）
         # # 持续跟随计时器
         # self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
         self.targets_out_of_bounds = torch.zeros(
