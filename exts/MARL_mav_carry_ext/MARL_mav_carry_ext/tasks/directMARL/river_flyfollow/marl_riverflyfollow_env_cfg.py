@@ -132,7 +132,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     velocity_follow_sigma = 0.8                         # 速度匹配高斯核宽度
     velocity_follow_overspeed_margin = 1.0              # 超速容忍裕量（从2.0降至1.0：避免无人机5m/s乱飞）
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
-    body_rate_penalty_weight = 0.2                      # 机体角速率惩罚权重
+    body_rate_penalty_weight = 0.02                     # 机体角速率惩罚权重（降至辅助约束，不主导负项）
     velocity_penalty_weight = 0.05                      # 速度惩罚权重（从0.2降至0.05：仅作防失控约束，不主导行为塑形）
     velocity_penalty_xy_safe = 4.0                      # XY 安全速度阈值（从2.0升至4.0 m/s：正常追踪机动完全不触发）
     velocity_penalty_z_safe = 2.0                       # Z 安全速度阈值（从0.5升至2.0 m/s：允许正常高度调整）
