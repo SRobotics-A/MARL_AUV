@@ -98,7 +98,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 0.8                                  # 目标移动速度（m/s）
     tracking_distance_xy = 3.0                          # tracking reward 激活的 XY 距离阈值（从2.0扩至3.0：zone中心外移，holding提前介入）
-    success_distance_xy = 5.0                          # success_mask 判定的 XY 距离阈值（从4.0放宽至5.0）
+    success_distance_xy = 6.0                          # success_mask 判定的 XY 距离阈值（从5.0小幅放宽至6.0）
     track_distance_xy = 3.5                            # 保留旧参数供兼容（success_distance_xy 优先）
     tracking_bonus_distance_xy = 2.0                   # 保留旧参数供兼容（tracking_distance_xy 优先）
     success_hold_time = 0.3                            # 持续满足 success 条件的秒数门槛（从0.5降至0.3：降低绝对持续时长要求）
