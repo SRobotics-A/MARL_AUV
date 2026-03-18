@@ -118,18 +118,18 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     alive_reward_weight = 0.05
 
     # 奖励塑形参数
-    distance_reward_weight = 1.0                        # 距离奖励权重
+    distance_reward_weight = 2.0                        # 距离奖励权重（放大近场梯度）
     tracking_reward_weight = 2.5                        # 进入区奖励权重（entry component，进入即有）
     tracking_zone_sharpness: float = 4.0               # sigmoid 软边界陡度（1/m）：4.0 → 约 0.25m 内完成过渡
     tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响 entry 的速度加成
     tracking_vel_quality_alpha: float = 0.5             # 速度质量加成权重（entry 额外最多 +50%）
     tracking_hold_weight: float = 5.0                  # 持续保持奖励权重（holding component，提高上限强化圈内累计价值）
     tracking_hold_ramp_time: float = 3.0               # 持续保持奖励从 0 增长至满值所需时间（s）
-    dist_progress_weight: float = 0.3                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
+    dist_progress_weight: float = 2.0                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
     velocity_follow_weight = 0.8                        # 速度跟随主权重
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数
     velocity_follow_overspeed_weight = 0.05             # 超速惩罚系数（从0.2降至0.05：允许积极追近）
-    velocity_follow_sigma = 0.8                         # 速度匹配高斯核宽度
+    velocity_follow_sigma = 1.5                         # 速度匹配高斯核宽度（从0.8放宽至1.5：降低早期训练的匹配难度）
     velocity_follow_overspeed_margin = 1.0              # 超速容忍裕量（从2.0降至1.0：避免无人机5m/s乱飞）
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
     body_rate_penalty_weight = 0.02                     # 机体角速率惩罚权重（降至辅助约束，不主导负项）
