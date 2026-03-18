@@ -174,6 +174,8 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 "dist_progress_reward",     # 距离进度奖励（势函数 shaping）：每步缩短距离即得正值
                 "tracking_reward",          # 追踪区奖励：entry（进入即有）+ holding（持续保持线性增长）
                 "velocity_follow_reward",   # 速度跟随奖励：vel_match + 前向进度 - 超速惩罚
+                "success_proximity_reward", # 成功区密集奖励：同时满足 dist+vel+height 三个 success 条件时每步发放
+                "success_bonus",            # 成功终止奖励：_sustained_follow_timer 越过阈值时一次性大额奖励
                 # ── 辅助约束项 ────────────────────────────────────────────
                 "action_smoothness",        # 动作平滑奖励：抑制相邻帧动作突变，防抖
                 "body_rate_penalty",        # 机体角速率惩罚：‖ω‖，辅助约束，防止过度翻滚
@@ -1094,7 +1096,37 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # =========================
         alive_reward_weight = getattr(self.cfg, "alive_reward_weight", 0.0)
         alive_reward = alive_reward_weight * torch.ones_like(assigned_dist)
-    
+
+        # =========================
+        # 10.5) success proximity reward + success terminal bonus
+        #
+        #   success_proximity_reward：同时满足所有 success 条件时的每步密集奖励。
+        #     success_mask = dist≤success_dist AND vel_err≤tolerance AND in_height_band
+        #     直接对齐 _get_dones() 中的 success_mask，无人机在"成功区"内停留即得，
+        #     与 tracking_reward（仅 dist 条件）互补，提供"速度+距离同时达标"的联合信号。
+        #
+        #   success_bonus：_sustained_follow_timer 上步已越过 success_hold_time 时发放。
+        #     _get_rewards() 在 _get_dones() 之前调用，此时 timer 已是上步 _get_dones() 更新后的值。
+        #     等价于：成功条件首次持续满足 → 本步发放一次性大额奖励 → 下一步 _get_dones() 触发 reset。
+        #     让策略明确区分"成功终止"与"撞地/超时终止"，提供清晰的价值锚点。
+        # =========================
+        success_dist_threshold_rew = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
+        in_height_band_rew = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
+        success_mask_rew = (
+            (assigned_dist <= success_dist_threshold_rew)
+            & (vel_err_norm <= self.cfg.success_velocity_tolerance)
+            & in_height_band_rew
+        )  # (E, D)，per-drone success 条件
+
+        success_proximity_weight = getattr(self.cfg, "success_proximity_weight", 0.0)
+        success_proximity_reward = (
+            success_proximity_weight * success_mask_rew.float() * assigned_target_values
+        )
+
+        success_bonus_weight = getattr(self.cfg, "success_bonus_weight", 0.0)
+        success_just_triggered = self._sustained_follow_timer >= self.cfg.success_hold_time  # (E, D)
+        success_bonus = success_bonus_weight * success_just_triggered.float() * assigned_target_values
+
         # =========================
         # 11) 汇总
         # =========================
@@ -1104,6 +1136,8 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             + dist_progress_reward
             + tracking_reward
             + velocity_follow_reward
+            + success_proximity_reward
+            + success_bonus
             + action_smoothness
             + height_reward
             - body_rate_penalty
@@ -1151,6 +1185,8 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self._episode_sums["upward_vz_penalty"] += upward_vz_penalty.sum(dim=-1)
         self._episode_sums["high_altitude_penalty"] += high_altitude_penalty.sum(dim=-1)
         self._episode_sums["safety_penalty"] += safety_penalty.sum(dim=-1)
+        self._episode_sums["success_proximity_reward"] += success_proximity_reward.sum(dim=-1)
+        self._episode_sums["success_bonus"] += success_bonus.sum(dim=-1)
 
         if "alive_reward" in self._episode_sums:
             self._episode_sums["alive_reward"] += alive_reward.sum(dim=-1)
