@@ -439,7 +439,15 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 self._setpoints[drone]["jerk"] = action[:, 9:12]
             elif self._control_mode == "ACCBR":
                 # ACCBR模式：优先支持6维 [lin_acc(3) + body_rates(3)]
-                self._setpoints[drone]["lin_acc"] = action[:, :3]
+                lin_acc = action[:, :3]
+                # 限制 az 正向分量，抑制起步上窜（geometric controller 已补重力，az>0 = 主动上升）
+                az_scale = getattr(self.cfg, "upward_acc_z_scale", 1.0)
+                if az_scale < 1.0:
+                    az = lin_acc[:, 2:3]
+                    lin_acc = torch.cat(
+                        [lin_acc[:, :2], torch.where(az > 0, az * az_scale, az)], dim=-1
+                    )
+                self._setpoints[drone]["lin_acc"] = lin_acc
                 if action.shape[-1] >= 6:
                     self._setpoints[drone]["body_rates"] = action[:, 3:6]
                 else:
