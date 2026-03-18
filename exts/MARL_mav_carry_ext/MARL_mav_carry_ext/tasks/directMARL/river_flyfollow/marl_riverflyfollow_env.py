@@ -180,6 +180,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 "height_reward",
                 "height_error_penalty",
                 "vertical_direction_penalty",
+                "upward_vz_penalty",
                 "high_altitude_penalty",
                 "safety_penalty",
             ]
@@ -956,7 +957,12 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             torch.clamp(-drone_vel_z, min=0.0),
         )
         vertical_direction_penalty = vertical_direction_penalty_weight * moving_away_vz
-    
+
+        # 上升速度软惩罚：仅 vz > 0 时生效，抑制起步先往上窜
+        upward_vz_penalty = getattr(self.cfg, "upward_vz_penalty_weight", 0.0) * torch.clamp(
+            drone_vel_z, min=0.0
+        )
+
         # =========================
         # 9) 安全软惩罚
         #    collision / 边界 / 低高度都改成“离危险越近罚越多”
@@ -1037,6 +1043,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             - force_penalty
             - height_error_penalty
             - vertical_direction_penalty
+            - upward_vz_penalty
             - safety_penalty
         ) * self.step_dt
 
@@ -1073,6 +1080,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self._episode_sums["height_reward"] += height_reward.sum(dim=-1)
         self._episode_sums["height_error_penalty"] += height_error_penalty.sum(dim=-1)
         self._episode_sums["vertical_direction_penalty"] += vertical_direction_penalty.sum(dim=-1)
+        self._episode_sums["upward_vz_penalty"] += upward_vz_penalty.sum(dim=-1)
         self._episode_sums["high_altitude_penalty"] += high_altitude_penalty.sum(dim=-1)
         self._episode_sums["safety_penalty"] += safety_penalty.sum(dim=-1)
 

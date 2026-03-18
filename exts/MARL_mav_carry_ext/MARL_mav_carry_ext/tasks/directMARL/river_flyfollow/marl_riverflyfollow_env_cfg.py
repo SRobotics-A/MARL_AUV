@@ -146,6 +146,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     height_error_quadratic_weight = 0.0                 # 关闭高度二次惩罚
     height_hold_deadband = 0.10                         # 保留参数（已不生效）
     vertical_direction_penalty_weight = 0.0             # 关闭方向性垂直速度惩罚（不需要定高）
+    upward_vz_penalty_weight: float = 0.05             # 上升速度惩罚：仅 vz>0 时生效，抑制起步上窜
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
     # 高度与碰撞相关
