@@ -21,6 +21,7 @@ from isaacsim.core.prims import XFormPrim
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from pxr import UsdPhysics
 from isaaclab.utils import CircularBuffer
 from isaaclab.utils.math import (
     matrix_from_quat,
@@ -319,6 +320,19 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 for path in candidate_paths:
                     if prim_utils.is_prim_path_valid(path):
                         return path
+                # instanceable = true 时 inner prim 对 is_prim_path_valid 不可见，
+                # 通过 prototype 查找带 ArticulationRootAPI 的子 prim，返回 instance proxy 路径。
+                outer_path = f"{root}/{agent_name}"
+                if prim_utils.is_prim_path_valid(outer_path):
+                    import omni.usd
+                    _stage = omni.usd.get_context().get_stage()
+                    _prim = _stage.GetPrimAtPath(outer_path)
+                    if _prim.IsValid() and _prim.IsInstance():
+                        proto = _prim.GetPrototype()
+                        if proto:
+                            for child in proto.GetAllChildren():
+                                if child.HasAPI(UsdPhysics.ArticulationRootAPI):
+                                    return f"{outer_path}/{child.GetName()}"
                 prims = sim_utils.get_all_matching_child_prims(
                     root, predicate=lambda p: p.GetName() == agent_name
                 )
