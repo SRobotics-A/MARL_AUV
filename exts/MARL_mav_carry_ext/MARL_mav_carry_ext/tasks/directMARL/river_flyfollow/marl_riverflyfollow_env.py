@@ -175,7 +175,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 "tracking_reward",          # 追踪区奖励：entry（进入即有）+ holding（持续保持线性增长）
                 "velocity_follow_reward",   # 速度跟随奖励：vel_match + 前向进度 - 超速惩罚
                 "success_proximity_reward", # 成功区密集奖励：同时满足 dist+vel+height 三个 success 条件时每步发放
-                "success_bonus",            # 成功终止奖励：_sustained_follow_timer 越过阈值时一次性大额奖励
+                "success_bonus",            # 成功终止奖励：timer 达到 success_hold_time 阈值的每步均发放，因触发 reset 每幕实际仅发一次
                 # ── 辅助约束项 ────────────────────────────────────────────
                 "action_smoothness",        # 动作平滑奖励：抑制相邻帧动作突变，防抖
                 "body_rate_penalty",        # 机体角速率惩罚：‖ω‖，辅助约束，防止过度翻滚
@@ -1105,9 +1105,10 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         #     直接对齐 _get_dones() 中的 success_mask，无人机在"成功区"内停留即得，
         #     与 tracking_reward（仅 dist 条件）互补，提供"速度+距离同时达标"的联合信号。
         #
-        #   success_bonus：_sustained_follow_timer 上步已越过 success_hold_time 时发放。
+        #   success_bonus：timer_reached_threshold（timer >= success_hold_time）的每步均发放。
         #     _get_rewards() 在 _get_dones() 之前调用，此时 timer 已是上步 _get_dones() 更新后的值。
-        #     等价于：成功条件首次持续满足 → 本步发放一次性大额奖励 → 下一步 _get_dones() 触发 reset。
+        #     timer 一旦达到阈值，本步 _get_rewards() 发放奖励，随后 _get_dones() 触发 reset，
+        #     因此每幕实际最多发放一次，并非"首次触发"的瞬时信号。
         #     让策略明确区分"成功终止"与"撞地/超时终止"，提供清晰的价值锚点。
         # =========================
         success_dist_threshold_rew = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
