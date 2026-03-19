@@ -1112,11 +1112,17 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # =========================
         success_dist_threshold_rew = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
         in_height_band_rew = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
+        # 速度条件与 _get_dones() 保持一致：只取纵向分量（沿目标前进方向）
+        _target_spd_rew = torch.norm(assigned_target_vel_xy, dim=-1, keepdim=True).clamp(min=1e-6)
+        _target_dir_rew = assigned_target_vel_xy / _target_spd_rew
+        vel_err_longitudinal_rew = torch.abs(
+            torch.sum((drone_vel_xy - assigned_target_vel_xy) * _target_dir_rew, dim=-1)
+        )  # (E, D)
         success_mask_rew = (
             (assigned_dist <= success_dist_threshold_rew)
-            & (vel_err_norm <= self.cfg.success_velocity_tolerance)
+            & (vel_err_longitudinal_rew <= self.cfg.success_velocity_tolerance)
             & in_height_band_rew
-        )  # (E, D)，per-drone success 条件
+        )  # (E, D)，per-drone success 条件，与 _get_dones() enter_mask 对齐
 
         success_proximity_weight = getattr(self.cfg, "success_proximity_weight", 0.0)
         success_proximity_reward = (
@@ -1227,7 +1233,13 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
         ).squeeze(2)
         assigned_dist_xy = torch.norm(self.drone_positions[:, :, :2] - assigned_target_pos_xy, dim=-1)
-        vel_error_xy = torch.norm(self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy, dim=-1)
+        # 速度误差：只取沿目标前进方向的纵向分量，忽略侧向漂移
+        # vel_error_xy = |dot(v_drone_xy - v_target_xy, target_dir)|
+        # 相比全量 L2 范数更贴近"跟随"语义：侧向偏移不计入成功条件
+        _vel_diff_dones = self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy   # (E, D, 2)
+        _target_spd_dones = torch.norm(assigned_target_vel_xy, dim=-1, keepdim=True).clamp(min=1e-6)
+        _target_dir_dones = assigned_target_vel_xy / _target_spd_dones                      # (E, D, 2)
+        vel_error_xy = torch.abs(torch.sum(_vel_diff_dones * _target_dir_dones, dim=-1))    # (E, D)
         drone_z = self.drone_positions[:, :, 2]
 
         # ── 滞回成功判定（Hysteresis Success） ──────────────────────────────
@@ -1287,6 +1299,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
         max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
         # success 条件分解：诊断哪个条件阻止了成功（enter=严格 / hold=宽松维持）
+        # vel_error_xy 此处已是纵向误差（沿目标前进方向），非全量 L2
         success_dist_rate  = (assigned_dist_xy <= success_dist_threshold).float().mean()
         success_vel_rate   = (vel_error_xy <= self.cfg.success_velocity_tolerance).float().mean()
         success_mask_rate  = enter_mask.float().mean()   # 严格 enter 条件同时满足的比例
