@@ -244,6 +244,10 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self._sustained_follow_timer = torch.zeros(
             (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
         )
+        # enter gate 使用的纵向速度误差 EMA；-1 表示该 env/drone 尚未初始化，首帧直接用当前值灌入。
+        self._smoothed_success_vel_error_longitudinal = torch.full(
+            (self.num_envs, self._num_drones), -1.0, dtype=torch.float, device=self.device
+        )
 
         # 近距稳定跟随计时器（tracking_reward 持续时间加成用）
         # 条件：dist < tracking_distance_xy AND vel_err < 2*tracking_vel_match_sigma
@@ -1274,10 +1278,19 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         hold_dist_sharp  = getattr(self.cfg, "success_hold_dist_sharpness", 0.5)
         decay_rate       = getattr(self.cfg, "success_timer_decay_rate", 0.5)
 
-        # enter_mask：硬阈值，保留严格进入门槛
+        # enter_mask：硬阈值，保留严格进入门槛；速度项使用短时 EMA，降低单步抖动造成的误判。
+        enter_vel_ema_alpha = float(getattr(self.cfg, "success_enter_vel_ema_alpha", 0.8))
+        prev_smoothed_vel = self._smoothed_success_vel_error_longitudinal
+        smoothed_vel_error_longitudinal = torch.where(
+            prev_smoothed_vel < 0.0,
+            vel_error_longitudinal,
+            enter_vel_ema_alpha * prev_smoothed_vel + (1.0 - enter_vel_ema_alpha) * vel_error_longitudinal,
+        )
+        self._smoothed_success_vel_error_longitudinal = smoothed_vel_error_longitudinal
+
         enter_mask = (
             (assigned_dist_xy      <= success_dist_threshold)
-            & (vel_error_longitudinal <= self.cfg.success_velocity_tolerance)
+            & (smoothed_vel_error_longitudinal <= self.cfg.success_velocity_tolerance)
             & in_height_band
         )  # (E, D)
 
@@ -1323,7 +1336,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
         # success 条件分解（所有速度指标均为纵向误差口径，与 _get_rewards() 对齐）
         success_dist_rate  = (assigned_dist_xy <= success_dist_threshold).float().mean()
-        success_vel_rate   = (vel_error_longitudinal <= self.cfg.success_velocity_tolerance).float().mean()
+        success_vel_rate   = (smoothed_vel_error_longitudinal <= self.cfg.success_velocity_tolerance).float().mean()
         success_mask_rate  = enter_mask.float().mean()    # enter 严格条件同时满足比例
         hold_mask_rate     = hold_mask.float().mean()     # hold_factor > 中性点的比例
         hold_factor_mean   = hold_factor.mean()           # hold 软权重均值（0~1）
@@ -1425,6 +1438,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
         self._assign_targets_for_envs(env_ids)
         self._sustained_follow_timer[env_ids] = 0.0
+        self._smoothed_success_vel_error_longitudinal[env_ids] = -1.0
         self._tracking_stable_timer[env_ids] = 0.0  # 重置近距稳定计时器
         self._prev_assigned_dist[env_ids] = 100.0  # 重置进度奖励基准距离
 
