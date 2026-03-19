@@ -1233,56 +1233,76 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
         ).squeeze(2)
         assigned_dist_xy = torch.norm(self.drone_positions[:, :, :2] - assigned_target_pos_xy, dim=-1)
-        # 速度误差：只取沿目标前进方向的纵向分量，忽略侧向漂移
-        # vel_error_xy = |dot(v_drone_xy - v_target_xy, target_dir)|
-        # 相比全量 L2 范数更贴近"跟随"语义：侧向偏移不计入成功条件
-        _vel_diff_dones = self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy   # (E, D, 2)
+        # ── 速度误差：纵向分量（沿目标前进方向），忽略侧向漂移 ────────────────
+        # vel_error_longitudinal = |dot(v_drone_xy - v_target_xy, target_dir)|
+        # 与 _get_rewards() 的 success_mask_rew / vel_err_longitudinal_rew 口径完全一致
+        _vel_diff_dones   = self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy  # (E, D, 2)
         _target_spd_dones = torch.norm(assigned_target_vel_xy, dim=-1, keepdim=True).clamp(min=1e-6)
-        _target_dir_dones = assigned_target_vel_xy / _target_spd_dones                      # (E, D, 2)
-        vel_error_xy = torch.abs(torch.sum(_vel_diff_dones * _target_dir_dones, dim=-1))    # (E, D)
+        _target_dir_dones = assigned_target_vel_xy / _target_spd_dones                       # (E, D, 2)
+        vel_error_longitudinal = torch.abs(
+            torch.sum(_vel_diff_dones * _target_dir_dones, dim=-1)
+        )  # (E, D) — 纵向速度误差，全局统一口径
         drone_z = self.drone_positions[:, :, 2]
 
-        # ── 滞回成功判定（Hysteresis Success） ──────────────────────────────
-        # 采用"先进入严格区，再用宽松条件维持"的两级门槛，避免轻微抖动导致 timer 反复归零。
+        # ── 滞回成功判定（Hysteresis + Soft Hold） ───────────────────────────
         #
-        # enter_mask（严格）：首次触发计时所需条件
-        #   dist ≤ success_distance_xy  AND  vel_err ≤ success_velocity_tolerance  AND  in_height_band
+        # 分两层：
+        #   enter_mask（硬阈值）：首次启动 timer 必须同时满足的严格条件
+        #     dist ≤ d_enter  AND  vel_long ≤ v_enter  AND  in_height_band
         #
-        # hold_mask（宽松）：已进入后仅需满足的维持条件
-        #   dist ≤ success_distance_xy_hold  AND  vel_err ≤ success_velocity_tolerance_hold
+        #   hold_factor（软权重，[0,1]）：已进入后 timer 的增长/衰减速率乘数
+        #     vel_factor  = exp(-(vel_long / v_hold_sigma)²)  — Gaussian，vel=0时1，vel=sigma时≈0.37
+        #     dist_factor = sigmoid((d_hold - dist) * sharpness) — sigmoid，中心满值，边界过渡
+        #     hold_factor = vel_factor × dist_factor × in_height_band
         #
-        # active_mask = enter_mask | (hold_mask & already_entered)
-        #   already_entered ≡ timer > 0（timer 本身就是"是否已进入"的状态）
-        # → timer > 0 后，后续步只需通过 hold_mask，即可持续累积
-        # → timer 归零后，必须重新通过 enter_mask 才能再次启动
+        #   timer 更新（连续平滑）：
+        #     已进入（timer>0）：delta = (hold_factor - decay_rate×(1-hold_factor)) × dt
+        #       → hold_factor=1.0 → 满速增长
+        #       → hold_factor=decay/(1+decay)≈0.33 → 中性（不增不减）
+        #       → hold_factor=0.0 → 以 decay_rate 衰减
+        #     未进入（timer=0）：enter_mask 才以固定速率启动，否则 timer 维持 0
+        #
+        # 效果：不再是单步硬开关，轻微超出 hold 区边界时 timer 缓慢衰减而非骤停，
+        # 只有持续远离才会归零，归零后必须重新通过 enter_mask 才能再次启动。
         in_height_band = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
         success_dist_threshold = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
-        hold_dist     = getattr(self.cfg, "success_distance_xy_hold", success_dist_threshold)
-        hold_vel      = getattr(self.cfg, "success_velocity_tolerance_hold", self.cfg.success_velocity_tolerance)
+        hold_dist        = getattr(self.cfg, "success_distance_xy_hold", success_dist_threshold)
+        hold_vel_sigma   = getattr(self.cfg, "success_velocity_tolerance_hold", self.cfg.success_velocity_tolerance)
+        hold_dist_sharp  = getattr(self.cfg, "success_hold_dist_sharpness", 0.5)
+        decay_rate       = getattr(self.cfg, "success_timer_decay_rate", 0.5)
 
+        # enter_mask：硬阈值，保留严格进入门槛
         enter_mask = (
-            (assigned_dist_xy <= success_dist_threshold)
-            & (vel_error_xy   <= self.cfg.success_velocity_tolerance)
+            (assigned_dist_xy      <= success_dist_threshold)
+            & (vel_error_longitudinal <= self.cfg.success_velocity_tolerance)
             & in_height_band
-        )  # (E, D) — 严格进入条件
-        hold_mask = (
-            (assigned_dist_xy <= hold_dist)
-            & (vel_error_xy   <= hold_vel)
-            & in_height_band
-        )  # (E, D) — 宽松维持条件
+        )  # (E, D)
 
-        already_entered = self._sustained_follow_timer > 0.0   # (E, D)
-        active_mask = enter_mask | (hold_mask & already_entered)
+        # hold_factor：连续软权重，已进入后控制 timer 增减速率
+        hold_vel_factor  = torch.exp(
+            -(vel_error_longitudinal / (hold_vel_sigma + 1e-6)) ** 2
+        )  # Gaussian：vel=0→1.0，vel=sigma→0.37，vel=2σ→0.02
+        hold_dist_factor = torch.sigmoid(
+            (hold_dist - assigned_dist_xy) * hold_dist_sharp
+        )  # sigmoid：dist远小于hold_dist→~1，超过hold_dist→快速降向0
+        hold_factor = hold_vel_factor * hold_dist_factor * in_height_band.float()  # (E, D)
 
-        # success_mask 仍用严格 enter 条件，用于日志和 success_proximity_reward 对齐
+        already_entered = self._sustained_follow_timer > 0.0  # (E, D)
+
+        # timer 增量：连续平滑，正值增长，负值衰减
+        timer_delta = torch.where(
+            already_entered,
+            (hold_factor - decay_rate * (1.0 - hold_factor)) * self.step_dt,  # 软增减
+            enter_mask.float() * self.step_dt,                                 # 硬启动
+        )
+        self._sustained_follow_timer = (self._sustained_follow_timer + timer_delta).clamp(min=0.0)
+
+        # success_mask 仍用严格 enter 条件，与 _get_rewards() 的 success_mask_rew 对齐
         success_mask = enter_mask
 
-        decay_rate = getattr(self.cfg, "success_timer_decay_rate", 0.5)
-        self._sustained_follow_timer = torch.where(
-            active_mask,
-            self._sustained_follow_timer + self.step_dt,
-            torch.clamp(self._sustained_follow_timer - decay_rate * self.step_dt, min=0.0),
-        )
+        # hold_mask：用于日志，表示 hold_factor > 0.5（等效于软权重通过"中性点"）
+        hold_mask = hold_factor > (decay_rate / (1.0 + decay_rate))  # 增减平衡点
+
         sustained_success = (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)
 
         # 综合终止条件
@@ -1298,13 +1318,13 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         any_rate = terminations.float().mean()
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
         max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
-        # success 条件分解：诊断哪个条件阻止了成功（enter=严格 / hold=宽松维持）
-        # vel_error_xy 此处已是纵向误差（沿目标前进方向），非全量 L2
+        # success 条件分解（所有速度指标均为纵向误差口径，与 _get_rewards() 对齐）
         success_dist_rate  = (assigned_dist_xy <= success_dist_threshold).float().mean()
-        success_vel_rate   = (vel_error_xy <= self.cfg.success_velocity_tolerance).float().mean()
-        success_mask_rate  = enter_mask.float().mean()   # 严格 enter 条件同时满足的比例
-        hold_mask_rate     = hold_mask.float().mean()    # 宽松 hold 条件同时满足的比例
-        in_success_rate    = already_entered.float().mean()  # 当前 timer>0（已进入）的比例
+        success_vel_rate   = (vel_error_longitudinal <= self.cfg.success_velocity_tolerance).float().mean()
+        success_mask_rate  = enter_mask.float().mean()    # enter 严格条件同时满足比例
+        hold_mask_rate     = hold_mask.float().mean()     # hold_factor > 中性点的比例
+        hold_factor_mean   = hold_factor.mean()           # hold 软权重均值（0~1）
+        in_success_rate    = already_entered.float().mean()  # timer>0（已进入）比例
         self.extras["log"] = {
             "Debug/Termination/fly_low_rate": fly_low_rate,
             "Debug/Termination/fly_high_rate": fly_high_rate,
@@ -1315,8 +1335,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             "Debug/Termination/min_height": min_height,
             "Debug/Termination/max_height": max_height,
             "Debug/Success/dist_rate": success_dist_rate,
-            "Debug/Success/vel_rate": success_vel_rate,
+            "Debug/Success/vel_rate_longitudinal": success_vel_rate,
             "Debug/Success/enter_mask_rate": success_mask_rate,
+            "Debug/Success/hold_factor_mean": hold_factor_mean,
             "Debug/Success/hold_mask_rate": hold_mask_rate,
             "Debug/Success/in_success_rate": in_success_rate,
         }
@@ -1333,8 +1354,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             log["Debug/Termination/min_height"] = min_height
             log["Debug/Termination/max_height"] = max_height
             log["Debug/Success/dist_rate"] = success_dist_rate
-            log["Debug/Success/vel_rate"] = success_vel_rate
+            log["Debug/Success/vel_rate_longitudinal"] = success_vel_rate
             log["Debug/Success/enter_mask_rate"] = success_mask_rate
+            log["Debug/Success/hold_factor_mean"] = hold_factor_mean
             log["Debug/Success/hold_mask_rate"] = hold_mask_rate
             log["Debug/Success/in_success_rate"] = in_success_rate
 
