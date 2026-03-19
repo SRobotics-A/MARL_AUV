@@ -1130,8 +1130,10 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         )
 
         success_bonus_weight = getattr(self.cfg, "success_bonus_weight", 0.0)
-        success_just_triggered = self._sustained_follow_timer >= self.cfg.success_hold_time  # (E, D)
-        success_bonus = success_bonus_weight * success_just_triggered.float() * assigned_target_values
+        # timer_reached_threshold：timer 已达到 success_hold_time 阈值（本步奖励发放后 _get_dones() 会触发 reset）
+        # 不是"首次触发"的瞬时标志，而是"timer 当前处于成功阈值以上"的状态标志
+        timer_reached_threshold = self._sustained_follow_timer >= self.cfg.success_hold_time  # (E, D)
+        success_bonus = success_bonus_weight * timer_reached_threshold.float() * assigned_target_values
 
         # =========================
         # 11) 汇总
@@ -1324,7 +1326,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         success_mask_rate  = enter_mask.float().mean()    # enter 严格条件同时满足比例
         hold_mask_rate     = hold_mask.float().mean()     # hold_factor > 中性点的比例
         hold_factor_mean   = hold_factor.mean()           # hold 软权重均值（0~1）
-        in_success_rate    = already_entered.float().mean()  # timer>0（已进入）比例
+        in_success_rate    = (self._sustained_follow_timer > 0.0).float().mean()  # timer>0（已进入）比例，使用本步更新后的 timer
         self.extras["log"] = {
             "Debug/Termination/fly_low_rate": fly_low_rate,
             "Debug/Termination/fly_high_rate": fly_high_rate,
