@@ -1230,21 +1230,47 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         vel_error_xy = torch.norm(self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy, dim=-1)
         drone_z = self.drone_positions[:, :, 2]
 
-        # 成功判定：仅要求 XY 距离 + 速度匹配 + 在安全高度带内（不要求定高）
-        # 高度安全由终止条件（fly_low/fly_high）和软惩罚（high/low_altitude_penalty）保证
+        # ── 滞回成功判定（Hysteresis Success） ──────────────────────────────
+        # 采用"先进入严格区，再用宽松条件维持"的两级门槛，避免轻微抖动导致 timer 反复归零。
+        #
+        # enter_mask（严格）：首次触发计时所需条件
+        #   dist ≤ success_distance_xy  AND  vel_err ≤ success_velocity_tolerance  AND  in_height_band
+        #
+        # hold_mask（宽松）：已进入后仅需满足的维持条件
+        #   dist ≤ success_distance_xy_hold  AND  vel_err ≤ success_velocity_tolerance_hold
+        #
+        # active_mask = enter_mask | (hold_mask & already_entered)
+        #   already_entered ≡ timer > 0（timer 本身就是"是否已进入"的状态）
+        # → timer > 0 后，后续步只需通过 hold_mask，即可持续累积
+        # → timer 归零后，必须重新通过 enter_mask 才能再次启动
         in_height_band = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
         success_dist_threshold = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
-        success_mask = (
+        hold_dist     = getattr(self.cfg, "success_distance_xy_hold", success_dist_threshold)
+        hold_vel      = getattr(self.cfg, "success_velocity_tolerance_hold", self.cfg.success_velocity_tolerance)
+
+        enter_mask = (
             (assigned_dist_xy <= success_dist_threshold)
-            & (vel_error_xy <= self.cfg.success_velocity_tolerance)
+            & (vel_error_xy   <= self.cfg.success_velocity_tolerance)
             & in_height_band
-        )
-        decay_rate = getattr(self.cfg, "success_timer_decay_rate", 2.0)
+        )  # (E, D) — 严格进入条件
+        hold_mask = (
+            (assigned_dist_xy <= hold_dist)
+            & (vel_error_xy   <= hold_vel)
+            & in_height_band
+        )  # (E, D) — 宽松维持条件
+
+        already_entered = self._sustained_follow_timer > 0.0   # (E, D)
+        active_mask = enter_mask | (hold_mask & already_entered)
+
+        # success_mask 仍用严格 enter 条件，用于日志和 success_proximity_reward 对齐
+        success_mask = enter_mask
+
+        decay_rate = getattr(self.cfg, "success_timer_decay_rate", 0.5)
         self._sustained_follow_timer = torch.where(
-            success_mask,
+            active_mask,
             self._sustained_follow_timer + self.step_dt,
-            self._sustained_follow_timer - decay_rate * self.step_dt,
-        ).clamp(min=0.0)
+            torch.clamp(self._sustained_follow_timer - decay_rate * self.step_dt, min=0.0),
+        )
         sustained_success = (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)
 
         # 综合终止条件
@@ -1260,10 +1286,12 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         any_rate = terminations.float().mean()
         min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
         max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
-        # success 条件分解：诊断哪个条件阻止了成功
-        success_dist_rate = (assigned_dist_xy <= success_dist_threshold).float().mean()
-        success_vel_rate = (vel_error_xy <= self.cfg.success_velocity_tolerance).float().mean()
-        success_mask_rate = success_mask.float().mean()
+        # success 条件分解：诊断哪个条件阻止了成功（enter=严格 / hold=宽松维持）
+        success_dist_rate  = (assigned_dist_xy <= success_dist_threshold).float().mean()
+        success_vel_rate   = (vel_error_xy <= self.cfg.success_velocity_tolerance).float().mean()
+        success_mask_rate  = enter_mask.float().mean()   # 严格 enter 条件同时满足的比例
+        hold_mask_rate     = hold_mask.float().mean()    # 宽松 hold 条件同时满足的比例
+        in_success_rate    = already_entered.float().mean()  # 当前 timer>0（已进入）的比例
         self.extras["log"] = {
             "Debug/Termination/fly_low_rate": fly_low_rate,
             "Debug/Termination/fly_high_rate": fly_high_rate,
@@ -1275,7 +1303,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             "Debug/Termination/max_height": max_height,
             "Debug/Success/dist_rate": success_dist_rate,
             "Debug/Success/vel_rate": success_vel_rate,
-            "Debug/Success/mask_rate": success_mask_rate,
+            "Debug/Success/enter_mask_rate": success_mask_rate,
+            "Debug/Success/hold_mask_rate": hold_mask_rate,
+            "Debug/Success/in_success_rate": in_success_rate,
         }
         for agent in self.cfg.possible_agents:
             if "log" not in self.extras[agent]:
@@ -1291,7 +1321,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             log["Debug/Termination/max_height"] = max_height
             log["Debug/Success/dist_rate"] = success_dist_rate
             log["Debug/Success/vel_rate"] = success_vel_rate
-            log["Debug/Success/mask_rate"] = success_mask_rate
+            log["Debug/Success/enter_mask_rate"] = success_mask_rate
+            log["Debug/Success/hold_mask_rate"] = hold_mask_rate
+            log["Debug/Success/in_success_rate"] = in_success_rate
 
         # 所有智能体共享相同终止信号
         terminated = {agent: terminations for agent in self.cfg.possible_agents}
