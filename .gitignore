@@ -11,3 +11,4 @@ profile.sh
 *.db
 reference_trajectories/
 .claude
+*_bak/
