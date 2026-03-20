@@ -1032,10 +1032,12 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         )
         vertical_direction_penalty = vertical_direction_penalty_weight * moving_away_vz
 
-        # 上升速度软惩罚：仅 vz > 0 时生效，抑制起步先往上窜
-        upward_vz_penalty = getattr(self.cfg, "upward_vz_penalty_weight", 0.0) * torch.clamp(
-            drone_vel_z, min=0.0
-        )
+        # 上升速度软惩罚：仅 vz > 0 时生效；当高度已偏高时，继续上升会更明显吃亏。
+        upward_vz = torch.clamp(drone_vel_z, min=0.0)
+        upward_vz_altitude_start = float(getattr(self.cfg, "upward_vz_penalty_altitude_start", 3.0))
+        upward_vz_altitude_scale = float(getattr(self.cfg, "upward_vz_penalty_altitude_scale", 1.0))
+        upward_altitude_factor = 1.0 + torch.clamp(drone_z - upward_vz_altitude_start, min=0.0) * upward_vz_altitude_scale
+        upward_vz_penalty = getattr(self.cfg, "upward_vz_penalty_weight", 0.0) * upward_vz * upward_altitude_factor
 
         # =========================
         # 9) 安全软惩罚

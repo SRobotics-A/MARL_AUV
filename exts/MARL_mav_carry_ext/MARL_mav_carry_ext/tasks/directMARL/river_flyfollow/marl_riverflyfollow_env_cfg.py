@@ -117,9 +117,9 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     collision_soft_margin = 0.5
     boundary_soft_margin = 1.0
     altitude_soft_margin = 1.0                         # 低高度软惩罚区间：z < min_altitude+1.0=2.0m 时开始罚
-    altitude_upper_soft_threshold = 5.5                # 高度软上限：z > 5.5m 才开始罚（硬终止 7.0m，留 1.5m 缓冲）
-    high_altitude_soft_margin = 1.5                    # 超高软惩罚归一化区间（5.5~7.0m 线性增大）
-    high_altitude_penalty_weight = 0.4                 # 超高软惩罚权重
+    altitude_upper_soft_threshold = 4.0                # 高度软上限前移：z > 4.0m 就开始持续受罚
+    high_altitude_soft_margin = 1.0                    # 超高软惩罚归一化区间（4.0~5.0m 迅速拉高代价）
+    high_altitude_penalty_weight = 1.2                 # 超高软惩罚权重加强，避免高空平台成为便宜解
     alive_reward_weight = 0.05
 
     # 奖励塑形参数
@@ -141,7 +141,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     body_rate_penalty_weight = 0.02                     # 机体角速率惩罚权重（降至辅助约束，不主导负项）
     velocity_penalty_weight = 0.05                      # 速度惩罚权重（从0.2降至0.05：仅作防失控约束，不主导行为塑形）
     velocity_penalty_xy_safe = 4.0                      # XY 安全速度阈值（从2.0升至4.0 m/s：正常追踪机动完全不触发）
-    velocity_penalty_z_safe = 2.0                       # Z 安全速度阈值（从0.5升至2.0 m/s：允许正常高度调整）
+    velocity_penalty_z_safe = 1.0                       # Z 安全速度阈值收紧：持续向上冲高更早进入惩罚区
     velocity_penalty_z_scale = 0.25                     # Z 超速惩罚相对权重
     force_penalty_weight = 0.2                          # 推力惩罚权重
     # 不要求定高悬停，只需保持在安全高度带内（不超高/不超低）
@@ -152,8 +152,10 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     height_error_quadratic_weight = 0.0                 # 关闭高度二次惩罚
     height_hold_deadband = 0.10                         # 保留参数（已不生效）
     vertical_direction_penalty_weight = 0.0             # 关闭方向性垂直速度惩罚（不需要定高）
-    upward_vz_penalty_weight: float = 0.15             # 上升速度惩罚：仅 vz>0 时生效，抑制起步上窜（加强至 0.15）
-    upward_acc_z_scale: float = 0.3                    # ACCBR az>0 时缩放因子：从源头限制上升加速度，1.0=无约束
+    upward_vz_penalty_weight: float = 0.30             # 上升速度惩罚基础权重：持续爬升会更明显吃亏
+    upward_vz_penalty_altitude_start: float = 3.0      # 高于该高度后，上升速度惩罚开始随高度继续增强
+    upward_vz_penalty_altitude_scale: float = 1.0      # 高度增强系数：每高于起点1m，惩罚系数额外增加1.0
+    upward_acc_z_scale: float = 0.2                    # ACCBR az>0 时缩放因子进一步压缩，减少向上冲高
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
     # 高度与碰撞相关
