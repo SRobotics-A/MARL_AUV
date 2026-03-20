@@ -970,10 +970,14 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             -(drone_z < self.cfg.min_altitude).any(dim=-1).float()
             * self.cfg.fly_low_penalty
         )  # (E,)
-        # 非法接触（contact sensor，与 move 对齐）
-        illegal_contact_r = (
-            -self.illegal_contact.float() * self.cfg.illegal_contact_penalty
-        )  # (E,)
+        # 非法接触（contact sensor，与 move 对齐：直接读当前步传感器数据）
+        illegal_any = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for cs in self.contact_sensors:
+            net_f = cs.data.net_forces_w_history
+            max_f = torch.max(torch.norm(net_f, dim=-1), dim=1)[0]
+            has_contact = (max_f > self.cfg.contact_sensor_threshold).any(dim=1)
+            illegal_any = illegal_any | has_contact
+        illegal_contact_r = -illegal_any.float() * self.cfg.illegal_contact_penalty  # (E,)
 
         # =========================
         # 14) 汇总（共享 per-env 奖励，与 move 对齐）
