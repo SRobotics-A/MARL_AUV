@@ -148,47 +148,43 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self._target_velocities = torch.zeros(self.num_envs, self._num_targets, 3, device=self.device)   # 速度
         self._target_orientations = torch.zeros(self.num_envs, self._num_targets, 4, device=self.device) # 姿态
         self._target_orientations[..., 0] = 1.0                                                          # 初始化为单位四元数
-        self._target_claimed = torch.zeros(self.num_envs, self._num_targets, dtype=torch.bool, device=self.device)  # 是否已被认领
+        # 目标跟随状态：实时可撤销（与 move 对齐）
+        # target_captured[e, t]：当前该目标是否被某架无人机跟随（距离 < capture_distance）
+        self.target_captured = torch.zeros(
+            self.num_envs, self._num_targets, dtype=torch.bool, device=self.device
+        )
+        # target_captured_by[e, t]：最近跟随该目标的无人机索引（-1=未被跟随）
+        self.target_captured_by = torch.full(
+            (self.num_envs, self._num_targets), -1, dtype=torch.long, device=self.device
+        )
         self._target_assignment = torch.full(
             (self.num_envs, self._num_targets), -1, dtype=torch.long, device=self.device
-        )  # 目标分配给哪个无人机
+        )  # 目标分配给哪个无人机（固定 per-episode，用于观测）
 
         # 目标沿x轴匀速移动
         self._target_velocities[..., 0] = cfg.target_speed
 
-        # 势函数距离进度奖励：记录上一步各无人机到分配目标的距离
-        self._prev_assigned_dist = torch.full(
-            (self.num_envs, self._num_drones), 100.0, device=self.device
-        )
-
-        # 奖励统计（用于日志记录）
+        # 奖励统计（与 move 对齐的简化版奖励项）
         self._episode_sums = {
-            key: torch.zeros(
-                self.num_envs,
-                dtype=torch.float,
-                device=self.device,
-            )
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
-                # ── 主奖励项 ──────────────────────────────────────────────
-                "distance_reward",          # 高斯距离奖励：exp(-(d/σ)²)，σ=10，近场梯度
-                "dist_progress_reward",     # 距离进度奖励（势函数 shaping）：每步缩短距离即得正值
-                "tracking_reward",          # 追踪区奖励：entry（进入即有）+ holding（持续保持线性增长）
-                "velocity_follow_reward",   # 速度跟随奖励：vel_match + 前向进度 - 超速惩罚
-                "success_proximity_reward", # 成功区密集奖励：同时满足 dist+vel+height 三个 success 条件时每步发放
-                "success_bonus",            # 成功终止奖励：timer 达到 success_hold_time 阈值的每步均发放，因触发 reset 每幕实际仅发一次
-                # ── 辅助约束项 ────────────────────────────────────────────
-                "action_smoothness",        # 动作平滑奖励：抑制相邻帧动作突变，防抖
-                "body_rate_penalty",        # 机体角速率惩罚：‖ω‖，辅助约束，防止过度翻滚
-                "velocity_penalty",         # 速度惩罚：XY/Z 超出安全阈值后按比例扣分
-                "force_penalty",            # 推力惩罚：总推力过大时扣分，节约能量
-                # ── 高度相关项 ────────────────────────────────────────────
-                "height_reward",            # 高度奖励：贴近 desired_height 的高斯奖励（当前已关闭，weight=0）
-                "height_error_penalty",     # 高度误差惩罚（当前已关闭，weight=0）
-                "vertical_direction_penalty", # 垂直方向速度惩罚（当前已关闭，weight=0）
-                "upward_vz_penalty",        # 上升速度惩罚：仅 vz>0 时生效，抑制起步无意义上窜
-                "high_altitude_penalty",    # 超高软惩罚：z > altitude_upper_soft_threshold 时线性增大
-                # ── 综合安全项 ────────────────────────────────────────────
-                "safety_penalty",           # 安全惩罚合计：碰撞软惩罚 + 边界软惩罚 + 低高度软惩罚 + 超高惩罚
+                # ── 主奖励（与 move 结构对齐）─────────────────────────────
+                "distance_reward",       # exp(-d/σ)² × target_value，最近无人机到各目标，move 同结构
+                "tracking_reward",       # is_captured × exp(-d × scale) × value，move 同结构
+                "velocity_follow_reward",# vel_match + progress - overspeed，river 特有（追随行为必需）
+                # ── 辅助正奖励（exp-decay，与 move 对齐：低值越优） ────────
+                "action_smoothness",     # exp(-‖Δa‖²/σ²)，move 同结构
+                "body_rate_reward",      # exp(-‖ω‖)，move: body_rate_penalty_weight × exp，此处同
+                "velocity_reward",       # exp(-‖v‖)，move: velocity_penalty_weight × exp，此处同
+                "force_reward",          # exp(-max_thrust)，move: force_penalty_weight × exp，此处同
+                # ── 高度与安全（river 特有保留项）────────────────────────
+                "height_reward",         # exp(-(z-z_d)²/σ²)，move 同结构
+                "upright_penalty",       # (z_body_dot - 1) × dt，move 同结构
+                "safety_penalty",        # 超高 + 上升速度惩罚，river 任务高空问题保留
+                # ── 硬约束固定惩罚（move 同结构，不乘 step_dt）────────────
+                "collision_penalty",     # 无人机碰撞
+                "drone_out",             # 越界
+                "fly_low",               # 低飞
             ]
         }
 
@@ -217,15 +213,10 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.body_pos_outside = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )  # 无人机飞出边界框（bounding_box_threshold），超出允许飞行区域
-        # 所有目标都被捕获的标志（当前任务中暂不启用提前终止）
-        self.all_targets_captured = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )  # 四个目标全部被持续跟随成功时置 True（当前由 sustained_success 触发终止）
-        # # 持续跟随计时器
-        # self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
-        self.targets_out_of_bounds = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
+        # 持续跟随成功标志（≥3个目标同时 captured 达到 sustained_follow_duration 秒）
+        self.all_targets_captured = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        # 持续跟随计时器（per-env，与 move 对齐：暂停而非归零）
+        self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
         self.time_out = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # 归一化配置参数
@@ -238,21 +229,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 每个 episode 固定的 target assignment（每架无人机一个目标）
         self._assigned_target_idx = torch.zeros(
             (self.num_envs, self._num_drones), dtype=torch.long, device=self.device
-        )
-
-        # 持续跟随计时器（按 env、drone）
-        self._sustained_follow_timer = torch.zeros(
-            (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
-        )
-        # enter gate 使用的纵向速度误差 EMA；-1 表示该 env/drone 尚未初始化，首帧直接用当前值灌入。
-        self._smoothed_success_vel_error_longitudinal = torch.full(
-            (self.num_envs, self._num_drones), -1.0, dtype=torch.float, device=self.device
-        )
-
-        # 近距稳定跟随计时器（tracking_reward 持续时间加成用）
-        # 条件：dist < tracking_distance_xy AND vel_err < 2*tracking_vel_match_sigma
-        self._tracking_stable_timer = torch.zeros(
-            (self.num_envs, self._num_drones), dtype=torch.float, device=self.device
         )
 
         # 初始化目标位置
@@ -791,7 +767,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 drone_angular_velocities_norm.view(self.num_envs, -1),  # 角速度 (9)
                 target_positions_norm.view(self.num_envs, -1),  # 目标位置 (12)
                 target_velocities_norm.view(self.num_envs, -1),  # 目标速度 (12)
-                self._target_claimed.float().view(self.num_envs, -1),  # 捕获状态 (4)
+                self.target_captured.float().view(self.num_envs, -1),  # 捕获状态 (4)
                 target_values_norm,  # 目标价值 (4)
                 assigned_target_one_hot.view(self.num_envs, -1),  # 固定分配关系 (num_drones*num_targets)
             ),
@@ -800,8 +776,14 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         return states
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        """更稳的多目标奖励设计：连续奖励 + 软约束 + step_dt 缩放"""
-    
+        """move 对齐的奖励设计：
+        - 距离奖励 + 追踪区奖励（主信号，与 move 结构一致）
+        - 速度跟随（river 任务必要辅助，保留）
+        - 辅助正奖励：action_smoothness / body_rate / velocity / force（exp-decay，与 move 对齐）
+        - 高度与安全（altitude、upright，与 move 对齐）
+        - 硬约束固定惩罚：collision / out-of-bounds / fly-low（不乘 step_dt，与 move 对齐）
+        - 奖励共享：所有智能体获得同一 per-env 奖励（与 move 对齐）
+        """
         # =========================
         # 0) 更新无人机状态
         # =========================
@@ -811,414 +793,223 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.drone_orientations[:, i] = root_state[:, 3:7]
             self.drone_linear_velocities[:, i] = root_state[:, 7:10]
             self.drone_angular_velocities[:, i] = root_state[:, 10:13]
-    
-        drone_pos = self.drone_positions                              # (E, D, 3)
-        drone_pos_xy = drone_pos[:, :, :2]                           # (E, D, 2)
-        drone_z = drone_pos[:, :, 2]                                 # (E, D)
-        drone_vel = self.drone_linear_velocities                     # (E, D, 3)
-        drone_vel_xy = drone_vel[:, :, :2]                           # (E, D, 2)
-        drone_vel_z = drone_vel[:, :, 2]                             # (E, D)
-        drone_ang_vel = self.drone_angular_velocities                # (E, D, 3)
-    
-        target_pos_xy = self._target_positions[:, :, :2]             # (E, T, 2)
-    
+
+        drone_pos    = self.drone_positions                 # (E, D, 3)
+        drone_pos_xy = drone_pos[:, :, :2]                 # (E, D, 2)
+        drone_z      = drone_pos[:, :, 2]                  # (E, D)
+        drone_vel    = self.drone_linear_velocities         # (E, D, 3)
+        drone_vel_xy = drone_vel[:, :, :2]                 # (E, D, 2)
+        drone_vel_z  = drone_vel[:, :, 2]                  # (E, D)
+        drone_ang_vel = self.drone_angular_velocities       # (E, D, 3)
+        target_pos_xy = self._target_positions[:, :, :2]   # (E, T, 2)
+
+        step_dt = self.step_dt
+        eps     = 1e-6
+
+        # 固定分配（仅用于 velocity_follow_reward，观测已包含）
         assigned_target_idx = self._assigned_target_idx
-        gather_idx_xy = assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
-        assigned_target_pos_xy = torch.gather(target_pos_xy.unsqueeze(1).expand(-1, self._num_drones, -1, -1), 2, gather_idx_xy).squeeze(2)
+        g_xy = assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
         assigned_target_vel_xy = torch.gather(
             self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
-            2,
-            gather_idx_xy,
-        ).squeeze(2)
-        assigned_target_values = self._target_values[assigned_target_idx]
+            2, g_xy,
+        ).squeeze(2)  # (E, D, 2)
 
         # =========================
-        # 1) 相对位置 / 距离
+        # 1) 距离矩阵（全对全，与 move 对齐）
         # =========================
-        rel_xy = target_pos_xy.unsqueeze(1) - drone_pos_xy.unsqueeze(2)   # (E, D, T, 2)
-        dist_xy = torch.norm(rel_xy, dim=-1)                               # (E, D, T)
-        assigned_rel_xy = assigned_target_pos_xy - drone_pos_xy
-        assigned_dist = torch.norm(assigned_rel_xy, dim=-1)
+        d_pos    = drone_pos_xy.unsqueeze(2)   # (E, D, 1, 2)
+        t_pos    = target_pos_xy.unsqueeze(1)  # (E, 1, T, 2)
+        dist_mat = torch.norm(d_pos - t_pos, dim=-1)  # (E, D, T)
+        min_dists, closest_drone_idx = dist_mat.min(dim=1)  # (E, T)
     
-        # 推荐在 cfg 里新增这些参数
-        dist_sigma = getattr(self.cfg, "distance_reward_sigma", 2.0)
-        tracking_distance_xy = self.cfg.tracking_distance_xy
-        height_sigma = getattr(self.cfg, "height_reward_sigma", 1.0)
-        smooth_sigma = getattr(self.cfg, "action_smoothness_sigma", 0.25)
-        collision_margin = getattr(self.cfg, "collision_soft_margin", 0.5)
-        boundary_soft_margin = getattr(self.cfg, "boundary_soft_margin", 1.0)
-        altitude_soft_margin = getattr(self.cfg, "altitude_soft_margin", 1.0)
-        altitude_upper_soft_threshold = getattr(self.cfg, "altitude_upper_soft_threshold", self.cfg.desired_height + 1.0)
-        high_altitude_soft_margin = getattr(self.cfg, "high_altitude_soft_margin", 1.0)
-        high_altitude_penalty_weight = getattr(self.cfg, "high_altitude_penalty_weight", 1.0)
-        height_error_penalty_weight = getattr(self.cfg, "height_error_penalty_weight", 0.0)
-        height_error_above_extra_weight = getattr(self.cfg, "height_error_above_extra_weight", 0.0)
-        height_error_quadratic_weight = getattr(self.cfg, "height_error_quadratic_weight", 0.0)
-        height_hold_deadband = getattr(self.cfg, "height_hold_deadband", 0.0)
-        vertical_direction_penalty_weight = getattr(self.cfg, "vertical_direction_penalty_weight", 0.0)
-        velocity_follow_sigma = getattr(self.cfg, "velocity_follow_sigma", 0.8)
-        velocity_follow_progress_weight = getattr(self.cfg, "velocity_follow_progress_weight", 0.3)
-        velocity_follow_overspeed_weight = getattr(self.cfg, "velocity_follow_overspeed_weight", 0.2)
-        velocity_follow_overspeed_margin = getattr(self.cfg, "velocity_follow_overspeed_margin", 0.3)
-        velocity_penalty_xy_safe = getattr(self.cfg, "velocity_penalty_xy_safe", 0.0)
-        velocity_penalty_z_safe = getattr(self.cfg, "velocity_penalty_z_safe", 0.0)
-        velocity_penalty_z_scale = getattr(self.cfg, "velocity_penalty_z_scale", 0.25)
-    
-        eps = 1e-6
-
-        # 速度误差（提前计算，供 tracking_reward 和 velocity_follow_reward 共用）
-        vel_err_xy = drone_vel_xy - assigned_target_vel_xy
-        vel_err_norm = torch.norm(vel_err_xy, dim=-1)  # (E, D)
+        # =========================
+        # 2) 距离奖励（exp-decay，全局最近分配，与 move 对齐）
+        # =========================
+        dist_sigma = self.cfg.distance_reward_sigma
+        dist_per_target = torch.exp(-(min_dists / (dist_sigma + eps)) ** 2)  # (E, T)
+        target_values = self._target_values  # (T,) broadcast to (E, T)
+        distance_reward = self.cfg.distance_reward_weight * (dist_per_target * target_values).sum(dim=-1)  # (E,)
 
         # =========================
-        # 2) 距离奖励（连续型，更宽）
-        #    新版 exp(-(d/sigma)^2)，sigma=10 在 5m 以内梯度显著
+        # 3) 捕获状态（实时可撤销，与 move 对齐）
         # =========================
-        distance_reward = self.cfg.distance_reward_weight * torch.exp(
-            - (assigned_dist / (dist_sigma + eps)) ** 2
+        is_captured_now = min_dists < self.cfg.capture_distance  # (E, T)
+        self.target_captured = is_captured_now
+        self.target_captured_by = torch.where(is_captured_now, closest_drone_idx, self.target_captured_by)
+        # 只有 ≥3 个目标被捕获时才累积 timer（暂停不重置，与 move 对齐）
+        enough_captured = is_captured_now.sum(dim=-1) >= 3  # (E,)
+        self._sustained_follow_timer = torch.where(
+            enough_captured,
+            self._sustained_follow_timer + step_dt,
+            self._sustained_follow_timer,
         )
-
-        # 2.5) 距离进度奖励（势函数 shaping）
-        #    reward = w * (prev_dist - curr_dist) / step_dt，在 total 乘以 step_dt 后
-        #    等价于：每步奖励 w * ∆dist（减少距离即得正奖励）
-        #    这提供了直接的时序梯度，驱动无人机主动缩短与目标的距离
-        # =========================
-        dist_progress_weight = getattr(self.cfg, "dist_progress_weight", 0.0)
-        dist_progress = self._prev_assigned_dist - assigned_dist   # (E, D)，正值=拉近
-        dist_progress_reward = dist_progress_weight * torch.clamp(
-            dist_progress / (self.step_dt + eps), min=-10.0, max=10.0
-        )
-        self._prev_assigned_dist = assigned_dist.detach().clone()
-        # =========================
+        self.all_targets_captured = self._sustained_follow_timer >= self.cfg.sustained_follow_duration
 
         # =========================
-        # 3) 追踪奖励（进入 + 持续保持 独立两项）
-        #
-        #    进入奖励（entry）：进入区立即获得，幅度固定，速度质量是加成
-        #    持续保持奖励（holding）：独立项，从 0 线性增长，稳定在区内 ramp_time 秒后达满值
-        #
-        #    tracking = entry_reward + holding_reward
-        #      entry   = w_entry × v × in_zone × (1 + vel_q_alpha × vel_q)
-        #      holding = w_hold  × v × in_zone × clamp(timer / ramp_time, 0, 1)
-        #
-        #    w_hold > w_entry：稳定贴近后 holding 超过 entry，成为主要激励来源
-        #    → 策略会学到"进去容易，待在里面才赚大"
+        # 4) 追踪奖励（仅在捕获区内，与 move 对齐）
         # =========================
-        tracking_zone_sharpness    = getattr(self.cfg, "tracking_zone_sharpness", 4.0)
-        tracking_vel_sigma         = getattr(self.cfg, "tracking_vel_match_sigma", 1.5)
-        tracking_vel_quality_alpha = getattr(self.cfg, "tracking_vel_quality_alpha", 0.5)
-        tracking_hold_weight       = getattr(self.cfg, "tracking_hold_weight", 3.0)
-        tracking_hold_ramp_time    = getattr(self.cfg, "tracking_hold_ramp_time", 3.0)
-
-        # 软边界区内因子：sharpness=4 → 约 0.25m 内完成 0→1 过渡
-        in_zone_factor = torch.sigmoid(
-            (tracking_distance_xy - assigned_dist) * tracking_zone_sharpness
-        )
-
-        # 速度质量：连续权重，entry 加成 + holding 乘数
-        vel_quality = torch.exp(-(vel_err_norm / (tracking_vel_sigma + eps)) ** 2)
-
-        # 进入奖励：进入区即有，速度质量好时可多赚 tracking_vel_quality_alpha 倍
-        entry_reward = self.cfg.tracking_reward_weight * assigned_target_values * in_zone_factor * (
-            1.0 + tracking_vel_quality_alpha * vel_quality
-        )
-
-        # 持续保持奖励：ramp 线性增长 + vel_quality 乘数
-        # → 只有"在圈内 + 速度匹配"才能积累最大 holding 奖励
-        holding_ramp = torch.clamp(
-            self._tracking_stable_timer / (tracking_hold_ramp_time + eps), max=1.0
-        )
-        holding_reward = (
-            tracking_hold_weight * assigned_target_values * in_zone_factor * holding_ramp * vel_quality
-        )
-
-        tracking_reward = entry_reward + holding_reward
-
-        # 更新计时器：
-        #   在圈内（dist < tracking_distance_xy）→ 以固定 step_dt 速率增长，不再由 vel_quality 节流。
-        #     vel_quality 仅作为 holding_reward 的幅度乘数，而非计时速率调节器。
-        #     早期训练中速度匹配差时，timer 仍能正常积累，策略获得清晰的"停留即有收益"信号。
-        #   离圈 → 以 decay_rate 倍速衰减（而非硬归零），防止轻微抖动蒸发全部积累。
-        #     decay_rate=3.0 意味着出圈 1/3s 后 timer 才清零，给策略一定容错余地。
-        in_zone_hard = assigned_dist < tracking_distance_xy
-        timer_decay_rate = getattr(self.cfg, "tracking_stable_timer_decay_rate", 0.0)
-        self._tracking_stable_timer = torch.where(
-            in_zone_hard,
-            self._tracking_stable_timer + self.step_dt,                                          # 固定速率增长
-            torch.clamp(self._tracking_stable_timer - self.step_dt * timer_decay_rate, min=0.0), # 软衰减
-        )
+        tracking_per_target = (
+            is_captured_now.float()
+            * torch.exp(-min_dists * self.cfg.tracking_reward_scale)
+            * target_values
+        )  # (E, T)
+        tracking_reward = self.cfg.tracking_reward_weight * tracking_per_target.sum(dim=-1)  # (E,)
 
         # =========================
-        # 3.1) 速度跟随奖励（与最近目标保持速度一致并向前推进）
+        # 5) 速度跟随奖励（per-drone → per-env 均值，与 move 对齐）
         # =========================
-        # vel_err_xy / vel_err_norm 已在上方提前计算
-        vel_match_reward = torch.exp(- (vel_err_norm / (velocity_follow_sigma + eps)) ** 2)
+        vel_err_xy = drone_vel_xy - assigned_target_vel_xy  # (E, D, 2)
+        vel_err_norm = vel_err_xy.norm(dim=-1)              # (E, D)
+        vel_sigma = self.cfg.velocity_follow_sigma
+        vel_match = torch.exp(-(vel_err_norm / (vel_sigma + eps)) ** 2)
 
-        target_speed = torch.norm(assigned_target_vel_xy, dim=-1)  # (E, D)
+        target_speed = assigned_target_vel_xy.norm(dim=-1)  # (E, D)
         target_dir = assigned_target_vel_xy / (target_speed.unsqueeze(-1) + eps)
-        progress_speed = torch.sum(drone_vel_xy * target_dir, dim=-1)
-        progress_reward = torch.clamp(progress_speed / (target_speed + eps), min=0.0, max=1.5)
+        progress_r = (drone_vel_xy * target_dir).sum(dim=-1) / (target_speed + eps)
+        progress_r = progress_r.clamp(0.0, 1.5)
 
-        drone_speed_xy = torch.norm(drone_vel_xy, dim=-1)
-        overspeed = torch.clamp(
-            drone_speed_xy - (target_speed + velocity_follow_overspeed_margin),
-            min=0.0,
-        ) / (target_speed + velocity_follow_overspeed_margin + eps)
-
-        velocity_follow_reward = self.cfg.velocity_follow_weight * (
-            vel_match_reward
-            + velocity_follow_progress_weight * progress_reward
-            - velocity_follow_overspeed_weight * overspeed
+        drone_speed_xy = drone_vel_xy.norm(dim=-1)
+        overspeed_margin = self.cfg.velocity_follow_overspeed_margin
+        overspeed = (drone_speed_xy - (target_speed + overspeed_margin)).clamp(0.0) / (
+            target_speed + overspeed_margin + eps
         )
-    
+
+        vel_follow_per_drone = self.cfg.velocity_follow_weight * (
+            vel_match
+            + self.cfg.velocity_follow_progress_weight * progress_r
+            - self.cfg.velocity_follow_overspeed_weight * overspeed
+        )  # (E, D)
+        velocity_follow_reward = vel_follow_per_drone.mean(dim=-1)  # (E,)
+
         # =========================
-        # 4) 动作平滑奖励
-        #    用平方差比 abs().mean 更敏感、更平滑
+        # 6) 动作平滑奖励（exp-decay 正奖励，与 move 对齐）
         # =========================
         current_actions = torch.stack(
             [self.actions[agent] for agent in self.cfg.possible_agents], dim=1
         )  # (E, D, A)
-    
-        prev_actions = torch.stack(
+        prev_actions_t = torch.stack(
             [self.prev_actions[agent] for agent in self.cfg.possible_agents], dim=1
         )  # (E, D, A)
-    
-        action_delta = current_actions - prev_actions
-        action_delta_sq_mean = (action_delta ** 2).mean(dim=-1)  # (E, D)
-    
-        action_smoothness = self.cfg.action_smoothness_weight * torch.exp(
-            - action_delta_sq_mean / (smooth_sigma ** 2 + eps)
-        )
-    
-        # =========================
-        # 5) 角速度惩罚
-        #    保留线性范数，足够直观
-        # =========================
-        body_rate_penalty = self.cfg.body_rate_penalty_weight * torch.norm(
-            drone_ang_vel, dim=-1
-        )
-    
-        # =========================
-        # 6) 速度惩罚
-        #    改成阈值型：只惩罚超出安全速度的部分
-        # =========================
-        vel_xy_speed = torch.norm(drone_vel_xy, dim=-1)
-        vel_z_speed = torch.abs(drone_vel_z)
-        vel_xy_penalty = torch.clamp(vel_xy_speed - velocity_penalty_xy_safe, min=0.0)
-        vel_z_penalty = torch.clamp(vel_z_speed - velocity_penalty_z_safe, min=0.0)
-
-        velocity_penalty = self.cfg.velocity_penalty_weight * (
-            vel_xy_penalty + velocity_penalty_z_scale * vel_z_penalty
-        )
-    
-        # =========================
-        # 7) 推力 / 控制 effort 惩罚
-        #    不再用 max(thrust_z)，改为动作平方均值
-        #    这通常比 max 更稳、更一致
-        # =========================
-        force_penalty = self.cfg.force_penalty_weight * (current_actions ** 2).mean(dim=-1)
-    
-        # =========================
-        # 8) 高度奖励（连续且更宽）
-        # =========================
-        height_error_raw = torch.abs(drone_z - self.cfg.desired_height)
-        height_error = torch.clamp(height_error_raw - height_hold_deadband, min=0.0)
-        above_height_error = torch.clamp(drone_z - self.cfg.desired_height, min=0.0)
-        height_reward = self.cfg.height_reward_weight * torch.exp(
-            - (height_error_raw / (height_sigma + eps)) ** 2
-        )
-        height_error_penalty = (
-            height_error_penalty_weight * height_error
-            + height_error_above_extra_weight * above_height_error
-            + height_error_quadratic_weight * (height_error ** 2)
-        )
-        # 方向性惩罚：高于目标还在上升、低于目标还在下降
-        moving_away_vz = torch.where(
-            drone_z >= self.cfg.desired_height,
-            torch.clamp(drone_vel_z, min=0.0),
-            torch.clamp(-drone_vel_z, min=0.0),
-        )
-        vertical_direction_penalty = vertical_direction_penalty_weight * moving_away_vz
-
-        # 上升速度软惩罚：仅 vz > 0 时生效；当高度已偏高时，继续上升会更明显吃亏。
-        upward_vz = torch.clamp(drone_vel_z, min=0.0)
-        upward_vz_altitude_start = float(getattr(self.cfg, "upward_vz_penalty_altitude_start", 3.0))
-        upward_vz_altitude_scale = float(getattr(self.cfg, "upward_vz_penalty_altitude_scale", 1.0))
-        upward_altitude_factor = 1.0 + torch.clamp(drone_z - upward_vz_altitude_start, min=0.0) * upward_vz_altitude_scale
-        upward_vz_penalty = getattr(self.cfg, "upward_vz_penalty_weight", 0.0) * upward_vz * upward_altitude_factor
-
-        # =========================
-        # 9) 安全软惩罚
-        #    collision / 边界 / 低高度都改成“离危险越近罚越多”
-        #    同时你原有的 terminate 条件可以继续保留在 _get_dones 中
-        # =========================
-    
-        # 9.1 机间距软惩罚
-        pos_xy = drone_pos_xy
-        diff = pos_xy.unsqueeze(2) - pos_xy.unsqueeze(1)  # (E, D, D, 2)
-        dist = torch.norm(diff, dim=-1)                   # (E, D, D)
-    
-        eye = torch.eye(self._num_drones, device=self.device, dtype=torch.bool)
-        dist.masked_fill_(eye.unsqueeze(0), float("inf"))
-        min_sep = dist.min(dim=-1).values  # (E, D)
-    
-        # 当 min_sep 小于 threshold + margin 时开始罚
-        collision_soft_threshold = self.cfg.drone_collision_threshold + collision_margin
-        collision_margin_violation = torch.clamp(
-            collision_soft_threshold - min_sep,
-            min=0.0
-        )
-        collision_penalty = collision_margin_violation / (collision_margin + eps)
-    
-        # 9.2 边界软惩罚
-        # 假设 bounding_box_threshold 是标量；如果是向量也兼容广播
-        bbox = self.cfg.bounding_box_threshold
-        abs_pos = torch.abs(drone_pos)  # (E, D, 3)
-    
-        # 距离硬边界还有多少余量
-        boundary_margin_left = bbox - abs_pos
-    
-        # 当余量小于 soft_margin 时开始罚；越靠近边界罚越多；越界后继续增大
-        boundary_violation = torch.clamp(
-            boundary_soft_margin - boundary_margin_left,
-            min=0.0
-        ) / (boundary_soft_margin + eps)
-    
-        boundary_penalty = boundary_violation.sum(dim=-1)  # (E, D)
-    
-        # 9.3 低高度软惩罚
-        altitude_margin = drone_z - self.cfg.min_altitude
-        low_altitude_penalty = torch.clamp(
-            altitude_soft_margin - altitude_margin,
-            min=0.0
-        ) / (altitude_soft_margin + eps)
-
-        # 9.4 超高软惩罚
-        high_altitude_excess = torch.clamp(drone_z - altitude_upper_soft_threshold, min=0.0)
-        high_altitude_penalty = high_altitude_penalty_weight * (
-            high_altitude_excess / (high_altitude_soft_margin + eps)
-        )
-
-        # 合并安全软惩罚
-        safety_penalty = self.cfg.safety_penalty_weight * (
-            collision_penalty + boundary_penalty + low_altitude_penalty + high_altitude_penalty
-        )
-    
-        # =========================
-        # 10) 可选：存活奖励（非常建议）
-        #    防止 reward 总体过负，也有助于稳定训练
-        # =========================
-        alive_reward_weight = getattr(self.cfg, "alive_reward_weight", 0.0)
-        alive_reward = alive_reward_weight * torch.ones_like(assigned_dist)
-
-        # =========================
-        # 10.5) success proximity reward + success terminal bonus
-        #
-        #   success_proximity_reward：同时满足所有 success 条件时的每步密集奖励。
-        #     success_mask = dist≤success_dist AND vel_err≤tolerance AND in_height_band
-        #     直接对齐 _get_dones() 中的 success_mask，无人机在"成功区"内停留即得，
-        #     与 tracking_reward（仅 dist 条件）互补，提供"速度+距离同时达标"的联合信号。
-        #
-        #   success_bonus：timer_reached_threshold（timer >= success_hold_time）的每步均发放。
-        #     _get_rewards() 在 _get_dones() 之前调用，此时 timer 已是上步 _get_dones() 更新后的值。
-        #     timer 一旦达到阈值，本步 _get_rewards() 发放奖励，随后 _get_dones() 触发 reset，
-        #     因此每幕实际最多发放一次，并非"首次触发"的瞬时信号。
-        #     让策略明确区分"成功终止"与"撞地/超时终止"，提供清晰的价值锚点。
-        # =========================
-        success_dist_threshold_rew = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
-        in_height_band_rew = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
-        # 速度条件与 _get_dones() 保持一致：只取纵向分量（沿目标前进方向）
-        _target_spd_rew = torch.norm(assigned_target_vel_xy, dim=-1, keepdim=True).clamp(min=1e-6)
-        _target_dir_rew = assigned_target_vel_xy / _target_spd_rew
-        vel_err_longitudinal_rew = torch.abs(
-            torch.sum((drone_vel_xy - assigned_target_vel_xy) * _target_dir_rew, dim=-1)
+        smooth_sigma = self.cfg.action_smoothness_sigma
+        action_delta_sq = ((current_actions - prev_actions_t) ** 2).mean(dim=-1)  # (E, D)
+        action_smoothness_per_drone = self.cfg.action_smoothness_weight * torch.exp(
+            -action_delta_sq / (smooth_sigma ** 2 + eps)
         )  # (E, D)
-        success_mask_rew = (
-            (assigned_dist <= success_dist_threshold_rew)
-            & (vel_err_longitudinal_rew <= self.cfg.success_velocity_tolerance)
-            & in_height_band_rew
-        )  # (E, D)，per-drone success 条件，与 _get_dones() enter_mask 对齐
-
-        success_proximity_weight = getattr(self.cfg, "success_proximity_weight", 0.0)
-        success_proximity_reward = (
-            success_proximity_weight * success_mask_rew.float() * assigned_target_values
-        )
-
-        success_bonus_weight = getattr(self.cfg, "success_bonus_weight", 0.0)
-        # timer_reached_threshold：timer 已达到 success_hold_time 阈值（本步奖励发放后 _get_dones() 会触发 reset）
-        # 不是"首次触发"的瞬时标志，而是"timer 当前处于成功阈值以上"的状态标志
-        timer_reached_threshold = self._sustained_follow_timer >= self.cfg.success_hold_time  # (E, D)
-        success_bonus = success_bonus_weight * timer_reached_threshold.float() * assigned_target_values
+        action_smoothness = action_smoothness_per_drone.mean(dim=-1)  # (E,)
 
         # =========================
-        # 11) 汇总
+        # 7) 角速度奖励（exp-decay 正奖励，与 move 对齐）
+        # =========================
+        body_rate_reward_per_drone = self.cfg.body_rate_penalty_weight * torch.exp(
+            -drone_ang_vel.norm(dim=-1)
+        )  # (E, D)
+        body_rate_reward = body_rate_reward_per_drone.mean(dim=-1)  # (E,)
+
+        # =========================
+        # 8) 速度奖励（exp-decay 正奖励，与 move 对齐）
+        # =========================
+        velocity_reward_per_drone = self.cfg.velocity_penalty_weight * torch.exp(
+            -drone_vel.norm(dim=-1)
+        )  # (E, D)
+        velocity_reward = velocity_reward_per_drone.mean(dim=-1)  # (E,)
+
+        # =========================
+        # 9) 推力奖励（exp-decay 正奖励，与 move 对齐）
+        # =========================
+        all_forces = torch.stack([f[..., 2] for f in self._forces], dim=1)  # (E, D, 4)
+        effort_max = (all_forces / (self.cfg.max_thrust_pp + eps)).view(self.num_envs, -1).max(dim=-1)[0]  # (E,)
+        force_reward = self.cfg.force_penalty_weight * torch.exp(-effort_max)  # (E,)
+
+        # =========================
+        # 10) 高度奖励（exp-decay 正奖励，与 move 对齐）
+        # =========================
+        height_sigma = self.cfg.height_reward_sigma
+        height_error_raw = (drone_z - self.cfg.desired_height).abs().mean(dim=-1)  # (E,)
+        height_reward = self.cfg.height_reward_weight * torch.exp(
+            -(height_error_raw / (height_sigma + eps)) ** 2
+        )  # (E,)
+
+        # =========================
+        # 11) 竖直对齐奖励（与 move 对齐）
+        # =========================
+        self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
+        z_axis = self.drone_rot_matrices[:, :, 2, 2]  # (E, D)
+        upright_penalty = self.cfg.upright_penalty_weight * (z_axis - 1.0).sum(dim=-1)  # (E,)
+
+        # =========================
+        # 12) 高空软惩罚 + 上升速度惩罚（river 特有，保留）
+        # =========================
+        alt_upper = self.cfg.altitude_upper_soft_threshold
+        alt_margin = self.cfg.high_altitude_soft_margin
+        alt_weight = self.cfg.high_altitude_penalty_weight
+        high_alt_penalty = alt_weight * (drone_z - alt_upper).clamp(0.0) / (alt_margin + eps)  # (E, D)
+
+        upward_vz = drone_vel_z.clamp(0.0)  # (E, D)
+        vz_start = self.cfg.upward_vz_penalty_altitude_start
+        vz_scale_cfg = self.cfg.upward_vz_penalty_altitude_scale
+        alt_factor = 1.0 + (drone_z - vz_start).clamp(0.0) * vz_scale_cfg
+        upward_vz_penalty = self.cfg.upward_vz_penalty_weight * upward_vz * alt_factor  # (E, D)
+
+        safety_penalty = self.cfg.safety_penalty_weight * (
+            high_alt_penalty + upward_vz_penalty
+        ).sum(dim=-1)  # (E,)
+
+        # =========================
+        # 13) 硬约束固定惩罚（不乘 step_dt，与 move 对齐）
+        # =========================
+        # 机间碰撞
+        dd = torch.cdist(drone_pos_xy, drone_pos_xy, p=2)  # (E, D, D)
+        eye_mask = torch.eye(self._num_drones, device=self.device, dtype=torch.bool).unsqueeze(0)
+        dd.masked_fill_(eye_mask, float(“inf”))
+        collision_penalty_r = (
+            -(dd < self.cfg.drone_collision_threshold).sum(dim=(1, 2)) / 2.0
+            * self.cfg.collision_penalty_scale
+        )  # (E,)
+        # 越界
+        drone_out_r = (
+            -(drone_pos.abs() > self.cfg.bounding_box_threshold).any(dim=-1).any(dim=-1).float()
+            * self.cfg.drone_out_of_bounds_penalty
+        )  # (E,)
+        # 低空
+        fly_low_r = (
+            -(drone_z < self.cfg.min_altitude).any(dim=-1).float()
+            * self.cfg.fly_low_penalty
+        )  # (E,)
+
+        # =========================
+        # 14) 汇总（共享 per-env 奖励，与 move 对齐）
         # =========================
         total_reward = (
-            alive_reward
-            + distance_reward
-            + dist_progress_reward
+            distance_reward
             + tracking_reward
             + velocity_follow_reward
-            + success_proximity_reward
-            + success_bonus
             + action_smoothness
+            + body_rate_reward
+            + velocity_reward
+            + force_reward
             + height_reward
-            - body_rate_penalty
-            - velocity_penalty
-            - force_penalty
-            - height_error_penalty
-            - vertical_direction_penalty
-            - upward_vz_penalty
+            + upright_penalty
             - safety_penalty
-        ) * self.step_dt
+        ) * step_dt + (collision_penalty_r + drone_out_r + fly_low_r)
 
-        # 临时调试：每隔 N 步打印一次奖励项 batch mean
-        self._reward_debug_counter += 1
-        if self._reward_debug_counter % self._reward_debug_print_interval == 0:
-            print(
-                "[flyfollow][reward_mean] "
-                f"total={total_reward.mean().item():.4f}, "
-                f"dist={distance_reward.mean().item():.4f}, "
-                f"progress={dist_progress_reward.mean().item():.4f}, "
-                f"track={tracking_reward.mean().item():.4f}, "
-                f"vel_follow={velocity_follow_reward.mean().item():.4f}, "
-                f"smooth={action_smoothness.mean().item():.4f}, "
-                f"high_alt_pen={high_altitude_penalty.mean().item():.4f}, "
-                f"rate_pen={body_rate_penalty.mean().item():.4f}, "
-                f"vel_pen={velocity_penalty.mean().item():.4f}, "
-                f"force_pen={force_penalty.mean().item():.4f}, "
-                f"safe_pen={safety_penalty.mean().item():.4f}, "
-                f"alive={alive_reward.mean().item():.4f}"
-            )
-    
         # =========================
-        # 12) 日志（按环境求和）
+        # 15) 日志
         # =========================
-        self._episode_sums["distance_reward"] += distance_reward.sum(dim=-1)
-        self._episode_sums["dist_progress_reward"] += dist_progress_reward.sum(dim=-1)
-        self._episode_sums["tracking_reward"] += tracking_reward.sum(dim=-1)
-        self._episode_sums["velocity_follow_reward"] += velocity_follow_reward.sum(dim=-1)
-        self._episode_sums["action_smoothness"] += action_smoothness.sum(dim=-1)
-        self._episode_sums["body_rate_penalty"] += body_rate_penalty.sum(dim=-1)
-        self._episode_sums["velocity_penalty"] += velocity_penalty.sum(dim=-1)
-        self._episode_sums["force_penalty"] += force_penalty.sum(dim=-1)
-        self._episode_sums["height_reward"] += height_reward.sum(dim=-1)
-        self._episode_sums["height_error_penalty"] += height_error_penalty.sum(dim=-1)
-        self._episode_sums["vertical_direction_penalty"] += vertical_direction_penalty.sum(dim=-1)
-        self._episode_sums["upward_vz_penalty"] += upward_vz_penalty.sum(dim=-1)
-        self._episode_sums["high_altitude_penalty"] += high_altitude_penalty.sum(dim=-1)
-        self._episode_sums["safety_penalty"] += safety_penalty.sum(dim=-1)
-        self._episode_sums["success_proximity_reward"] += success_proximity_reward.sum(dim=-1)
-        self._episode_sums["success_bonus"] += success_bonus.sum(dim=-1)
+        self._episode_sums[“distance_reward”] += distance_reward
+        self._episode_sums[“tracking_reward”] += tracking_reward
+        self._episode_sums[“velocity_follow_reward”] += velocity_follow_reward
+        self._episode_sums[“action_smoothness”] += action_smoothness
+        self._episode_sums[“body_rate_reward”] += body_rate_reward
+        self._episode_sums[“velocity_reward”] += velocity_reward
+        self._episode_sums[“force_reward”] += force_reward
+        self._episode_sums[“height_reward”] += height_reward
+        self._episode_sums[“upright_penalty”] += upright_penalty
+        self._episode_sums[“safety_penalty”] += safety_penalty
+        self._episode_sums[“collision_penalty”] += collision_penalty_r
+        self._episode_sums[“drone_out”] += drone_out_r
+        self._episode_sums[“fly_low”] += fly_low_r
 
-        if "alive_reward" in self._episode_sums:
-            self._episode_sums["alive_reward"] += alive_reward.sum(dim=-1)
-
-        rewards = {
-            agent: total_reward[:, i]
-            for i, agent in enumerate(self.cfg.possible_agents)
-        }
-        return rewards
+        return {agent: total_reward for agent in self.cfg.possible_agents}
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """判断终止条件"""
@@ -1249,144 +1040,39 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             2,
             self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
         ).squeeze(2)
-        assigned_dist_xy = torch.norm(self.drone_positions[:, :, :2] - assigned_target_pos_xy, dim=-1)
-        # ── 速度误差：纵向分量（沿目标前进方向），忽略侧向漂移 ────────────────
-        # vel_error_longitudinal = |dot(v_drone_xy - v_target_xy, target_dir)|
-        # 与 _get_rewards() 的 success_mask_rew / vel_err_longitudinal_rew 口径完全一致
-        _vel_diff_dones   = self.drone_linear_velocities[:, :, :2] - assigned_target_vel_xy  # (E, D, 2)
-        _target_spd_dones = torch.norm(assigned_target_vel_xy, dim=-1, keepdim=True).clamp(min=1e-6)
-        _target_dir_dones = assigned_target_vel_xy / _target_spd_dones                       # (E, D, 2)
-        vel_error_longitudinal = torch.abs(
-            torch.sum(_vel_diff_dones * _target_dir_dones, dim=-1)
-        )  # (E, D) — 纵向速度误差，全局统一口径
-        drone_z = self.drone_positions[:, :, 2]
+        # 成功终止：_sustained_follow_timer 由 _get_rewards() 更新，此处仅判断
+        sustained_success = self.all_targets_captured  # (E,), 已由 _get_rewards() 写入
 
-        # ── 滞回成功判定（Hysteresis + Soft Hold） ───────────────────────────
-        #
-        # 分两层：
-        #   enter_mask（硬阈值）：首次启动 timer 必须同时满足的严格条件
-        #     dist ≤ d_enter  AND  vel_long ≤ v_enter  AND  in_height_band
-        #
-        #   hold_factor（软权重，[0,1]）：已进入后 timer 的增长/衰减速率乘数
-        #     vel_factor  = exp(-(vel_long / v_hold_sigma)²)  — Gaussian，vel=0时1，vel=sigma时≈0.37
-        #     dist_factor = sigmoid((d_hold - dist) * sharpness) — sigmoid，中心满值，边界过渡
-        #     hold_factor = vel_factor × dist_factor × in_height_band
-        #
-        #   timer 更新（连续平滑）：
-        #     已进入（timer>0）：delta = (hold_factor - decay_rate×(1-hold_factor)) × dt
-        #       → hold_factor=1.0 → 满速增长
-        #       → hold_factor=decay/(1+decay)≈0.33 → 中性（不增不减）
-        #       → hold_factor=0.0 → 以 decay_rate 衰减
-        #     未进入（timer=0）：enter_mask 才以固定速率启动，否则 timer 维持 0
-        #
-        # 效果：不再是单步硬开关，轻微超出 hold 区边界时 timer 缓慢衰减而非骤停，
-        # 只有持续远离才会归零，归零后必须重新通过 enter_mask 才能再次启动。
-        in_height_band = (drone_z >= self.cfg.min_altitude) & (drone_z <= self.cfg.max_altitude)
-        success_dist_threshold = getattr(self.cfg, "success_distance_xy", self.cfg.track_distance_xy)
-        hold_dist        = getattr(self.cfg, "success_distance_xy_hold", success_dist_threshold)
-        hold_vel_sigma   = getattr(self.cfg, "success_velocity_tolerance_hold", self.cfg.success_velocity_tolerance)
-        hold_dist_sharp  = getattr(self.cfg, "success_hold_dist_sharpness", 0.5)
-        decay_rate       = getattr(self.cfg, "success_timer_decay_rate", 0.5)
+        # 无人机碰撞终止（与 move 对齐）
+        drone_pos_xy_d = self.drone_positions[:, :, :2]  # (E, D, 2)
+        dd = torch.cdist(drone_pos_xy_d, drone_pos_xy_d, p=2)  # (E, D, D)
+        eye_mask = torch.eye(self._num_drones, device=self.device, dtype=torch.bool).unsqueeze(0)
+        dd.masked_fill_(eye_mask, float("inf"))
+        drone_collision = (dd < self.cfg.drone_collision_threshold).any(dim=-1).any(dim=-1)  # (E,)
 
-        # enter_mask：硬阈值，保留严格进入门槛；速度项使用短时 EMA，降低单步抖动造成的误判。
-        enter_vel_ema_alpha = float(getattr(self.cfg, "success_enter_vel_ema_alpha", 0.8))
-        prev_smoothed_vel = self._smoothed_success_vel_error_longitudinal
-        smoothed_vel_error_longitudinal = torch.where(
-            prev_smoothed_vel < 0.0,
-            vel_error_longitudinal,
-            enter_vel_ema_alpha * prev_smoothed_vel + (1.0 - enter_vel_ema_alpha) * vel_error_longitudinal,
-        )
-        self._smoothed_success_vel_error_longitudinal = smoothed_vel_error_longitudinal
-
-        enter_mask = (
-            (assigned_dist_xy      <= success_dist_threshold)
-            & (smoothed_vel_error_longitudinal <= self.cfg.success_velocity_tolerance)
-            & in_height_band
-        )  # (E, D)
-
-        # hold_factor：连续软权重，已进入后控制 timer 增减速率
-        hold_vel_factor  = torch.exp(
-            -(vel_error_longitudinal / (hold_vel_sigma + 1e-6)) ** 2
-        )  # Gaussian：vel=0→1.0，vel=sigma→0.37，vel=2σ→0.02
-        hold_dist_factor = torch.sigmoid(
-            (hold_dist - assigned_dist_xy) * hold_dist_sharp
-        )  # sigmoid：dist远小于hold_dist→~1，超过hold_dist→快速降向0
-        hold_factor = hold_vel_factor * hold_dist_factor * in_height_band.float()  # (E, D)
-
-        already_entered = self._sustained_follow_timer > 0.0  # (E, D)
-
-        # timer 增量：连续平滑，正值增长，负值衰减
-        timer_delta = torch.where(
-            already_entered,
-            (hold_factor - decay_rate * (1.0 - hold_factor)) * self.step_dt,  # 软增减
-            enter_mask.float() * self.step_dt,                                 # 硬启动
-        )
-        self._sustained_follow_timer = (self._sustained_follow_timer + timer_delta).clamp(min=0.0)
-
-        # success_mask 仍用严格 enter 条件，与 _get_rewards() 的 success_mask_rew 对齐
-        success_mask = enter_mask
-
-        # hold_mask：用于日志，表示 hold_factor > 0.5（等效于软权重通过"中性点"）
-        hold_mask = hold_factor > (decay_rate / (1.0 + decay_rate))  # 增减平衡点
-
-        sustained_success = (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)
-
-        # 综合终止条件
-        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | sustained_success
+        # 综合终止条件（与 move 对齐）
+        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | drone_collision | sustained_success
         timed_outs = self.time_out
 
-        # 调试日志（每步）- 记录到全局 log 以及每个 agent 的 extras 中
-        fly_low_rate = falcon_fly_low.float().mean()
-        fly_high_rate = falcon_fly_high.float().mean()
-        out_of_bounds_rate = body_pos_outside.float().mean()
-        sustained_success_rate = sustained_success.float().mean()
-        time_out_rate = self.time_out.float().mean()
-        any_rate = terminations.float().mean()
-        min_height = self.drone_positions[:, :, 2].min(dim=-1).values.mean()
-        max_height = self.drone_positions[:, :, 2].max(dim=-1).values.mean()
-        # success 条件分解（所有速度指标均为纵向误差口径，与 _get_rewards() 对齐）
-        success_dist_rate  = (assigned_dist_xy <= success_dist_threshold).float().mean()
-        success_vel_rate   = (smoothed_vel_error_longitudinal <= self.cfg.success_velocity_tolerance).float().mean()
-        success_mask_rate  = enter_mask.float().mean()    # enter 严格条件同时满足比例
-        hold_mask_rate     = hold_mask.float().mean()     # hold_factor > 中性点的比例
-        hold_factor_mean   = hold_factor.mean()           # hold 软权重均值（0~1）
-        in_success_rate    = (self._sustained_follow_timer > 0.0).float().mean()  # timer>0（已进入）比例，使用本步更新后的 timer
+        # 调试日志
         self.extras["log"] = {
-            "Debug/Termination/fly_low_rate": fly_low_rate,
-            "Debug/Termination/fly_high_rate": fly_high_rate,
-            "Debug/Termination/out_of_bounds_rate": out_of_bounds_rate,
-            "Debug/Termination/sustained_success_rate": sustained_success_rate,
-            "Debug/Termination/time_out_rate": time_out_rate,
-            "Debug/Termination/any_rate": any_rate,
-            "Debug/Termination/min_height": min_height,
-            "Debug/Termination/max_height": max_height,
-            "Debug/Success/dist_rate": success_dist_rate,
-            "Debug/Success/vel_rate_longitudinal": success_vel_rate,
-            "Debug/Success/enter_mask_rate": success_mask_rate,
-            "Debug/Success/hold_factor_mean": hold_factor_mean,
-            "Debug/Success/hold_mask_rate": hold_mask_rate,
-            "Debug/Success/in_success_rate": in_success_rate,
+            "Debug/Termination/fly_low_rate": falcon_fly_low.float().mean(),
+            "Debug/Termination/fly_high_rate": falcon_fly_high.float().mean(),
+            "Debug/Termination/out_of_bounds_rate": body_pos_outside.float().mean(),
+            "Debug/Termination/collision_rate": drone_collision.float().mean(),
+            "Debug/Termination/sustained_success_rate": sustained_success.float().mean(),
+            "Debug/Termination/time_out_rate": self.time_out.float().mean(),
+            "Debug/Termination/any_rate": terminations.float().mean(),
+            "Debug/Termination/min_height": self.drone_positions[:, :, 2].min(dim=-1).values.mean(),
+            "Debug/Termination/max_height": self.drone_positions[:, :, 2].max(dim=-1).values.mean(),
+            "Debug/Success/captured_rate": self.target_captured.float().mean(),
+            "Debug/Success/timer_mean": self._sustained_follow_timer.mean(),
         }
         for agent in self.cfg.possible_agents:
             if "log" not in self.extras[agent]:
                 self.extras[agent]["log"] = {}
-            log = self.extras[agent]["log"]
-            log["Debug/Termination/fly_low_rate"] = fly_low_rate
-            log["Debug/Termination/fly_high_rate"] = fly_high_rate
-            log["Debug/Termination/out_of_bounds_rate"] = out_of_bounds_rate
-            log["Debug/Termination/sustained_success_rate"] = sustained_success_rate
-            log["Debug/Termination/time_out_rate"] = time_out_rate
-            log["Debug/Termination/any_rate"] = any_rate
-            log["Debug/Termination/min_height"] = min_height
-            log["Debug/Termination/max_height"] = max_height
-            log["Debug/Success/dist_rate"] = success_dist_rate
-            log["Debug/Success/vel_rate_longitudinal"] = success_vel_rate
-            log["Debug/Success/enter_mask_rate"] = success_mask_rate
-            log["Debug/Success/hold_factor_mean"] = hold_factor_mean
-            log["Debug/Success/hold_mask_rate"] = hold_mask_rate
-            log["Debug/Success/in_success_rate"] = in_success_rate
+            self.extras[agent]["log"].update(self.extras["log"])
 
-        # 所有智能体共享相同终止信号
         terminated = {agent: terminations for agent in self.cfg.possible_agents}
         time_outs = {agent: timed_outs for agent in self.cfg.possible_agents}
 
@@ -1448,9 +1134,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
         self._assign_targets_for_envs(env_ids)
         self._sustained_follow_timer[env_ids] = 0.0
-        self._smoothed_success_vel_error_longitudinal[env_ids] = -1.0
-        self._tracking_stable_timer[env_ids] = 0.0  # 重置近距稳定计时器
-        self._prev_assigned_dist[env_ids] = 100.0  # 重置进度奖励基准距离
+        self.target_captured[env_ids] = False
+        self.target_captured_by[env_ids] = -1
+        self.all_targets_captured[env_ids] = False
 
         # 重置观测缓冲区和动作历史
         for agent in self.cfg.possible_agents:
@@ -1483,7 +1169,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.extras["log"]["Episode_Termination/falcon_fly_high"] = fly_high_count
         self.extras["log"]["Episode_Termination/bounding_box"] = out_of_bounds_count
         success_count = torch.count_nonzero(
-            (self._sustained_follow_timer >= self.cfg.success_hold_time).any(dim=-1)[env_ids]
+            self._sustained_follow_timer[env_ids] >= self.cfg.sustained_follow_duration
         ).item()
         self.extras["log"]["Episode_Termination/sustained_success"] = success_count
         self.extras["log"]["Episode_Termination/time_out"] = time_out_count
@@ -1525,7 +1211,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self._target_positions[env_ids, :, 2] = 0.0  # z坐标为0（地面高度）
 
         # 重置目标状态
-        self._target_claimed[env_ids] = False      # 未被认领
+        self.target_captured[env_ids] = False      # 未被捕获
         self._target_assignment[env_ids] = -1      # 未分配
 
         # 将目标位置写入场景（XFormPrim可视化）

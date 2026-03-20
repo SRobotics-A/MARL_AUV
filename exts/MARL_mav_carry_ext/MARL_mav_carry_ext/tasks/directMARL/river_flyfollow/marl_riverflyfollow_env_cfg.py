@@ -160,6 +160,22 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     upward_acc_z_min_scale: float = 0.02               # 饱和高度处正向 az 最小缩放比例（几乎禁止继续上升）
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
+    # === move 对齐参数 ===
+    # 目标捕获距离（实时可撤销，与 move.capture_distance 含义一致）
+    capture_distance = 3.0
+    # 持续跟随成功门槛（≥3个目标同时被捕获持续此时长则 episode 成功终止，与 move 逻辑对齐）
+    sustained_follow_duration = 3.0
+    # 距离奖励衰减速率（move=0.5；river 场景更大故取更小值）
+    dist_reward_scale = 0.2
+    # 追踪区奖励衰减速率（仅在捕获区内有效，move 同参数）
+    tracking_reward_scale = 0.3
+    # 竖直保持奖励权重（exp-decay，与 move.upright_penalty_weight=2.0 对齐）
+    upright_penalty_weight = 2.0
+    # 安全硬惩罚（不乘 step_dt，与 move 对齐）
+    collision_penalty_scale = 1.0
+    drone_out_of_bounds_penalty = 1.0
+    fly_low_penalty = 1.0
+
     # 高度与碰撞相关
     desired_height = 2.0                                # 期望高度
     drone_collision_threshold = 1.0                     # 无人机碰撞阈值
