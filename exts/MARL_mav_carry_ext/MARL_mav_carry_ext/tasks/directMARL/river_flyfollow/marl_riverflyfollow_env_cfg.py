@@ -155,7 +155,9 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     upward_vz_penalty_weight: float = 0.30             # 上升速度惩罚基础权重：持续爬升会更明显吃亏
     upward_vz_penalty_altitude_start: float = 3.0      # 高于该高度后，上升速度惩罚开始随高度继续增强
     upward_vz_penalty_altitude_scale: float = 1.0      # 高度增强系数：每高于起点1m，惩罚系数额外增加1.0
-    upward_acc_z_scale: float = 0.2                    # ACCBR az>0 时缩放因子进一步压缩，减少向上冲高
+    upward_acc_z_alt_lo: float = 2.5                   # 正向 az 限幅起点高度（m）：低于此值 cap=1.0 不限制
+    upward_acc_z_alt_hi: float = 3.5                   # 正向 az 限幅饱和高度（m）：高于此值 cap=az_min_scale
+    upward_acc_z_min_scale: float = 0.02               # 饱和高度处正向 az 最小缩放比例（几乎禁止继续上升）
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
     # 高度与碰撞相关

@@ -502,13 +502,21 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             elif self._control_mode == "ACCBR":
                 # ACCBR模式：优先支持6维 [lin_acc(3) + body_rates(3)]
                 lin_acc = action[:, :3]
-                # 限制 az 正向分量，抑制起步上窜（geometric controller 已补重力，az>0 = 主动上升）
-                az_scale = getattr(self.cfg, "upward_acc_z_scale", 1.0)
-                if az_scale < 1.0:
-                    az = lin_acc[:, 2:3]
-                    lin_acc = torch.cat(
-                        [lin_acc[:, :2], torch.where(az > 0, az * az_scale, az)], dim=-1
-                    )
+                # 随高度收紧的正向 az 饱和限幅（geometric controller 已补重力，az>0 = 主动上升）
+                # z < az_alt_lo            ：cap = 1.0，允许正常小幅上推
+                # az_alt_lo <= z < az_alt_hi：cap 线性从 1.0 → az_min_scale，明显压缩
+                # z >= az_alt_hi           ：cap = az_min_scale，几乎禁止继续正向 az
+                drone_idx_ap  = self.cfg.possible_agents.index(drone)
+                drone_z_ap    = self.drone_positions[:, drone_idx_ap, 2:3]  # (E,1)，上步值
+                az_alt_lo     = float(getattr(self.cfg, "upward_acc_z_alt_lo",   2.5))
+                az_alt_hi     = float(getattr(self.cfg, "upward_acc_z_alt_hi",   3.5))
+                az_min_scale  = float(getattr(self.cfg, "upward_acc_z_min_scale", 0.02))
+                t_az = ((drone_z_ap - az_alt_lo) / (az_alt_hi - az_alt_lo + 1e-6)).clamp(0.0, 1.0)
+                az_cap = 1.0 - (1.0 - az_min_scale) * t_az  # (E,1)
+                az = lin_acc[:, 2:3]
+                lin_acc = torch.cat(
+                    [lin_acc[:, :2], torch.where(az > 0, az * az_cap, az)], dim=-1
+                )
                 self._setpoints[drone]["lin_acc"] = lin_acc
                 if action.shape[-1] >= 6:
                     self._setpoints[drone]["body_rates"] = action[:, 3:6]
