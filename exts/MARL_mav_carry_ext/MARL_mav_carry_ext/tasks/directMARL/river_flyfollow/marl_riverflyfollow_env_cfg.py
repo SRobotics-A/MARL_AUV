@@ -84,7 +84,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     episode_length_s = 60       # 回合长度（秒）
 
     # 观测历史配置
-    history_len = 1             # 观测历史长度（跟随任务中通常不需要历史信息）
+    history_len = 3             # 观测历史长度（参考 move：history_len=3，提供速度/加速度隐式信息）
 
     # 多智能体配置
     possible_agents = ["falcon", "falcon_01", "falcon_02"]  # 默认三架Falcon无人机
@@ -183,7 +183,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     action_spaces = {}
     observation_spaces = {}
 
-    state_space = -1  # 状态空间维度（跟随任务中不使用全局状态）
+    state_space = -1  # 占位符；__post_init__ 会根据 _get_states() 实际维度重新计算并覆盖此值
 
     # 仿真配置
     sim: SimulationCfg = SimulationCfg(
@@ -233,26 +233,43 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
         self.num_drones = len(self.possible_agents)
         # Keep this in the same order as _get_observations()
         self.obs_dim_per_step = (
-            self.num_drones                          # agent one-hot
-            + 3                                      # own position xyz（含高度 z）
-            + 9                                      # own rotation matrix
-            + 3                                      # own linear velocity xyz（含垂直速度 vz）
-            + 3                                      # own angular velocity
-            + (self.num_targets * 2)                # own relative target xy
-            + self.num_targets                      # own target distances
-            + ((self.num_drones - 1) * 2)           # relative xy to other drones
+            self.num_drones                                # agent one-hot
+            + 3                                            # own position xyz（含高度 z）
+            + 9                                            # own rotation matrix
+            + 3                                            # own linear velocity xyz（含垂直速度 vz）
+            + 3                                            # own angular velocity
+            + (self.num_targets * 2)                      # own relative target xy
+            + self.num_targets                            # own target distances
+            + ((self.num_drones - 1) * 2)                 # relative xy to other drones
             + ((self.num_drones - 1) * self.num_targets)  # other drones to target distances
-            + (self.num_targets * 2)                # target velocities xy
-            + (self.num_targets * self.num_drones)  # closest drone one-hot for each target
-            + self.num_targets                      # target values
-            + self.num_targets                      # assigned target one-hot
+            + (self.num_targets * 2)                      # target velocities xy
+            + (self.num_targets * self.num_drones)        # closest drone one-hot for each target
+            + self.num_targets                            # target values
+            + self.num_targets                            # assigned target one-hot
         )
 
         if self.control_mode == "geometric":
             action_dim = 12
         else:
-            action_dim = 5
+            # 6维 ACCBR：[ax, ay, az, p, q, r]，同 move 保持一致，开放偏航率控制
+            action_dim = 6
 
         obs_dim = self.obs_dim_per_step * self.history_len
         self.action_spaces = {agent: action_dim for agent in self.possible_agents}
         self.observation_spaces = {agent: obs_dim for agent in self.possible_agents}
+
+        # 全局状态维度（Critic 输入，用于 CTDE）：与 _get_states() 实际输出对齐
+        # drone_pos(3*D) + rot_mat(9*D) + lin_vel(3*D) + ang_vel(3*D)
+        # + target_pos(3*T) + target_vel(3*T) + target_claimed(T) + target_values(T)
+        # + assigned_target_one_hot(D*T)
+        self.state_space = (
+            self.num_drones * 3           # drone positions
+            + self.num_drones * 9         # rotation matrices
+            + self.num_drones * 3         # linear velocities
+            + self.num_drones * 3         # angular velocities
+            + self.num_targets * 3        # target positions
+            + self.num_targets * 3        # target velocities
+            + self.num_targets            # target claimed (bool)
+            + self.num_targets            # target values
+            + self.num_drones * self.num_targets  # assigned target one-hot
+        )

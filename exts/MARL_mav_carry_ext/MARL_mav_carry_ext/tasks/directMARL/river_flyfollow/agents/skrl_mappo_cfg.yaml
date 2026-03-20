@@ -2,7 +2,7 @@ seed: 42
 
 models:
   separate: True
-  CTDE: True
+  CTDE: True                  # 集中式训练、分散式执行（Critic 用全局状态）
   separate_actors: False
   separate_critics: False
   local_critics: False
@@ -12,11 +12,11 @@ models:
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: -0.2  # 初始对数标准差
+    initial_log_std: -0.2     # 初始对数标准差（同 move）
     network:
       - name: net
         input: STATES
-        layers: [256, 256, 128]  # 网络层结构：几层全连接网络
+        layers: [256, 256, 128]  # Actor 网络：处理局部观测 obs_dim_per_step*history_len
         activations: elu
     output: ACTIONS
   value:
@@ -25,7 +25,7 @@ models:
     network:
       - name: net
         input: STATES
-        layers: [256, 256, 128]
+        layers: [256, 256, 256]  # Critic 网络：处理全局状态（state_space=98），加宽最后层
         activations: elu
     output: ONE
 
@@ -36,19 +36,21 @@ memory:
 agent:
   class: MAPPO
   separate_actors: False
-  use_state_space: True
-  rollouts: 128
+  use_state_space: True       # Critic 使用全局 state（须配合 state_space 正确设置）
+  rollouts: 256               # 从 128 增至 256：更多样本/更新，river 任务比 move 复杂
   learning_epochs: 5
-  mini_batches: 4
+  mini_batches: 8             # 从 4 增至 8：配合 rollouts*2，保持 minibatch 规模
   discount_factor: 0.99
   lambda: 0.95
   learning_rate: 2.5e-4
   learning_rate_actor: 2.5e-4
   learning_rate_critic: 2.5e-4
-  learning_rate_scheduler_actor: null
-  learning_rate_scheduler_actor_kwargs: null
-  learning_rate_scheduler_critic: null
-  learning_rate_scheduler_critic_kwargs: null
+  learning_rate_scheduler_actor: KLAdaptiveLR    # 自适应学习率：KL 散度过大时自动降 LR
+  learning_rate_scheduler_actor_kwargs:
+    kl_threshold: 0.008
+  learning_rate_scheduler_critic: KLAdaptiveLR
+  learning_rate_scheduler_critic_kwargs:
+    kl_threshold: 0.008
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
   shared_state_preprocessor: RunningStandardScaler
@@ -61,7 +63,7 @@ agent:
   ratio_clip: 0.1
   value_clip: 0.1
   clip_predicted_values: True
-  entropy_loss_scale: 0.001
+  entropy_loss_scale: 0.005   # 从 0.001 提高至 0.005：river 任务探索需求更高
   value_loss_scale: 1.0
   kl_threshold: 0.0
 #  rewards_shaper_scale: 1.0
@@ -74,5 +76,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 400000
+  timesteps: 2000000          # 从 400000 增至 2000000：river_flyfollow 任务更复杂
   environment_info: log
