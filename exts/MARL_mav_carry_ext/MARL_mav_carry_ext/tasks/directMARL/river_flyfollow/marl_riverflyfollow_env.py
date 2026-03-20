@@ -20,6 +20,7 @@ import isaacsim.core.utils.prims as prim_utils
 from isaacsim.core.prims import XFormPrim
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectMARLEnv
+from isaaclab.sensors import ContactSensor
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from pxr import UsdPhysics
 from isaaclab.utils import CircularBuffer
@@ -185,6 +186,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 "collision_penalty",     # 无人机碰撞
                 "drone_out",             # 越界
                 "fly_low",               # 低飞
+                "illegal_contact",       # 接触传感器：非法碰撞（障碍物/地面）
             ]
         }
 
@@ -429,6 +431,11 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         if self.robots:
             self.scene.articulations["robot"] = self.robots[0]
 
+        # ── 5b. 创建接触传感器（单传感器覆盖全部无人机子 prim，与 move 对齐）──────
+        contact = ContactSensor(self.cfg.contact_forces)
+        self.contact_sensors = [contact]
+        self.scene.sensors["contact_forces"] = contact
+
         # ── 6. 添加环境光照 ──────────────────────────────────────────────────
         # USD 内已有 DistantLight，此处再添加 DomeLight 补充环境亮度
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -476,31 +483,19 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 self._setpoints[drone]["lin_acc"] = action[:, 6:9]
                 self._setpoints[drone]["jerk"] = action[:, 9:12]
             elif self._control_mode == "ACCBR":
-                # ACCBR模式：优先支持6维 [lin_acc(3) + body_rates(3)]
-                lin_acc = action[:, :3]
-                # 随高度收紧的正向 az 饱和限幅（geometric controller 已补重力，az>0 = 主动上升）
-                # z < az_alt_lo            ：cap = 1.0，允许正常小幅上推
-                # az_alt_lo <= z < az_alt_hi：cap 线性从 1.0 → az_min_scale，明显压缩
-                # z >= az_alt_hi           ：cap = az_min_scale，几乎禁止继续正向 az
-                drone_idx_ap  = self.cfg.possible_agents.index(drone)
-                drone_z_ap    = self.drone_positions[:, drone_idx_ap, 2:3]  # (E,1)，上步值
-                az_alt_lo     = float(getattr(self.cfg, "upward_acc_z_alt_lo",   2.5))
-                az_alt_hi     = float(getattr(self.cfg, "upward_acc_z_alt_hi",   3.5))
-                az_min_scale  = float(getattr(self.cfg, "upward_acc_z_min_scale", 0.02))
-                t_az = ((drone_z_ap - az_alt_lo) / (az_alt_hi - az_alt_lo + 1e-6)).clamp(0.0, 1.0)
-                az_cap = 1.0 - (1.0 - az_min_scale) * t_az  # (E,1)
-                az = lin_acc[:, 2:3]
-                lin_acc = torch.cat(
-                    [lin_acc[:, :2], torch.where(az > 0, az * az_cap, az)], dim=-1
-                )
-                self._setpoints[drone]["lin_acc"] = lin_acc
-                if action.shape[-1] >= 6:
-                    self._setpoints[drone]["body_rates"] = action[:, 3:6]
-                else:
-                    # 兼容5维：body_rates仅xy，z保持恒定
-                    self._setpoints[drone]["body_rates"] = torch.cat(
-                        (action[:, 3:], self._constant_yaw), dim=-1
-                    )
+                # 速度指令 + PD 控制器（与 move.ACCBR 对齐）
+                # action[:, :3] → 归一化期望速度，缩放到 ±lin_vel_max
+                # action[:, 3:6] → 归一化角速度，缩放到 ±ang_vel_max
+                drone_idx_ap = self.cfg.possible_agents.index(drone)
+                desired_vel = action[:, :3] * self.cfg.lin_vel_max
+                current_vel = self.drone_linear_velocities[:, drone_idx_ap]
+                vel_error = desired_vel - current_vel
+                d_error = (vel_error - self._drone_prev_vel_error[:, drone_idx_ap]) / self.step_dt
+                self._drone_prev_vel_error[:, drone_idx_ap] = vel_error
+                commanded_acc = self.cfg.vel_Kp * vel_error + self.cfg.vel_Kd * d_error
+                commanded_acc = torch.clamp(commanded_acc, -self.cfg.lin_acc_max, self.cfg.lin_acc_max)
+                self._setpoints[drone]["lin_acc"] = commanded_acc
+                self._setpoints[drone]["body_rates"] = action[:, 3:6] * self.cfg.ang_vel_max
 
             # 维持恒定偏航角设定
             self._setpoints[drone]["yaw"] = self._constant_yaw
@@ -960,7 +955,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 机间碰撞
         dd = torch.cdist(drone_pos_xy, drone_pos_xy, p=2)  # (E, D, D)
         eye_mask = torch.eye(self._num_drones, device=self.device, dtype=torch.bool).unsqueeze(0)
-        dd.masked_fill_(eye_mask, float(“inf”))
+        dd.masked_fill_(eye_mask, float("inf"))
         collision_penalty_r = (
             -(dd < self.cfg.drone_collision_threshold).sum(dim=(1, 2)) / 2.0
             * self.cfg.collision_penalty_scale
@@ -974,6 +969,10 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         fly_low_r = (
             -(drone_z < self.cfg.min_altitude).any(dim=-1).float()
             * self.cfg.fly_low_penalty
+        )  # (E,)
+        # 非法接触（contact sensor，与 move 对齐）
+        illegal_contact_r = (
+            -self.illegal_contact.float() * self.cfg.illegal_contact_penalty
         )  # (E,)
 
         # =========================
@@ -990,24 +989,25 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             + height_reward
             + upright_penalty
             - safety_penalty
-        ) * step_dt + (collision_penalty_r + drone_out_r + fly_low_r)
+        ) * step_dt + (collision_penalty_r + drone_out_r + fly_low_r + illegal_contact_r)
 
         # =========================
         # 15) 日志
         # =========================
-        self._episode_sums[“distance_reward”] += distance_reward
-        self._episode_sums[“tracking_reward”] += tracking_reward
-        self._episode_sums[“velocity_follow_reward”] += velocity_follow_reward
-        self._episode_sums[“action_smoothness”] += action_smoothness
-        self._episode_sums[“body_rate_reward”] += body_rate_reward
-        self._episode_sums[“velocity_reward”] += velocity_reward
-        self._episode_sums[“force_reward”] += force_reward
-        self._episode_sums[“height_reward”] += height_reward
-        self._episode_sums[“upright_penalty”] += upright_penalty
-        self._episode_sums[“safety_penalty”] += safety_penalty
-        self._episode_sums[“collision_penalty”] += collision_penalty_r
-        self._episode_sums[“drone_out”] += drone_out_r
-        self._episode_sums[“fly_low”] += fly_low_r
+        self._episode_sums["distance_reward"] += distance_reward
+        self._episode_sums["tracking_reward"] += tracking_reward
+        self._episode_sums["velocity_follow_reward"] += velocity_follow_reward
+        self._episode_sums["action_smoothness"] += action_smoothness
+        self._episode_sums["body_rate_reward"] += body_rate_reward
+        self._episode_sums["velocity_reward"] += velocity_reward
+        self._episode_sums["force_reward"] += force_reward
+        self._episode_sums["height_reward"] += height_reward
+        self._episode_sums["upright_penalty"] += upright_penalty
+        self._episode_sums["safety_penalty"] += safety_penalty
+        self._episode_sums["collision_penalty"] += collision_penalty_r
+        self._episode_sums["drone_out"] += drone_out_r
+        self._episode_sums["fly_low"] += fly_low_r
+        self._episode_sums["illegal_contact"] += illegal_contact_r
 
         return {agent: total_reward for agent in self.cfg.possible_agents}
 
@@ -1043,6 +1043,14 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 成功终止：_sustained_follow_timer 由 _get_rewards() 更新，此处仅判断
         sustained_success = self.all_targets_captured  # (E,), 已由 _get_rewards() 写入
 
+        # 非法接触终止（contact sensor，与 move 对齐）
+        self.illegal_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for cs in self.contact_sensors:
+            net_f = cs.data.net_forces_w_history
+            max_f = torch.max(torch.norm(net_f, dim=-1), dim=1)[0]
+            has_contact = (max_f > self.cfg.contact_sensor_threshold).any(dim=1)
+            self.illegal_contact = self.illegal_contact | has_contact
+
         # 无人机碰撞终止（与 move 对齐）
         drone_pos_xy_d = self.drone_positions[:, :, :2]  # (E, D, 2)
         dd = torch.cdist(drone_pos_xy_d, drone_pos_xy_d, p=2)  # (E, D, D)
@@ -1051,7 +1059,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         drone_collision = (dd < self.cfg.drone_collision_threshold).any(dim=-1).any(dim=-1)  # (E,)
 
         # 综合终止条件（与 move 对齐）
-        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | drone_collision | sustained_success
+        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | drone_collision | self.illegal_contact | sustained_success
         timed_outs = self.time_out
 
         # 调试日志
@@ -1060,6 +1068,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             "Debug/Termination/fly_high_rate": falcon_fly_high.float().mean(),
             "Debug/Termination/out_of_bounds_rate": body_pos_outside.float().mean(),
             "Debug/Termination/collision_rate": drone_collision.float().mean(),
+            "Debug/Termination/illegal_contact_rate": self.illegal_contact.float().mean(),
             "Debug/Termination/sustained_success_rate": sustained_success.float().mean(),
             "Debug/Termination/time_out_rate": self.time_out.float().mean(),
             "Debug/Termination/any_rate": terminations.float().mean(),
@@ -1137,6 +1146,8 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.target_captured[env_ids] = False
         self.target_captured_by[env_ids] = -1
         self.all_targets_captured[env_ids] = False
+        self.illegal_contact[env_ids] = False
+        self._drone_prev_vel_error[env_ids] = 0.0
 
         # 重置观测缓冲区和动作历史
         for agent in self.cfg.possible_agents:

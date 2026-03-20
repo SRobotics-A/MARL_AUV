@@ -175,6 +175,15 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     collision_penalty_scale = 1.0
     drone_out_of_bounds_penalty = 1.0
     fly_low_penalty = 1.0
+    illegal_contact_penalty = 1.0
+    contact_sensor_threshold = 1.0  # N，低于此值忽略（与 move 一致）
+
+    # ACCBR 速度指令 + PD 控制参数（与 move.ACCBR 对齐）
+    lin_vel_max: float = 3.0    # 速度指令最大值（m/s），action[:, :3] 缩放到 ±lin_vel_max
+    ang_vel_max: float = 3.0    # 角速度指令最大值（rad/s）
+    lin_acc_max: float = 5.0    # 加速度饱和限幅（m/s²）
+    vel_Kp: float = 3.0         # 速度 PD 比例增益
+    vel_Kd: float = 0.5         # 速度 PD 微分增益
 
     # 高度与碰撞相关
     desired_height = 2.0                                # 期望高度
