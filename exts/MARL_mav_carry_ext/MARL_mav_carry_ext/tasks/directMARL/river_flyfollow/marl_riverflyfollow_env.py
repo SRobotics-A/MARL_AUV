@@ -810,29 +810,30 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         ).squeeze(2)  # (E, D, 2)
 
         # =========================
-        # 1) 距离矩阵 + 无人机中心分配
-        #    每架无人机只与其 _assigned_target_idx 对应的高价值目标计算奖励
+        # 1) 距离矩阵（全对全）
         # =========================
         d_pos    = drone_pos_xy.unsqueeze(2)   # (E, D, 1, 2)
         t_pos    = target_pos_xy.unsqueeze(1)  # (E, 1, T, 2)
         dist_mat = torch.norm(d_pos - t_pos, dim=-1)  # (E, D, T)
 
-        g = self._assigned_target_idx                            # (E, D)  drone→target 索引
-        assigned_dist   = dist_mat.gather(2, g.unsqueeze(-1)).squeeze(-1)   # (E, D) 各无人机到分配目标的距离
-        assigned_values = self._target_values[g]                 # (E, D) 各无人机分配目标的价值
+        # 每个目标到最近无人机的距离（target-centric，与 move 完全对齐）
+        target_min_dist = dist_mat.min(dim=1)[0]  # (E, T)
+
+        # 无人机到各自分配目标的距离（仅用于 velocity_follow）
+        g = self._assigned_target_idx
+        assigned_dist = dist_mat.gather(2, g.unsqueeze(-1)).squeeze(-1)  # (E, D)
 
         # =========================
-        # 2) 距离奖励（无人机中心，每架无人机只算分配目标）
+        # 2) 距离奖励（target-centric，与 move 对齐）
         # =========================
         dist_sigma = self.cfg.distance_reward_sigma
-        dist_per_drone = torch.exp(-(assigned_dist / (dist_sigma + eps)) ** 2)  # (E, D)
-        distance_reward = self.cfg.distance_reward_weight * (dist_per_drone * assigned_values).sum(dim=-1)  # (E,)
+        dist_per_target = torch.exp(-(target_min_dist / (dist_sigma + eps)) ** 2)  # (E, T)
+        distance_reward = self.cfg.distance_reward_weight * (dist_per_target * self._target_values).sum(dim=-1)  # (E,)
 
         # =========================
         # 3) 捕获状态（target-centric，与 move 对齐）
         #    每个目标：到最近无人机的距离 < capture_distance 即被跟随
         # =========================
-        target_min_dist = dist_mat.min(dim=1)[0]  # (E, T) 每个目标到最近无人机的距离
         target_followed = target_min_dist < self.cfg.capture_distance  # (E, T)
         self.target_captured = target_followed
         self.target_captured_by = torch.where(
