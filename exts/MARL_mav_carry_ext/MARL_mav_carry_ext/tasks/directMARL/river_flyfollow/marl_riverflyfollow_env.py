@@ -801,14 +801,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         step_dt = self.step_dt
         eps     = 1e-6
 
-        # 固定分配（仅用于 velocity_follow_reward，观测已包含）
-        assigned_target_idx = self._assigned_target_idx
-        g_xy = assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
-        assigned_target_vel_xy = torch.gather(
-            self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
-            2, g_xy,
-        ).squeeze(2)  # (E, D, 2)
-
         # =========================
         # 1) 距离矩阵（全对全）
         # =========================
@@ -816,12 +808,16 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         t_pos    = target_pos_xy.unsqueeze(1)  # (E, 1, T, 2)
         dist_mat = torch.norm(d_pos - t_pos, dim=-1)  # (E, D, T)
 
-        # 每个目标到最近无人机的距离（target-centric，与 move 完全对齐）
+        # 每个目标到最近无人机的距离（target-centric）
         target_min_dist = dist_mat.min(dim=1)[0]  # (E, T)
 
-        # 无人机到各自分配目标的距离（仅用于 velocity_follow）
-        g = self._assigned_target_idx
-        assigned_dist = dist_mat.gather(2, g.unsqueeze(-1)).squeeze(-1)  # (E, D)
+        # 每架无人机当前最近目标的速度（target-centric velocity follow，不依赖固定分配）
+        closest_target_per_drone = dist_mat.argmin(dim=2)  # (E, D)
+        g_vel = closest_target_per_drone.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
+        closest_target_vel_xy = torch.gather(
+            self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
+            2, g_vel,
+        ).squeeze(2)  # (E, D, 2)
 
         # =========================
         # 2) 距离奖励（target-centric，与 move 对齐）
@@ -860,15 +856,15 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         tracking_reward = self.cfg.tracking_reward_weight * tracking_per_target.sum(dim=-1)  # (E,)
 
         # =========================
-        # 5) 速度跟随奖励（per-drone → per-env 均值，与 move 对齐）
+        # 5) 速度跟随奖励（每架无人机跟随当前最近目标速度，target-centric，river 特有）
         # =========================
-        vel_err_xy = drone_vel_xy - assigned_target_vel_xy  # (E, D, 2)
+        vel_err_xy = drone_vel_xy - closest_target_vel_xy  # (E, D, 2)
         vel_err_norm = vel_err_xy.norm(dim=-1)              # (E, D)
         vel_sigma = self.cfg.velocity_follow_sigma
         vel_match = torch.exp(-(vel_err_norm / (vel_sigma + eps)) ** 2)
 
-        target_speed = assigned_target_vel_xy.norm(dim=-1)  # (E, D)
-        target_dir = assigned_target_vel_xy / (target_speed.unsqueeze(-1) + eps)
+        target_speed = closest_target_vel_xy.norm(dim=-1)  # (E, D)
+        target_dir = closest_target_vel_xy / (target_speed.unsqueeze(-1) + eps)
         progress_r = (drone_vel_xy * target_dir).sum(dim=-1) / (target_speed + eps)
         progress_r = progress_r.clamp(0.0, 1.5)
 
