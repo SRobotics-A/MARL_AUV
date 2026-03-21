@@ -811,10 +811,12 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 每个目标到最近无人机的距离（target-centric）
         target_min_dist = dist_mat.min(dim=1)[0]  # (E, T)
 
-        # 每架无人机当前最近目标的速度（target-centric velocity follow，不依赖固定分配）
-        closest_target_per_drone = dist_mat.argmin(dim=2)  # (E, D)
-        g_vel = closest_target_per_drone.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
-        closest_target_vel_xy = torch.gather(
+        # 每架无人机"应盯"目标的速度：按 value/(dist+ε) 选收益最大目标
+        # 自然选出高价值且距离近的目标，低价值目标即使最近也会被排开
+        benefit = self._target_values / (dist_mat + eps)   # (E, D, T): value/dist
+        best_target_per_drone = benefit.argmax(dim=2)      # (E, D)
+        g_vel = best_target_per_drone.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
+        best_target_vel_xy = torch.gather(
             self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
             2, g_vel,
         ).squeeze(2)  # (E, D, 2)
@@ -858,13 +860,13 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # =========================
         # 5) 速度跟随奖励（每架无人机跟随当前最近目标速度，target-centric，river 特有）
         # =========================
-        vel_err_xy = drone_vel_xy - closest_target_vel_xy  # (E, D, 2)
-        vel_err_norm = vel_err_xy.norm(dim=-1)              # (E, D)
+        vel_err_xy = drone_vel_xy - best_target_vel_xy  # (E, D, 2)
+        vel_err_norm = vel_err_xy.norm(dim=-1)           # (E, D)
         vel_sigma = self.cfg.velocity_follow_sigma
         vel_match = torch.exp(-(vel_err_norm / (vel_sigma + eps)) ** 2)
 
-        target_speed = closest_target_vel_xy.norm(dim=-1)  # (E, D)
-        target_dir = closest_target_vel_xy / (target_speed.unsqueeze(-1) + eps)
+        target_speed = best_target_vel_xy.norm(dim=-1)  # (E, D)
+        target_dir = best_target_vel_xy / (target_speed.unsqueeze(-1) + eps)
         progress_r = (drone_vel_xy * target_dir).sum(dim=-1) / (target_speed + eps)
         progress_r = progress_r.clamp(0.0, 1.5)
 
