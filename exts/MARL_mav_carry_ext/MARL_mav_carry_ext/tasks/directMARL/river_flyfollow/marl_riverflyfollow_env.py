@@ -242,44 +242,44 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
     def _assign_targets_for_envs(self, env_ids: torch.Tensor) -> None:
         """为指定环境固定每架无人机的目标，保持一个 episode 内不变。
 
-        采用贪心最近距离匹配：每轮找当前最近的（无人机, 目标）对完成配对，
-        直到无人机或目标耗尽。目标数多于无人机数时，多余目标不分配。
+        分配策略（价值优先贪心）：
+        1. 按目标价值降序取前 num_drones 个高价值目标作为候选（低价值目标自动排除）
+        2. 在候选目标内做贪心最近距离匹配：每轮选距离最近的（无人机, 候选目标）对完成配对
+        效果：3架无人机自动追踪价值最高的3个目标，最低价值目标不参与分配。
         结果写入 _assigned_target_idx[env_id, drone_idx] = target_idx。
         """
         if env_ids.numel() == 0:
             return
 
-        # 取当前帧无人机和目标的 XY 坐标，形状 (len(env_ids), num_drones/targets, 2)
+        # 按价值降序取前 num_drones 个目标索引（固定，全批次共用）
+        priority_targets = torch.argsort(self._target_values, descending=True)[: self._num_drones].tolist()
+
         drone_pos_xy = self.drone_positions[env_ids, :, :2]
         target_pos_xy = self._target_positions[env_ids, :, :2]
 
-        # 初始化：所有无人机默认指向 target 0，所有目标标记为未分配（-1）
-        self._assigned_target_idx[env_ids] = 0
+        self._assigned_target_idx[env_ids] = priority_targets[0]  # 默认指向最高价值目标
         self._target_assignment[env_ids] = -1
 
         for local_env_idx, env_id in enumerate(env_ids.tolist()):
-            # dist[drone_idx, target_idx]：该环境内每对（无人机, 目标）的 XY 欧氏距离
-            # unsqueeze 分别扩维以广播：drone (D,1,2)，target (1,T,2) → (D,T,2) → norm → (D,T)
             dist = torch.norm(
                 target_pos_xy[local_env_idx].unsqueeze(0) - drone_pos_xy[local_env_idx].unsqueeze(1),
                 dim=-1,
-            )
-            free_drones = set(range(self._num_drones))    # 尚未配对的无人机索引集合
-            free_targets = set(range(self._num_targets))  # 尚未配对的目标索引集合
+            )  # (D, T)
+            free_drones = set(range(self._num_drones))
+            free_targets = set(priority_targets)  # 只在高价值候选目标中匹配
 
-            # 贪心匹配：每轮在所有剩余（无人机, 目标）对中选最近的完成配对
+            # 贪心最近距离匹配（在高价值候选集内）
             while free_drones and free_targets:
                 best_pair = None
                 best_dist = None
                 for drone_idx in free_drones:
                     for target_idx in free_targets:
-                        value = float(dist[drone_idx, target_idx].item())
-                        if best_dist is None or value < best_dist:
-                            best_dist = value
+                        d = float(dist[drone_idx, target_idx].item())
+                        if best_dist is None or d < best_dist:
+                            best_dist = d
                             best_pair = (drone_idx, target_idx)
 
                 drone_idx, target_idx = best_pair
-                # 写入双向映射：无人机→目标，目标→无人机
                 self._assigned_target_idx[env_id, drone_idx] = target_idx
                 self._target_assignment[env_id, target_idx] = drone_idx
                 free_drones.remove(drone_idx)
@@ -810,45 +810,58 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         ).squeeze(2)  # (E, D, 2)
 
         # =========================
-        # 1) 距离矩阵（全对全，与 move 对齐）
+        # 1) 距离矩阵 + 无人机中心分配
+        #    每架无人机只与其 _assigned_target_idx 对应的高价值目标计算奖励
         # =========================
         d_pos    = drone_pos_xy.unsqueeze(2)   # (E, D, 1, 2)
         t_pos    = target_pos_xy.unsqueeze(1)  # (E, 1, T, 2)
         dist_mat = torch.norm(d_pos - t_pos, dim=-1)  # (E, D, T)
-        min_dists, closest_drone_idx = dist_mat.min(dim=1)  # (E, T)
-    
-        # =========================
-        # 2) 距离奖励（exp-decay，全局最近分配，与 move 对齐）
-        # =========================
-        dist_sigma = self.cfg.distance_reward_sigma
-        dist_per_target = torch.exp(-(min_dists / (dist_sigma + eps)) ** 2)  # (E, T)
-        target_values = self._target_values  # (T,) broadcast to (E, T)
-        distance_reward = self.cfg.distance_reward_weight * (dist_per_target * target_values).sum(dim=-1)  # (E,)
+
+        g = self._assigned_target_idx                            # (E, D)  drone→target 索引
+        assigned_dist   = dist_mat.gather(2, g.unsqueeze(-1)).squeeze(-1)   # (E, D) 各无人机到分配目标的距离
+        assigned_values = self._target_values[g]                 # (E, D) 各无人机分配目标的价值
 
         # =========================
-        # 3) 捕获状态（实时可撤销，与 move 对齐）
+        # 2) 距离奖励（无人机中心，每架无人机只算分配目标）
         # =========================
-        is_captured_now = min_dists < self.cfg.capture_distance  # (E, T)
-        self.target_captured = is_captured_now
-        self.target_captured_by = torch.where(is_captured_now, closest_drone_idx, self.target_captured_by)
-        # 只有 ≥3 个目标被捕获时才累积 timer（暂停不重置，与 move 对齐）
-        enough_captured = is_captured_now.sum(dim=-1) >= 3  # (E,)
+        dist_sigma = self.cfg.distance_reward_sigma
+        dist_per_drone = torch.exp(-(assigned_dist / (dist_sigma + eps)) ** 2)  # (E, D)
+        distance_reward = self.cfg.distance_reward_weight * (dist_per_drone * assigned_values).sum(dim=-1)  # (E,)
+
+        # =========================
+        # 3) 捕获状态（无人机中心，每架无人机进入自己分配目标的 capture_distance 即为捕获）
+        # =========================
+        is_drone_captured = assigned_dist < self.cfg.capture_distance  # (E, D) 每架无人机是否捕获了其目标
+
+        # 推导 per-target capture 状态（供 _get_states 和 debug 使用）
+        # target_captured[e, t] = True 当且仅当分配到 t 的无人机进入了捕获区
+        self.target_captured = torch.zeros(
+            self.num_envs, self._num_targets, dtype=torch.bool, device=self.device
+        )
+        has_drone = self._target_assignment >= 0                # (E, T) 该目标是否有分配的无人机
+        drone_for_target = self._target_assignment.clamp(min=0) # (E, T) safe index（-1→0，但 has_drone 遮掩）
+        captured_by_assigned = is_drone_captured.gather(1, drone_for_target)  # (E, T)
+        self.target_captured = has_drone & captured_by_assigned
+        self.target_captured_by = torch.where(has_drone, drone_for_target, torch.full_like(drone_for_target, -1))
+
+        # 全部3架无人机都捕获各自目标时累积 timer（与 move 对齐：暂停而非归零）
+        all_captured = is_drone_captured.all(dim=-1)  # (E,)
         self._sustained_follow_timer = torch.where(
-            enough_captured,
+            all_captured,
             self._sustained_follow_timer + step_dt,
             self._sustained_follow_timer,
         )
         self.all_targets_captured = self._sustained_follow_timer >= self.cfg.sustained_follow_duration
 
         # =========================
-        # 4) 追踪奖励（仅在捕获区内，与 move 对齐）
+        # 4) 追踪奖励（无人机中心，仅在各自捕获区内）
         # =========================
-        tracking_per_target = (
-            is_captured_now.float()
-            * torch.exp(-min_dists * self.cfg.tracking_reward_scale)
-            * target_values
-        )  # (E, T)
-        tracking_reward = self.cfg.tracking_reward_weight * tracking_per_target.sum(dim=-1)  # (E,)
+        tracking_per_drone = (
+            is_drone_captured.float()
+            * torch.exp(-assigned_dist * self.cfg.tracking_reward_scale)
+            * assigned_values
+        )  # (E, D)
+        tracking_reward = self.cfg.tracking_reward_weight * tracking_per_drone.sum(dim=-1)  # (E,)
 
         # =========================
         # 5) 速度跟随奖励（per-drone → per-env 均值，与 move 对齐）

@@ -92,7 +92,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     # 目标小车参数配置
     num_targets = 4                                     # 目标小车数量
-    target_values: Sequence[float] = (4.0, 3.0, 2.0, 1.0)  # 各目标的价值（红黄绿蓝）
+    target_values: Sequence[float] = (0.1, 0.2, 0.3, 0.4)  # 各目标价值（升序：小车0最低，小车3最高）
     target_start_x = 0                                  # 目标起始x坐标
     target_end_x = 50.0                                 # 目标结束x坐标
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
