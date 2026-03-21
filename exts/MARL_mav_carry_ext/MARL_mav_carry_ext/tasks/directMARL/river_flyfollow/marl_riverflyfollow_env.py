@@ -829,39 +829,34 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         distance_reward = self.cfg.distance_reward_weight * (dist_per_drone * assigned_values).sum(dim=-1)  # (E,)
 
         # =========================
-        # 3) 捕获状态（无人机中心，每架无人机进入自己分配目标的 capture_distance 即为捕获）
+        # 3) 捕获状态（target-centric，与 move 对齐）
+        #    每个目标：到最近无人机的距离 < capture_distance 即被跟随
         # =========================
-        is_drone_captured = assigned_dist < self.cfg.capture_distance  # (E, D) 每架无人机是否捕获了其目标
+        target_min_dist = dist_mat.min(dim=1)[0]  # (E, T) 每个目标到最近无人机的距离
+        target_followed = target_min_dist < self.cfg.capture_distance  # (E, T)
+        self.target_captured = target_followed
+        self.target_captured_by = torch.where(
+            target_followed, dist_mat.min(dim=1)[1], self.target_captured_by
+        )  # (E, T) 最近无人机索引
 
-        # 推导 per-target capture 状态（供 _get_states 和 debug 使用）
-        # target_captured[e, t] = True 当且仅当分配到 t 的无人机进入了捕获区
-        self.target_captured = torch.zeros(
-            self.num_envs, self._num_targets, dtype=torch.bool, device=self.device
-        )
-        has_drone = self._target_assignment >= 0                # (E, T) 该目标是否有分配的无人机
-        drone_for_target = self._target_assignment.clamp(min=0) # (E, T) safe index（-1→0，但 has_drone 遮掩）
-        captured_by_assigned = is_drone_captured.gather(1, drone_for_target)  # (E, T)
-        self.target_captured = has_drone & captured_by_assigned
-        self.target_captured_by = torch.where(has_drone, drone_for_target, torch.full_like(drone_for_target, -1))
-
-        # 全部3架无人机都捕获各自目标时累积 timer（与 move 对齐：暂停而非归零）
-        all_captured = is_drone_captured.all(dim=-1)  # (E,)
+        # 跟随计时：≥3 个目标同时被跟随时 timer 累积，否则暂停（与 move 对齐）
+        enough_followed = target_followed.sum(dim=-1) >= 3  # (E,)
         self._sustained_follow_timer = torch.where(
-            all_captured,
+            enough_followed,
             self._sustained_follow_timer + step_dt,
             self._sustained_follow_timer,
         )
         self.all_targets_captured = self._sustained_follow_timer >= self.cfg.sustained_follow_duration
 
         # =========================
-        # 4) 追踪奖励（无人机中心，仅在各自捕获区内）
+        # 4) 追踪奖励（target-centric，仅在跟随区内，与 move 对齐）
         # =========================
-        tracking_per_drone = (
-            is_drone_captured.float()
-            * torch.exp(-assigned_dist * self.cfg.tracking_reward_scale)
-            * assigned_values
-        )  # (E, D)
-        tracking_reward = self.cfg.tracking_reward_weight * tracking_per_drone.sum(dim=-1)  # (E,)
+        tracking_per_target = (
+            target_followed.float()
+            * torch.exp(-target_min_dist * self.cfg.tracking_reward_scale)
+            * self._target_values
+        )  # (E, T)
+        tracking_reward = self.cfg.tracking_reward_weight * tracking_per_target.sum(dim=-1)  # (E,)
 
         # =========================
         # 5) 速度跟随奖励（per-drone → per-env 均值，与 move 对齐）
@@ -1057,9 +1052,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             2,
             self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
         ).squeeze(2)
-        # 成功终止：_sustained_follow_timer 由 _get_rewards() 更新，此处仅判断
-        sustained_success = self.all_targets_captured  # (E,), 已由 _get_rewards() 写入
-
         # 非法接触终止（contact sensor，与 move 对齐）
         self.illegal_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         for cs in self.contact_sensors:
@@ -1075,8 +1067,8 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         dd.masked_fill_(eye_mask, float("inf"))
         drone_collision = (dd < self.cfg.drone_collision_threshold).any(dim=-1).any(dim=-1)  # (E,)
 
-        # 综合终止条件（与 move 对齐）
-        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | drone_collision | self.illegal_contact | sustained_success
+        # 综合终止条件（与 move 对齐，成功不终止 episode）
+        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | drone_collision | self.illegal_contact
         timed_outs = self.time_out
 
         # 调试日志
@@ -1086,12 +1078,12 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             "Debug/Termination/out_of_bounds_rate": body_pos_outside.float().mean(),
             "Debug/Termination/collision_rate": drone_collision.float().mean(),
             "Debug/Termination/illegal_contact_rate": self.illegal_contact.float().mean(),
-            "Debug/Termination/sustained_success_rate": sustained_success.float().mean(),
             "Debug/Termination/time_out_rate": self.time_out.float().mean(),
             "Debug/Termination/any_rate": terminations.float().mean(),
             "Debug/Termination/min_height": self.drone_positions[:, :, 2].min(dim=-1).values.mean(),
             "Debug/Termination/max_height": self.drone_positions[:, :, 2].max(dim=-1).values.mean(),
-            "Debug/Success/captured_rate": self.target_captured.float().mean(),
+            "Debug/Success/targets_followed_rate": self.target_captured.float().mean(),
+            "Debug/Success/all_targets_captured_rate": self.all_targets_captured.float().mean(),
             "Debug/Success/timer_mean": self._sustained_follow_timer.mean(),
         }
         for agent in self.cfg.possible_agents:
@@ -1196,9 +1188,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.extras["log"]["Episode_Termination/falcon_fly_low"] = fly_low_count
         self.extras["log"]["Episode_Termination/falcon_fly_high"] = fly_high_count
         self.extras["log"]["Episode_Termination/bounding_box"] = out_of_bounds_count
-        success_count = torch.count_nonzero(
-            self._sustained_follow_timer[env_ids] >= self.cfg.sustained_follow_duration
-        ).item()
+        success_count = torch.count_nonzero(self.all_targets_captured[env_ids]).item()
         self.extras["log"]["Episode_Termination/sustained_success"] = success_count
         self.extras["log"]["Episode_Termination/time_out"] = time_out_count
         for agent in self.cfg.possible_agents:
