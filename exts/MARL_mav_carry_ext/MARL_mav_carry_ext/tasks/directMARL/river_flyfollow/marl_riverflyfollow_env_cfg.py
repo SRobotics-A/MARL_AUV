@@ -119,7 +119,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     altitude_soft_margin = 1.0                         # 低高度软惩罚区间：z < min_altitude+1.0=2.0m 时开始罚
     altitude_upper_soft_threshold = 4.0                # 高度软上限前移：z > 4.0m 就开始持续受罚
     high_altitude_soft_margin = 1.0                    # 超高软惩罚归一化区间（4.0~5.0m 迅速拉高代价）
-    high_altitude_penalty_weight = 1.2                 # 超高软惩罚权重加强，避免高空平台成为便宜解
+    high_altitude_penalty_weight = 1.6                 # 超高软惩罚权重加强，避免高空平台成为便宜解
     alive_reward_weight = 0.05
 
     # 奖励塑形参数
@@ -152,7 +152,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     height_error_quadratic_weight = 0.0                 # 关闭高度二次惩罚
     height_hold_deadband = 0.10                         # 保留参数（已不生效）
     vertical_direction_penalty_weight = 0.0             # 关闭方向性垂直速度惩罚（不需要定高）
-    upward_vz_penalty_weight: float = 0.30             # 上升速度惩罚基础权重：持续爬升会更明显吃亏
+    upward_vz_penalty_weight: float = 0.45             # 上升速度惩罚基础权重：持续爬升会更明显吃亏
     upward_vz_penalty_altitude_start: float = 3.0      # 高于该高度后，上升速度惩罚开始随高度继续增强
     upward_vz_penalty_altitude_scale: float = 1.0      # 高度增强系数：每高于起点1m，惩罚系数额外增加1.0
     upward_acc_z_alt_lo: float = 2.5                   # 正向 az 限幅起点高度（m）：低于此值 cap=1.0 不限制
@@ -162,9 +162,9 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
 
     # === move 对齐参数 ===
     # 目标捕获距离（实时可撤销，与 move.capture_distance 含义一致）
-    capture_distance = 3.0
+    capture_distance = 3.5
     # 持续跟随成功门槛（≥3个目标同时被捕获持续此时长则 episode 成功终止，与 move 逻辑对齐）
-    sustained_follow_duration = 3.0
+    sustained_follow_duration = 2.0
     # 距离奖励衰减速率（move=0.5；river 场景更大故取更小值）
     dist_reward_scale = 0.2
     # 追踪区奖励衰减速率（仅在捕获区内有效，move 同参数）
