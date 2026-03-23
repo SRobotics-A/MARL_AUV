@@ -123,22 +123,18 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     illegal_contact_penalty = 1.0      # 非法接触惩罚
     fly_low_penalty = 1.0              # 飞低惩罚
 
-    # ===== 动作/观测空间（与 river_flyfollow 一致，动态构建）=====
-    # 注意：action_spaces/observation_spaces 的 key 需与 possible_agents 一致
-    # 实际在 __post_init__ 中由 river_flyfollow 的动态构建方式处理，此处仅设全局维度
+    # ===== 动作/观测空间维度（在 __post_init__ 中动态填充到 action_spaces/observation_spaces）=====
     # ACCBR 模式：vel_cmd(3) + body_rates(3) = 6维动作
     # geometric 模式：pos(3)+vel(3)+acc(3)+jerk(3) = 12维动作
-    action_dim = 6        # ACCBR 模式动作维度
+    action_dim = 6
     # 单步观测 49 维：pos(3)+vel(3)+rot_mat(9)+other_drones(6)+targets(20)+dist(4)+closest(4)
     obs_dim_per_step = 49
     # 全局 state 86 维：pos(9)+rot(27)+vel(9)+ang_vel(9)+t_pos(12)+t_vel(12)+captured(4)+values(4)
     state_space = 86
 
-    action_spaces = {agent: action_dim for agent in possible_agents}
-    observation_spaces = {
-        agent: (obs_dim_per_step * history_len if partial_obs else obs_dim_per_step)
-        for agent in possible_agents
-    }
+    # 占位，__post_init__ 中按 possible_agents 动态填充
+    action_spaces: dict = {}
+    observation_spaces: dict = {}
 
     # ===== 仿真配置 =====
     # dt = 1/300 ≈ 3.33ms（物理步长）；decimation=3 → 高级控制步长 = 10ms（100Hz）
@@ -193,3 +189,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=1, env_spacing=25.0, replicate_physics=True
     )
+
+    def __post_init__(self):
+        """根据 possible_agents 动态填充动作/观测空间字典。"""
+        super().__post_init__()
+        obs_dim = self.obs_dim_per_step * self.history_len if self.partial_obs else self.obs_dim_per_step
+        self.action_spaces = {agent: self.action_dim for agent in self.possible_agents}
+        self.observation_spaces = {agent: obs_dim for agent in self.possible_agents}
