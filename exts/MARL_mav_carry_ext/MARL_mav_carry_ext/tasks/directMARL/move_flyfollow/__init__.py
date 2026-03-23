@@ -14,7 +14,7 @@ from . import agents
 
 gym.register(
     id="Isaac-move-flyfollow-marl-v0",
-    entry_point=f"{__name__}.marl_move_env:MARLMoveEnv",
+    entry_point=f"{__name__}.marl_move_flyfollow_env:MARLMoveEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.marl_move_env_cfg:MARLMoveEnvCfg",
