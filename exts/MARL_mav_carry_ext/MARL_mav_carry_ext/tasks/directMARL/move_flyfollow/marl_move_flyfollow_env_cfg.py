@@ -126,16 +126,13 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # ===== 动作/观测空间（与 river_flyfollow 一致，动态构建）=====
     # 注意：action_spaces/observation_spaces 的 key 需与 possible_agents 一致
     # 实际在 __post_init__ 中由 river_flyfollow 的动态构建方式处理，此处仅设全局维度
-    if control_mode == "geometric":
-        action_dim = 12  # pos(3) + vel(3) + acc(3) + jerk(3)
-        obs_dim_per_step = 86
-        state_space = 86
-    elif control_mode == "ACCBR":
-        action_dim = 6   # vel_cmd(3) + body_rates(3)
-        # 单步观测 49 维：pos(3)+vel(3)+rot_mat(9)+other_drones(6)+targets(20)+dist(4)+closest(4)
-        # 历史拼接后：49 × history_len = 147 维
-        obs_dim_per_step = 49
-        state_space = 86  # 86 = pos(9)+rot(27)+vel(9)+ang_vel(9)+t_pos(12)+t_vel(12)+captured(4)+values(4)
+    # ACCBR 模式：vel_cmd(3) + body_rates(3) = 6维动作
+    # geometric 模式：pos(3)+vel(3)+acc(3)+jerk(3) = 12维动作
+    action_dim = 6        # ACCBR 模式动作维度
+    # 单步观测 49 维：pos(3)+vel(3)+rot_mat(9)+other_drones(6)+targets(20)+dist(4)+closest(4)
+    obs_dim_per_step = 49
+    # 全局 state 86 维：pos(9)+rot(27)+vel(9)+ang_vel(9)+t_pos(12)+t_vel(12)+captured(4)+values(4)
+    state_space = 86
 
     action_spaces = {agent: action_dim for agent in possible_agents}
     observation_spaces = {
