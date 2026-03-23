@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 
 # 外环几何控制器（计算期望姿态/加速度）和内环 INDI 控制器（计算转子转速）
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
@@ -20,16 +21,20 @@ from MARL_mav_carry_ext.tasks.managerbased.mdp_llc.utils import (
 )
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, RigidObject
-from isaaclab.envs import DirectMARLEnv          # IsaacLab 多智能体环境基类
+import isaacsim.core.utils.prims as prim_utils
+from isaacsim.core.prims import XFormPrim            # 用于驱动 NovaCarter 位置（运动学方式）
+from isaaclab.assets import Articulation
+from isaaclab.envs import DirectMARLEnv
 from isaaclab.sensors import ContactSensor
+from isaaclab.sim import schemas as sim_schemas
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils import CircularBuffer          # 环形缓冲区，用于存储历史观测
+from isaaclab.utils import CircularBuffer
 from isaaclab.utils.math import (
-    euler_xyz_from_quat,   # 四元数 → 欧拉角
-    matrix_from_quat,      # 四元数 → 旋转矩阵（用于观测中的姿态表示）
-    quat_rotate,           # 向量的四元数旋转
+    matrix_from_quat,
+    quat_from_angle_axis,
+    quat_mul,
 )
+from pxr import UsdPhysics
 
 from .marl_move_flyfollow_env_cfg import MARLMoveEnvCfg
 
@@ -171,18 +176,15 @@ class MARLMoveEnv(DirectMARLEnv):
         self.target_positions = torch.zeros(
             self.num_envs, self.num_targets, 3, device=self.device
         )
-        # 速度：x 方向匀速运动（cfg.target_velocity），y/z 为 0
+        # 速度：x 方向匀速运动，恒定值，供 _get_states 中 Critic 使用
         self.target_velocities = torch.zeros(
             self.num_envs, self.num_targets, 3, device=self.device
         )
+        self.target_velocities[..., 0] = cfg.target_velocity
         # 捕获状态：bool (E, T)，每帧实时更新；若无人机飞远则自动置 False（可撤销捕获）
         self.target_captured = torch.zeros(
             self.num_envs, self.num_targets, dtype=torch.bool, device=self.device
         )
-        # 预创建单位四元数，写入仿真位置时使用，避免每帧重新分配内存
-        self._target_quat = torch.tensor(
-            [[1.0, 0.0, 0.0, 0.0]], device=self.device
-        ).repeat(self.num_envs, 1)
         # 目标价值（固定不变）：红4分、黄3分、绿2分、蓝1分
         # shape: (num_envs, num_targets)，用于距离奖励加权
         self.target_values = (
@@ -266,65 +268,147 @@ class MARLMoveEnv(DirectMARLEnv):
         self.set_debug_vis(cfg.debug_vis)
 
     def _setup_scene(self):
-        """构建仿真场景：3个独立无人机 Articulation + 4个运动物块 RigidObject。
+        """从 USD 文件加载完整场景（对齐 river_flyfollow 范式）。
 
-        采用 IsaacLab-HARL 模式：每架无人机是独立的 Articulation 对象，
-        避免多智能体合并为单个 Articulation 带来的索引复杂度。
+        USD 内含：Rivermark 室外环境 + 3架 Falcon 无人机 + 4辆 NovaCarter 目标小车。
+        步骤：
+          1. 加载地面平面（物理碰撞）
+          2. spawn_from_usd → clone_environments（USD 场景复制到所有并行 env）
+          3. resolve_agent_prim_path 定位各 Falcon prim → 绑定 Articulation（spawn=None）
+          4. 激活接触传感器 API
+          5. 绑定 NovaCarter 小车为 XFormPrim（运动学，直接写位置）
         """
-        # ===== 创建3个独立的Articulation对象（每架无人机独立）=====
+        # ── 1. 地面平面 ──────────────────────────────────────────────────────
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+
+        # ── 2. 加载 move_flyfollow USD 场景 ──────────────────────────────────
+        scene_usd_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets/data/AMR/move_flyfollow/move_flyfollow.usda"
+        )
+        scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
+        sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
+
+        # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
+        self.scene.clone_environments(copy_from_source=False)
+
+        # ── 4. 确定 env_0 的实际根路径 ───────────────────────────────────────
+        env_root_base = "/World/envs/env_0"
+        env_root = env_root_base
+        if prim_utils.is_prim_path_valid(f"{env_root_base}/World"):
+            env_root = f"{env_root_base}/World"
+
+        def resolve_agent_prim_path(agent_name: str) -> str:
+            """定位 env_0 中指定 agent 的带 ArticulationRootAPI 的 prim 路径。"""
+            roots = [env_root]
+            if prim_utils.is_prim_path_valid(f"{env_root}/World"):
+                roots.append(f"{env_root}/World")
+
+            for root in roots:
+                for candidate in [
+                    f"{root}/{agent_name}/Robot",
+                    f"{root}/{agent_name}/Falcon",
+                    f"{root}/{agent_name}",
+                ]:
+                    if prim_utils.is_prim_path_valid(candidate):
+                        return candidate
+
+                # instanceable prim 处理
+                outer_path = f"{root}/{agent_name}"
+                if prim_utils.is_prim_path_valid(outer_path):
+                    import omni.usd
+                    _stage = omni.usd.get_context().get_stage()
+                    _prim = _stage.GetPrimAtPath(outer_path)
+                    if _prim.IsValid() and _prim.IsInstance():
+                        proto = _prim.GetPrototype()
+                        if proto:
+                            for child in proto.GetAllChildren():
+                                if child.HasAPI(UsdPhysics.ArticulationRootAPI):
+                                    return f"{outer_path}/{child.GetName()}"
+
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: p.GetName() == agent_name
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: agent_name in p.GetName()
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+
+            prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/{agent_name}(/.*)?")
+            if prim is not None:
+                return prim.GetPath().pathString
+            raise RuntimeError(f"Could not resolve prim path for agent '{agent_name}' under {env_root_base}.")
+
+        # ── 5. 绑定 Falcon 无人机 Articulation（spawn=None）─────────────────
         self.robots = []
         self.contact_sensors = []
+        self._usd_root_state_rel = torch.zeros(
+            len(self.cfg.possible_agents), 7, device=self.device
+        )
+        for i, agent in enumerate(self.cfg.possible_agents):
+            env0_prim = resolve_agent_prim_path(agent)
+            # 将 env_0 路径转为 env_.* 通配符
+            env_prim_pattern = env0_prim.replace(env_root_base, "/World/envs/env_.*", 1)
 
-        for i in range(3):
-            robot_cfg = getattr(self.cfg, f"robot_{i}")
-            # Articulation 构造函数会通过 scene replication 调用 spawn 函数
+            robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_prim_pattern)
+            robot_cfg.spawn = None  # 不重新 spawn，绑定已有 prim
             robot = Articulation(robot_cfg)
             self.robots.append(robot)
             self.scene.articulations[f"robot_{i}"] = robot
 
-            # 每架无人机对应独立的接触传感器（用于检测非法碰撞）
-            contact_cfg = getattr(self.cfg, f"contact_forces_{i}")
+            # 逐 env 激活接触传感器 API
+            for env_id in range(self.num_envs):
+                env_prim = env0_prim.replace("/env_0", f"/env_{env_id}", 1)
+                sim_schemas.activate_contact_sensors(env_prim, threshold=self.cfg.contact_sensor_threshold)
+
+            contact_cfg = self.cfg.contact_forces.replace(
+                prim_path=f"{env_prim_pattern}/.*"
+            )
             contact = ContactSensor(contact_cfg)
             self.contact_sensors.append(contact)
             self.scene.sensors[f"contact_forces_{i}"] = contact
 
-        # ===== 创建4个移动物块（目标）=====
-        # 物块设为 kinematic（运动学刚体），由代码直接控制位置，不参与物理碰撞求解
-        from isaaclab.assets import RigidObjectCfg
+            # 缓存 USD 初始位姿（相对 env_origin），reset 时恢复
+            try:
+                xfm = XFormPrim(env0_prim)
+                pos, ori = xfm.get_world_poses()
+                self._usd_root_state_rel[i, :3] = pos[0] - self.scene.env_origins[0]
+                self._usd_root_state_rel[i, 3:7] = ori[0]
+            except Exception as exc:
+                print(f"[move_flyfollow] Failed to read USD pose for {env0_prim}: {exc}")
 
-        self.targets = []
-        for i, color_name in enumerate(self.cfg.target_colors):
-            color_rgb = self.cfg.target_color_rgb[color_name]
-            target_cfg = RigidObjectCfg(
-                prim_path=f"/World/envs/env_.*/target_{i}",
-                spawn=sim_utils.CuboidCfg(
-                    size=self.cfg.target_size,
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        kinematic_enabled=True,   # 运动学模式：位置由代码写入，忽略碰撞力
-                        disable_gravity=True,     # 禁用重力，保持地面高度匀速滑动
-                    ),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=color_rgb   # 颜色区分：红/黄/绿/蓝
-                    ),
-                ),
-                init_state=RigidObjectCfg.InitialStateCfg(
-                    pos=(0.0, 0.0, self.cfg.target_spawn_z),
-                    rot=(1.0, 0.0, 0.0, 0.0),
-                ),
-            )
-            target = RigidObject(target_cfg)
-            self.scene.rigid_objects[f"target_{i}"] = target
-            self.targets.append(target)
+        if self.robots:
+            self.scene.articulations["robot"] = self.robots[0]
 
-        # 地面平面（防止无人机无限下落）
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # 复制并行环境（每个 env 独立一份场景）
-        self.scene.clone_environments(copy_from_source=False)
-        # 添加场景照明
+        # ── 6. 补充环境光照 ───────────────────────────────────────────────────
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+        # ── 7. 绑定 NovaCarter 小车为 XFormPrim ──────────────────────────────
+        # 小车不参与物理仿真，每步通过 set_world_poses 直接驱动位置
+        # USD 命名约定：第一辆无后缀，其余 _01/_02/_03
+        self._target_prims: list[XFormPrim] = []
+        self._usd_target_positions_rel = torch.zeros(self.cfg.num_targets, 3, device=self.device)
+        self._usd_target_orientations = torch.zeros(self.cfg.num_targets, 4, device=self.device)
+        target_prim_names = [
+            "nova_carter_sim_optimized",
+            "nova_carter_sim_optimized_01",
+            "nova_carter_sim_optimized_02",
+            "nova_carter_sim_optimized_03",
+        ]
+        for idx, name in enumerate(target_prim_names[: self.cfg.num_targets]):
+            prim_path = f"{env_root}/{name}"
+            xfm = XFormPrim(prim_path)
+            self._target_prims.append(xfm)
+            try:
+                pos, ori = xfm.get_world_poses()
+                self._usd_target_positions_rel[idx] = pos[0] - self.scene.env_origins[0]
+                self._usd_target_orientations[idx] = ori[0]
+            except Exception as exc:
+                print(f"[move_flyfollow] Failed to read USD target pose for {prim_path}: {exc}")
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         """将 policy 输出的动作解码为控制器设定点。
@@ -505,25 +589,15 @@ class MARLMoveEnv(DirectMARLEnv):
                 body_ids=self._falcon_rotor_idx,
             )
 
-        # ===== 更新目标物块位置（匀速直线运动，x 方向正向）=====
-        # 使用高级控制时间步长（decimation × physics_dt）推进位置
-        dt = self.physics_dt * self.cfg.decimation
-        self.target_velocities[:, :, 0] = self.cfg.target_velocity   # x 方向速度
-        self.target_velocities[:, :, 1] = 0.0
-        self.target_velocities[:, :, 2] = 0.0
+        # ===== 更新目标小车位置（匀速直线运动，x 方向正向）=====
+        self.target_positions[..., 0] += self.cfg.target_velocity * self.step_dt
 
-        self.target_positions += self.target_velocities * dt   # 位置积分
-
-        # 将位置写回仿真（需加 env_origins 转换到世界坐标）
-        for i, target in enumerate(self.targets):
-            target_poses = torch.cat(
-                [
-                    self.target_positions[:, i] + self.scene.env_origins,
-                    self._target_quat,  # 固定朝向，不旋转
-                ],
-                dim=-1,
-            )
-            target.write_root_pose_to_sim(target_poses)
+        # 仅更新 env_0 的可视化（XFormPrim 只有 env_0 下有 prim）
+        positions_world = self.target_positions + self.scene.env_origins.unsqueeze(1)
+        for i, prim in enumerate(self._target_prims):
+            pos = positions_world[0:1, i, :]
+            ori = self._usd_target_orientations[i].unsqueeze(0)
+            prim.set_world_poses(positions=pos, orientations=ori)
 
     def _normalize_observation(self, obs: torch.Tensor) -> torch.Tensor:
         """No manual normalization — relying on skrl's RunningStandardScaler."""
@@ -925,14 +999,9 @@ class MARLMoveEnv(DirectMARLEnv):
         # 只有"出界 AND 未捕获目标"的无人机才触发终止
         self.body_pos_outside = (is_outside & (~drone_has_captured)).any(dim=-1)
 
-        # --- 条件5：目标物块超出边界（x 方向运动最终会超出）---
-        # 当所有目标都跑出右边界时，episode 自然结束
+        # --- 条件5：目标小车超出 x 方向终点（匀速行驶跑出场景边界）---
         self.targets_out_of_bounds = (
-            (self.target_positions[:, :, 0] > self.cfg.bounding_box_threshold)
-            | (self.target_positions[:, :, 0] < -self.cfg.bounding_box_threshold)
-            | (self.target_positions[:, :, 1] > self.cfg.bounding_box_threshold)
-            | (self.target_positions[:, :, 1] < -self.cfg.bounding_box_threshold)
-            | (self.target_positions[:, :, 2] < 0.05)
+            self.target_positions[:, :, 0] > self.cfg.target_end_x
         ).any(dim=-1)
 
         # --- 组合所有终止条件（任一触发即终止）---
@@ -1010,44 +1079,17 @@ class MARLMoveEnv(DirectMARLEnv):
         if not isinstance(env_ids, torch.Tensor):
             env_ids = torch.tensor(env_ids, device=self.device)
 
-        # ===== 随机化无人机初始位置（三角编队）=====
-        # 随机采样编队中心（x: drone_spawn_x_range, y: drone_spawn_y_range）
-        center_x = torch.empty(len(env_ids), device=self.device).uniform_(
-            *self.cfg.drone_spawn_x_range
-        )
-        center_y = torch.empty(len(env_ids), device=self.device).uniform_(
-            *self.cfg.drone_spawn_y_range
-        )
+        num_ids = len(env_ids)
+        env_origins = self.scene.env_origins[env_ids]
+        zeros_vel = torch.zeros(num_ids, 6, device=self.device)
 
-        radius = 2.0   # 三角编队半径（m）
-        height = 2.5   # 初始高度（m）
-        # 三角编队相位：0°, 120°, 240°
-        phases = torch.tensor(
-            [0.0, 2.0 * 3.14159 / 3.0, 4.0 * 3.14159 / 3.0], device=self.device
-        )
-
+        # ===== 使用 USD 缓存的初始位姿恢复无人机位置 =====
+        # _usd_root_state_rel[i]：第 i 架无人机相对 env_origin 的初始位姿
         for i, robot in enumerate(self.robots):
-            robot.reset(env_ids)  # 重置关节等内部状态
-
-            origins = self.scene.env_origins[env_ids]  # 各 env 的世界坐标原点
-
-            # 计算初始位置偏移（三角形顶点 + 中心偏移）
-            offsets = torch.zeros((len(env_ids), 3), device=self.device)
-            offsets[:, 0] = center_x + radius * torch.cos(phases[i])
-            offsets[:, 1] = center_y + radius * torch.sin(phases[i])
-            offsets[:, 2] = height
-
-            new_positions = origins + offsets
-
-            default_root_state = robot.data.default_root_state[env_ids]
-            new_quats = default_root_state[:, 3:7]  # 保持默认朝向
-            new_poses = torch.cat([new_positions, new_quats], dim=-1)
-
-            robot.write_root_pose_to_sim(new_poses, env_ids=env_ids)
-            # 初始速度归零（防止继承上一 episode 的速度）
-            robot.write_root_velocity_to_sim(
-                torch.zeros_like(default_root_state[:, 7:]), env_ids=env_ids
-            )
+            pos = self._usd_root_state_rel[i, :3].unsqueeze(0).repeat(num_ids, 1) + env_origins
+            ori = self._usd_root_state_rel[i, 3:7].unsqueeze(0).repeat(num_ids, 1)
+            root_state = torch.cat([pos, ori, zeros_vel], dim=-1)
+            robot.write_root_state_to_sim(root_state, env_ids=env_ids)
 
         # 清空历史观测缓冲区（防止新 episode 混入旧 episode 帧）
         for agent in self.cfg.possible_agents:
@@ -1106,43 +1148,26 @@ class MARLMoveEnv(DirectMARLEnv):
         # 重置成功标志
         self.all_targets_captured[env_ids] = False
 
-    def _reset_targets(self, env_ids):
-        """重置目标物块的位置、速度和捕获状态。
+    def _reset_targets(self, env_ids: torch.Tensor):
+        """重置目标小车位置：使用 USD 中缓存的初始位姿作为起始点。"""
+        if env_ids.numel() == 0:
+            return
 
-        目标初始化策略：
-        - x 坐标：在 target_spawn_x_range 内随机采样（制造追捕任务的初始距离差异）
-        - y 坐标：固定在 target_spawn_y_positions（4个目标等间距排列，初始分散）
-        - z 坐标：固定在 target_spawn_z（地面高度，目标在地面滑动）
-        - 速度：初始为 0（由 _apply_action 在第一步赋予 x 方向速度）
-        """
-        # 计算展平索引：(num_env_reset × num_targets,)
-        target_indices_flat = (
-            env_ids.view(-1, 1) * self.num_targets
-            + torch.arange(self.num_targets, device=self.device).view(1, -1)
-        ).flatten()
+        # 以 USD 初始位置为基准（相对坐标），广播到所有被重置的 env
+        rel = self._usd_target_positions_rel.unsqueeze(0).repeat(env_ids.numel(), 1, 1)
+        self.target_positions[env_ids] = rel
 
-        flat_pos = self.target_positions.view(-1, 3)
-        flat_vel = self.target_velocities.view(-1, 3)
-
-        # 重置捕获状态（新 episode 无人机尚未接近任何目标）
+        # 重置捕获状态
         self.target_captured[env_ids] = False
-        self.target_captured_by[env_ids] = -1  # -1 表示未被任何无人机捕获
+        self.target_captured_by[env_ids] = -1
 
-        # 逐目标随机化 x 坐标，y/z 固定
-        for i in range(self.num_targets):
-            current_indices = env_ids * self.num_targets + i
-
-            r = torch.empty(len(env_ids), device=self.device)
-            val_x = r.uniform_(*self.cfg.target_spawn_x_range)  # x: 随机
-            val_y = self.cfg.target_spawn_y_positions[i]         # y: 固定分层
-            val_z = self.cfg.target_spawn_z                      # z: 地面高度
-
-            flat_pos[current_indices, 0] = val_x
-            flat_pos[current_indices, 1] = val_y
-            flat_pos[current_indices, 2] = val_z
-
-        # 初始速度归零（第一个物理步骤后会被赋予 target_velocity）
-        flat_vel[target_indices_flat] = 0.0
+        # 更新 env_0 可视化
+        if 0 in env_ids.tolist():
+            positions_world = self.target_positions[0:1] + self.scene.env_origins[0:1].unsqueeze(1)
+            for i, prim in enumerate(self._target_prims):
+                pos = positions_world[:, i, :]
+                ori = self._usd_target_orientations[i].unsqueeze(0)
+                prim.set_world_poses(positions=pos, orientations=ori)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """设置 debug 可视化（当前未实现，预留接口）。"""

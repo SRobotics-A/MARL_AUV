@@ -88,7 +88,7 @@ agent:
                                 # 确保 GAE 在超时截断时使用正确的价值估计
 
   experiment:
-    directory: "move"           # 日志保存目录：logs/skrl/move/
+    directory: "move_flyfollow"           # 日志保存目录：logs/skrl/move_flyfollow/
     experiment_name: "mappo"   # 实验名称（用于区分不同超参数运行）
     write_interval: 100         # 每 100 步写一次 tensorboard 日志
     checkpoint_interval: 5000  # 每 5000 步保存一次模型检查点
