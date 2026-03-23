@@ -67,7 +67,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 目标价值（高价值目标优先级更高，体现在距离奖励的加权上）
     target_values = [4.0, 3.0, 2.0, 1.0]
     target_velocity = 0.3     # 小车沿 x 轴正方向的匀速（m/s）
-    capture_distance = 2.0    # 捕获/跟随判定距离（m）：NovaCarter 车身较大，适当放宽
+    # [PLAN fix-3] 暂时放宽至 3.0m 引导首次进入捕获区，收敛后可收紧
+    capture_distance = 3.0    # 捕获/跟随判定距离（m）：NovaCarter 车身较大，适当放宽
     sustained_follow_duration = 3.0  # 成功终止需持续跟随的时间（秒）
     # 目标小车边界：x 超过此值触发 targets_out_of_bounds 终止
     target_end_x = 30.0       # 小车跑出场景边界的 x 坐标（与场景 bounding_box 匹配）
@@ -77,7 +78,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 距离奖励：w * exp(-dist × scale) × value × dt
     # scale 越小，奖励梯度覆盖范围越广（吸引盆地更宽）
-    dist_reward_weight = 1.5
+    # [PLAN fix-1] 大幅提升权重，使追踪信号远超稳定性奖励
+    dist_reward_weight = 4.0
     dist_reward_scale = 0.5   # 较小值：远距离也有梯度，避免无人机卡在局部最优
 
     # 成功奖励（当前已移除，设为0）
@@ -85,31 +87,41 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 跟随奖励：仅在捕获状态下（dist < capture_distance）给予
     # 与距离奖励叠加，增强进入捕获区后的保持动机
-    tracking_reward_weight = 1.0
+    # [PLAN fix-3] 提升 tracking 权重，放宽 capture_distance 以引导首次进入捕获区
+    tracking_reward_weight = 3.0
     tracking_reward_scale = 1.0
+
+    # 速度跟随奖励：鼓励无人机匹配目标速度（0.3 m/s x 向），解决"悬停局部最优"
+    # exp(-||v_drone_xy - v_target_xy||²)；适合匀速追踪任务
+    # [PLAN fix-2] 新增，CRITICAL
+    velocity_follow_weight = 1.5
 
     # 动作平滑度：exp(-||Δaction||²)，鼓励连续平滑的控制输出
     action_smoothness_weight = 1.0
 
     # 机体角速率：exp(-||ω||)，抑制过激角运动（大角速率 = 不稳定飞行）
-    body_rate_penalty_weight = 2.0
+    # [PLAN fix-1] 降低权重，避免稳定性奖励掩盖追踪信号
+    body_rate_penalty_weight = 0.5
 
     # 时间惩罚（已禁用）：可用于鼓励快速完成任务
     time_penalty = 0.0
 
-    # 速度惩罚：exp(-||v||)，抑制高速飞行（影响精确跟随）
-    velocity_penalty_weight = 0.3
+    # 速度惩罚：已用 velocity_follow 代替，此项置 0 以消除"悬停优于追踪"的局部最优
+    # [PLAN fix-1] 置为 0
+    velocity_penalty_weight = 0.0
 
     # 推力惩罚：exp(-max_thrust_normalized)，抑制高能耗悬停
     force_penalty_weight = 0.5
 
     # 竖直姿态：w * (R_zz - 1.0) × dt，R_zz = 机体 z 轴与世界 z 轴夹角余弦
     # 完全竖直时 R_zz=1（奖励=0），翻滚时 R_zz=-1（奖励=-2×w×dt）
-    upright_penalty_weight = 2.0
+    # [PLAN fix-1] 降低权重
+    upright_penalty_weight = 0.5
     upright_expect_dir = (0.0, 0.0, 1.0)  # 期望机体上方向 = 世界 z 轴
 
     # 高度奖励：鼓励维持在 desired_height 附近飞行
-    height_reward_weight = 2.0
+    # [PLAN fix-1] 降低权重，高度保持不应压制追踪动机
+    height_reward_weight = 0.5
     desired_height = 2.5   # 期望飞行高度（m），需保持在目标上方以便俯视追踪
 
     # 高度超限惩罚（线性）：|z - desired| > threshold 时额外惩罚
@@ -127,8 +139,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # ACCBR 模式：vel_cmd(3) + body_rates(3) = 6维动作
     # geometric 模式：pos(3)+vel(3)+acc(3)+jerk(3) = 12维动作
     action_dim = 6
-    # 单步观测 49 维：pos(3)+vel(3)+rot_mat(9)+other_drones(6)+targets(20)+dist(4)+closest(4)
-    obs_dim_per_step = 49
+    # 单步观测 61 维：pos(3)+vel(3)+rot_mat(9)+other_drones(6)+targets(32)+dist(4)+closest(4)
+    # targets(32) = 相对位置(12) + 目标速度(12) + 捕获状态(4) + 价值(4)
+    # [PLAN fix-4] 加入目标速度观测（+12维，49→61）
+    obs_dim_per_step = 61
     # 全局 state 86 维：pos(9)+rot(27)+vel(9)+ang_vel(9)+t_pos(12)+t_vel(12)+captured(4)+values(4)
     state_space = 86
 

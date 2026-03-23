@@ -16,7 +16,7 @@ models:
     initial_log_std: -0.2  # 初始对数标准差（约 0.82 的标准差，适度探索）
     network:
       - name: net
-        input: STATES      # 输入：局部观测（obs_dim = 49 × 3 = 147）
+        input: STATES      # 输入：局部观测（obs_dim = 61 × 3 = 183）
         layers: [256, 256, 128]  # 三层 MLP；最后层窄化以压缩特征
         activations: elu   # ELU 激活：平滑且收敛快，比 ReLU 梯度更稳定
     output: ACTIONS        # 输出：动作均值（6维）
@@ -73,12 +73,14 @@ agent:
 
   # ===== 梯度裁剪和截断 =====
   grad_norm_clip: 1.0     # 梯度范数截断（防止梯度爆炸）
-  ratio_clip: 0.1         # PPO clip epsilon：限制策略更新幅度（较小=更保守）
-  value_clip: 0.1         # Critic 价值截断（防止价值更新过大）
+  # [PLAN fix-5] 0.1→0.2：早期探索阶段策略需要更大的更新步长
+  ratio_clip: 0.2         # PPO clip epsilon：限制策略更新幅度
+  value_clip: 0.2         # Critic 价值截断（与 ratio_clip 保持一致）
   clip_predicted_values: True  # 对新旧价值的差值也做截断
 
   # ===== 损失系数 =====
-  entropy_loss_scale: 0.001   # 熵正则化权重（鼓励探索）；move 任务已收敛故较小
+  # [PLAN fix-5] 0.001→0.01：增大熵系数，鼓励早期阶段充分探索
+  entropy_loss_scale: 0.01    # 熵正则化权重（鼓励探索）
   value_loss_scale: 1.0       # Critic 损失权重（与 Actor 损失的相对比例）
   kl_threshold: 0.0           # 0 = 不使用 KL 散度早停
 

@@ -606,13 +606,14 @@ class MARLMoveEnv(DirectMARLEnv):
     def _get_observations(self) -> dict[str, torch.Tensor]:
         """构建每个智能体的局部观测向量。
 
-        观测结构（每步 49 维，history_len=3 时输入 147 维）：
+        观测结构（每步 61 维，history_len=3 时输入 183 维）：
           1. 自身状态（15维）：位置(3) + 线速度(3) + 旋转矩阵(9)
           2. 其他无人机相对位置（6维）：(num_drones-1) × 3
-          3. 目标信息（20维）：相对位置(12) + 捕获状态(4) + 价值(4)
+          3. 目标信息（32维）：相对位置(12) + 目标速度(12) + 捕获状态(4) + 价值(4)
           4. 距离信息（4维）：到各目标的水平距离
           5. 最近标志（4维）：当前无人机是否是各目标最近的无人机（one-hot 风格）
 
+        [PLAN fix-4] 在目标信息中新增目标速度（12维），使 Actor 可感知目标运动方向。
         注：观测使用 CircularBuffer 拼接历史帧，提供时序信息（替代 RNN）
         """
         # ===== 刷新无人机状态缓冲区（每步从仿真读取）=====
@@ -675,17 +676,19 @@ class MARLMoveEnv(DirectMARLEnv):
                     self.num_envs, (self._num_drones - 1) * 3, device=self.device
                 )
 
-            # --- 3. 目标信息（20维）---
-            # 相对位置(4×3=12) + 捕获状态 bool→float(4) + 目标价值(4)
+            # --- 3. 目标信息（32维）---
+            # 相对位置(4×3=12) + 目标速度(4×3=12) + 捕获状态 bool→float(4) + 目标价值(4)
+            # [PLAN fix-4] 加入目标速度，使 Actor 可感知目标运动方向（原为 20 维，现扩展至 32 维）
             target_rel_pos = self.target_positions - self.drone_positions[
                 :, drone_idx
             ].unsqueeze(1)   # (N, T, 3)
 
             obs_targets = torch.cat(
                 [
-                    target_rel_pos.view(self.num_envs, -1),         # 12
-                    self.target_captured.float().view(self.num_envs, -1),  # 4
-                    self.target_values,                               # 4
+                    target_rel_pos.view(self.num_envs, -1),                  # 12
+                    self.target_velocities.view(self.num_envs, -1),          # 12（新增）
+                    self.target_captured.float().view(self.num_envs, -1),    # 4
+                    self.target_values,                                       # 4
                 ],
                 dim=-1,
             )
@@ -817,6 +820,26 @@ class MARLMoveEnv(DirectMARLEnv):
         ).sum(dim=-1)
         rewards["tracking_reward"] = (
             self.cfg.tracking_reward_weight * tracking_reward * step_dt
+        )
+
+        # --- 1.5 速度跟随奖励（鼓励匹配目标速度，解决"悬停"局部最优）---
+        # [PLAN fix-2] 对每架无人机，计算其 XY 速度与最近目标速度的差值
+        # closest_drone_indices shape: (N, T) → 转置得 (N, D) 形式的最近目标索引
+        closest_target_per_drone = torch.argmin(dist_matrix, dim=2)  # (N, D)
+        # target_velocities: (N, T, 3) → 按索引取各无人机最近目标的速度
+        closest_target_idx_exp = closest_target_per_drone.unsqueeze(-1).expand(
+            -1, -1, 3
+        )  # (N, D, 3)
+        target_vel_for_drone = torch.gather(
+            self.target_velocities, 1, closest_target_idx_exp
+        )  # (N, D, 3)
+        # 计算 XY 平面上的速度误差（不考虑 z，避免高度控制干扰跟随）
+        vel_diff_xy = (
+            self.drone_linear_velocities[:, :, :2] - target_vel_for_drone[:, :, :2]
+        )  # (N, D, 2)
+        vel_err = torch.norm(vel_diff_xy, dim=-1).mean(dim=-1)  # (N,)
+        rewards["velocity_follow"] = (
+            self.cfg.velocity_follow_weight * torch.exp(-vel_err) * step_dt
         )
 
         # --- 2. 动作平滑度奖励（抑制震荡动作）---
