@@ -97,81 +97,41 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     target_end_x = 50.0                                 # 目标结束x坐标
     target_y_positions: Sequence[float] = (15.0, 5.0, -5.0, -15.0)  # 各目标的y坐标分布
     target_speed = 0.8                                  # 目标移动速度（m/s）
-    tracking_distance_xy = 3.0                          # tracking reward 激活的 XY 距离阈值（从2.0扩至3.0：zone中心外移，holding提前介入）
-    success_distance_xy = 6.0                          # success_mask 判定的 XY 距离阈值（从5.0小幅放宽至6.0）
-    track_distance_xy = 3.5                            # 保留旧参数供兼容（success_distance_xy 优先）
-    tracking_bonus_distance_xy = 2.0                   # 保留旧参数供兼容（tracking_distance_xy 优先）
-    success_hold_time = 0.3                            # 持续满足 success 条件的秒数门槛（从0.5降至0.3：降低绝对持续时长要求）
-    success_timer_decay_rate: float = 0.5              # 离开 success zone 时 timer 衰减倍率（从2.0降至0.5：在区50%占比即可净增长）
 
-    success_velocity_tolerance = 2.0                   # 进入 success zone 的严格纵向速度门槛（enter 条件，硬阈值）
-    success_distance_xy_hold: float = 8.0              # 进入后维持 timer 的宽松距离门槛（hold 软化距离边界中心）
-    success_velocity_tolerance_hold: float = 4.0       # hold 纵向速度 Gaussian sigma：vel=0时factor=1，vel=sigma时factor≈0.37
-    success_hold_dist_sharpness: float = 0.3           # hold 距离 sigmoid 陡度（1/m）：0.5→约2m过渡带，越大越陡
-    success_proximity_weight: float = 3.0              # 成功区每步密集奖励权重：dist+vel+height 同时达标时发放，对齐 success_mask
-    success_bonus_weight: float = 500.0                # 成功终止一次性奖励权重：val=1→5.0，val=4→20.0（×step_dt后）
-
-    distance_reward_sigma = 10                              # 从28降至10：更强的近程梯度（5m内明显提升）
+    distance_reward_sigma = 10                         # 近程梯度衰减宽度（σ，m）
     height_reward_sigma = 1.0
     action_smoothness_sigma = 0.25
-    collision_soft_margin = 0.5
-    boundary_soft_margin = 1.0
-    altitude_soft_margin = 1.0                         # 低高度软惩罚区间：z < min_altitude+1.0=2.0m 时开始罚
-    altitude_upper_soft_threshold = 4.0                # 高度软上限前移：z > 4.0m 就开始持续受罚
-    high_altitude_soft_margin = 1.0                    # 超高软惩罚归一化区间（4.0~5.0m 迅速拉高代价）
-    high_altitude_penalty_weight = 1.6                 # 超高软惩罚权重加强，避免高空平台成为便宜解
-    alive_reward_weight = 0.05
+    altitude_upper_soft_threshold = 4.0                # 高度软上限：z > 4.0m 开始持续受罚
+    high_altitude_soft_margin = 1.0                    # 超高软惩罚归一化区间（4.0~5.0m）
+    high_altitude_penalty_weight = 1.6                 # 超高软惩罚权重
 
     # 奖励塑形参数
-    distance_reward_weight = 2.0                        # 距离奖励权重（放大近场梯度）
-    tracking_reward_weight = 2.5                        # 进入区奖励权重（entry component，进入即有）
-    tracking_zone_sharpness: float = 1.5               # sigmoid 软边界陡度（1/m）：从4.0软化至1.5，梯度覆盖5m范围而非0.25m
-    tracking_vel_match_sigma: float = 1.5               # 速度质量高斯核宽度（m/s），仅影响 entry 的速度加成
-    tracking_vel_quality_alpha: float = 0.5             # 速度质量加成权重（entry 额外最多 +50%）
-    tracking_hold_weight: float = 10.0                 # 持续保持奖励权重（从5.0翻倍至10.0：圈内停留成为最高价值行为）
-    tracking_hold_ramp_time: float = 1.0               # ramp 达满值所需时间（从3.0降至1.0s：100步内即可体验满额 holding 正反馈）
-    tracking_stable_timer_decay_rate: float = 3.0      # 离圈时 timer 每秒衰减倍率（替代硬归零，防止短暂出圈蒸发所有积累）
-    dist_progress_weight: float = 2.0                   # 距离进度奖励权重（势函数 shaping，激励主动追近）
+    distance_reward_weight = 2.0                        # 距离奖励权重
+    tracking_reward_weight = 2.5                        # 追踪区奖励权重
     velocity_follow_weight = 0.8                        # 速度跟随主权重
     velocity_follow_progress_weight = 0.3               # 向前进度奖励系数
     velocity_follow_overspeed_weight = 0.05             # 超速惩罚系数（从0.2降至0.05：允许积极追近）
     velocity_follow_sigma = 1.5                         # 速度匹配高斯核宽度（从0.8放宽至1.5：降低早期训练的匹配难度）
-    velocity_follow_overspeed_margin = 1.0              # 超速容忍裕量（从2.0降至1.0：避免无人机5m/s乱飞）
+    velocity_follow_overspeed_margin = 1.0              # 超速容忍裕量（m/s）
     action_smoothness_weight = 0.5                      # 动作平滑性奖励权重
-    body_rate_penalty_weight = 0.02                     # 机体角速率惩罚权重（降至辅助约束，不主导负项）
-    velocity_penalty_weight = 0.05                      # 速度惩罚权重（从0.2降至0.05：仅作防失控约束，不主导行为塑形）
-    velocity_penalty_xy_safe = 4.0                      # XY 安全速度阈值（从2.0升至4.0 m/s：正常追踪机动完全不触发）
-    velocity_penalty_z_safe = 1.0                       # Z 安全速度阈值收紧：持续向上冲高更早进入惩罚区
-    velocity_penalty_z_scale = 0.25                     # Z 超速惩罚相对权重
+    body_rate_penalty_weight = 0.02                     # 机体角速率惩罚权重
+    velocity_penalty_weight = 0.05                      # 速度惩罚权重
     force_penalty_weight = 0.2                          # 推力惩罚权重
-    # 不要求定高悬停，只需保持在安全高度带内（不超高/不超低）
-    # 高度控制完全交给软边界惩罚（safety_penalty 中的 low/high_altitude_penalty）和终止条件（fly_low/fly_high）
-    height_reward_weight = 0.0                          # 关闭"靠近 desired_height"的高斯奖励（不需要定高）
-    height_error_penalty_weight = 0.0                   # 关闭高度误差惩罚（不需要贴 2m 飞）
-    height_error_above_extra_weight = 0.0               # 关闭超高额外惩罚（由 high_altitude_penalty 统一处理）
-    height_error_quadratic_weight = 0.0                 # 关闭高度二次惩罚
-    height_hold_deadband = 0.10                         # 保留参数（已不生效）
-    vertical_direction_penalty_weight = 0.0             # 关闭方向性垂直速度惩罚（不需要定高）
-    upward_vz_penalty_weight: float = 1.2              # 上升速度惩罚基础权重：更早压制高速冲高
-    upward_vz_penalty_altitude_start: float = 1.5      # 高于该高度后，上升速度惩罚开始随高度继续增强
-    upward_vz_penalty_altitude_scale: float = 1.0      # 高度增强系数：每高于起点1m，惩罚系数额外增加1.0
-    upward_acc_z_alt_lo: float = 1.5                   # 正向 az 限幅起点高度（m）：更早限制继续上冲
-    upward_acc_z_alt_hi: float = 2.3                   # 正向 az 限幅饱和高度（m）：在中低空就基本禁止继续上冲
-    upward_acc_z_min_scale: float = 0.02               # 饱和高度处正向 az 最小缩放比例（几乎禁止继续上升）
+    height_reward_weight = 0.0                          # 高度奖励权重（关闭定高约束）
+    upward_vz_penalty_weight: float = 1.2              # 上升速度惩罚基础权重
+    upward_vz_penalty_altitude_start: float = 1.5      # 上升惩罚随高度增强的起始高度（m）
+    upward_vz_penalty_altitude_scale: float = 1.0      # 高度增强系数（每高于起点1m，惩罚额外+1.0）
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
-    # === move 对齐参数 ===
-    # 目标捕获距离（实时可撤销，与 move.capture_distance 含义一致）
+    # 目标捕获距离（实时可撤销）
     capture_distance = 3.5
-    # 持续跟随成功门槛（≥3个目标同时被捕获持续此时长则 episode 成功终止，与 move 逻辑对齐）
+    # 持续跟随成功门槛（≥3个目标同时被捕获持续此时长）
     sustained_follow_duration = 2.0
-    # 距离奖励衰减速率（move=0.5；river 场景更大故取更小值）
-    dist_reward_scale = 0.2
-    # 追踪区奖励衰减速率（仅在捕获区内有效，move 同参数）
+    # 追踪区奖励衰减速率（仅在捕获区内有效）
     tracking_reward_scale = 0.3
-    # 竖直保持奖励权重（exp-decay，与 move.upright_penalty_weight=2.0 对齐）
+    # 竖直保持奖励权重
     upright_penalty_weight = 2.0
-    # 安全硬惩罚（不乘 step_dt，与 move 对齐）
+    # 硬约束惩罚（不乘 step_dt）
     collision_penalty_scale = 1.0
     drone_out_of_bounds_penalty = 1.0
     fly_low_penalty = 1.0

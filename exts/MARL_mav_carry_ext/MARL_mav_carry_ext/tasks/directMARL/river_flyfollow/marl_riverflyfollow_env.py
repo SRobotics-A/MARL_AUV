@@ -1029,8 +1029,16 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 高度过高终止：防止长期高空逃逸
         falcon_fly_high = (self.drone_positions[:, :, 2] > self.cfg.max_altitude).any(dim=-1)
         
-        # 越界终止：防止飞出限定区域
-        body_pos_outside = (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1).any(dim=-1)
+        # 越界终止：防止飞出限定区域（豁免：正在捕获目标的无人机不触发，与 move 对齐）
+        is_outside = (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1)  # (E, D)
+        drone_has_captured = torch.zeros(
+            (self.num_envs, self._num_drones), dtype=torch.bool, device=self.device
+        )
+        for d in range(self._num_drones):
+            drone_has_captured[:, d] = (
+                (self.target_captured_by == d) & self.target_captured
+            ).any(dim=-1)
+        body_pos_outside = (is_outside & (~drone_has_captured)).any(dim=-1)  # (E,)
 
         # 时间超时
         self.time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -1069,11 +1077,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             "Debug/Success/all_targets_captured_rate": self.all_targets_captured.float().mean(),
             "Debug/Success/timer_mean": self._sustained_follow_timer.mean(),
         }
-        for agent in self.cfg.possible_agents:
-            if "log" not in self.extras[agent]:
-                self.extras[agent]["log"] = {}
-            self.extras[agent]["log"].update(self.extras["log"])
-
         terminated = {agent: terminations for agent in self.cfg.possible_agents}
         time_outs = {agent: timed_outs for agent in self.cfg.possible_agents}
 
@@ -1147,49 +1150,34 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.prev_actions[agent][env_ids] = 0.0
             self.actions[agent][env_ids] = 0.0
 
-        # 日志记录初始化
+        # 日志
         if "log" not in self.extras:
             self.extras["log"] = dict()
-        for agent in self.cfg.possible_agents:
-            if "log" not in self.extras[agent]:
-                self.extras[agent]["log"] = dict()
 
-        # 记录终止原因统计
+        # 终止原因统计
         for i, robot in enumerate(self.robots):
             root_state = robot.data.root_state_w
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
-        fly_low_count = torch.count_nonzero(
+        log = self.extras["log"]
+        log["Episode_Termination/falcon_fly_low"] = torch.count_nonzero(
             (self.drone_positions[:, :, 2] < self.cfg.min_altitude).any(dim=-1)[env_ids]
         ).item()
-        fly_high_count = torch.count_nonzero(
+        log["Episode_Termination/falcon_fly_high"] = torch.count_nonzero(
             (self.drone_positions[:, :, 2] > self.cfg.max_altitude).any(dim=-1)[env_ids]
         ).item()
-        out_of_bounds_count = torch.count_nonzero(
+        log["Episode_Termination/bounding_box"] = torch.count_nonzero(
             (self.drone_positions.abs() > self.cfg.bounding_box_threshold).any(dim=-1).any(dim=-1)[env_ids]
         ).item()
-        time_out_count = torch.count_nonzero(self.time_out[env_ids]).item()
-        self.extras["log"]["Episode_Termination/falcon_fly_low"] = fly_low_count
-        self.extras["log"]["Episode_Termination/falcon_fly_high"] = fly_high_count
-        self.extras["log"]["Episode_Termination/bounding_box"] = out_of_bounds_count
-        success_count = torch.count_nonzero(self.all_targets_captured[env_ids]).item()
-        self.extras["log"]["Episode_Termination/sustained_success"] = success_count
-        self.extras["log"]["Episode_Termination/time_out"] = time_out_count
-        for agent in self.cfg.possible_agents:
-            log = self.extras[agent]["log"]
-            log["Episode_Termination/falcon_fly_low"] = fly_low_count
-            log["Episode_Termination/falcon_fly_high"] = fly_high_count
-            log["Episode_Termination/bounding_box"] = out_of_bounds_count
-            log["Episode_Termination/sustained_success"] = success_count
-            log["Episode_Termination/time_out"] = time_out_count
+        log["Episode_Termination/sustained_success"] = torch.count_nonzero(
+            self.all_targets_captured[env_ids]
+        ).item()
+        log["Episode_Termination/time_out"] = torch.count_nonzero(self.time_out[env_ids]).item()
 
-        # 记录奖励成分平均值
+        # 奖励成分平均值
         for key in self._episode_sums.keys():
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            self.extras["log"]["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
-            for agent in self.cfg.possible_agents:
-                self.extras[agent]["log"]["Episode_Reward/" + key] = (
-                    episodic_sum_avg / self.max_episode_length_s
-                )
+            log["Episode_Reward/" + key] = (
+                torch.mean(self._episode_sums[key][env_ids]) / self.max_episode_length_s
+            )
             self._episode_sums[key][env_ids] = 0.0
 
     def _reset_targets(self, env_ids: torch.Tensor):
