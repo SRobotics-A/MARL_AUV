@@ -1,0 +1,99 @@
+seed: 42
+
+models:
+  separate: True          # Actor 和 Critic 使用独立网络
+  CTDE: True              # 集中式训练、分散式执行（Critic 使用全局 state）
+  separate_actors: False  # 所有 agent 共享同一 Actor 网络（参数共享，减少网络规模）
+  separate_critics: False # 所有 agent 共享同一 Critic 网络
+  local_critics: False    # Critic 使用全局 state，而非局部观测
+
+  policy:
+    class: GaussianMixin   # 随机策略：输出高斯分布的均值和方差
+    clip_actions: False    # 动作在 env._pre_physics_step 中通过 ACCBR 解码，无需在此截断
+    clip_log_std: True     # 对 log_std 截断（防止方差过大或过小）
+    min_log_std: -20.0     # 最小对数标准差（对应极小方差，近似确定性策略）
+    max_log_std: 2.0       # 最大对数标准差（对应较大方差，对应高探索率）
+    initial_log_std: -0.2  # 初始对数标准差（约 0.82 的标准差，适度探索）
+    network:
+      - name: net
+        input: STATES      # 输入：局部观测（obs_dim = 49 × 3 = 147）
+        layers: [256, 256, 128]  # 三层 MLP；最后层窄化以压缩特征
+        activations: elu   # ELU 激活：平滑且收敛快，比 ReLU 梯度更稳定
+    output: ACTIONS        # 输出：动作均值（6维）
+
+  value:
+    class: DeterministicMixin  # Critic：确定性输出（标量价值估计）
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES      # 输入：全局 state（state_space = 86）
+        layers: [256, 256, 128]
+        activations: elu
+    output: ONE            # 输出：标量价值 V(s)
+
+memory:
+  class: RandomMemory
+  memory_size: -1          # -1 = 自动设为 rollouts 大小
+
+agent:
+  class: MAPPO
+  separate_actors: False   # 与 models 保持一致
+  use_state_space: True    # Critic 输入全局 state（须配合 state_space 正确设置）
+
+  # ===== 采样与更新 =====
+  rollouts: 128            # 每次更新前收集的时间步数（与 num_envs 无关）
+  learning_epochs: 5       # 每批数据重复学习的轮数（PPO 特性，提升样本效率）
+  mini_batches: 4          # minibatch 数量；minibatch_size = rollouts / mini_batches = 32
+
+  # ===== 折扣因子和 GAE =====
+  discount_factor: 0.99   # γ：长期回报折扣（接近1表示重视长期奖励）
+  lambda: 0.95             # GAE-λ：权衡 bias 和 variance（0=TD, 1=MC）
+
+  # ===== 学习率 =====
+  learning_rate: 2.5e-4
+  learning_rate_actor: 2.5e-4
+  learning_rate_critic: 2.5e-4
+  learning_rate_scheduler_actor: null    # 无学习率调度（固定 LR）
+  learning_rate_scheduler_actor_kwargs: null
+  learning_rate_scheduler_critic: null
+  learning_rate_scheduler_critic_kwargs: null
+
+  # ===== 观测/价值预处理 =====
+  # RunningStandardScaler：在线计算均值和方差，对输入进行标准化（稳定训练）
+  state_preprocessor: RunningStandardScaler       # 局部观测标准化（Actor 输入）
+  state_preprocessor_kwargs: null
+  shared_state_preprocessor: RunningStandardScaler  # 全局 state 标准化（Critic 输入）
+  shared_state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler         # 价值估计标准化（减少梯度爆炸）
+  value_preprocessor_kwargs: null
+
+  # ===== 训练开始设置 =====
+  random_timesteps: 0     # 0 = 立即使用策略（不预填充随机数据）
+  learning_starts: 0      # 0 = 第一批 rollout 后立即开始更新
+
+  # ===== 梯度裁剪和截断 =====
+  grad_norm_clip: 1.0     # 梯度范数截断（防止梯度爆炸）
+  ratio_clip: 0.1         # PPO clip epsilon：限制策略更新幅度（较小=更保守）
+  value_clip: 0.1         # Critic 价值截断（防止价值更新过大）
+  clip_predicted_values: True  # 对新旧价值的差值也做截断
+
+  # ===== 损失系数 =====
+  entropy_loss_scale: 0.001   # 熵正则化权重（鼓励探索）；move 任务已收敛故较小
+  value_loss_scale: 1.0       # Critic 损失权重（与 Actor 损失的相对比例）
+  kl_threshold: 0.0           # 0 = 不使用 KL 散度早停
+
+# rewards_shaper_scale: 1.0  # 奖励缩放（已注释，由环境直接输出合适尺度）
+
+  time_limit_bootstrap: True   # episode 超时时做 bootstrap（而非视为终止）
+                                # 确保 GAE 在超时截断时使用正确的价值估计
+
+  experiment:
+    directory: "move"           # 日志保存目录：logs/skrl/move/
+    experiment_name: "mappo"   # 实验名称（用于区分不同超参数运行）
+    write_interval: 100         # 每 100 步写一次 tensorboard 日志
+    checkpoint_interval: 5000  # 每 5000 步保存一次模型检查点
+
+trainer:
+  class: SequentialTrainer     # 串行 trainer（对应单 GPU 标准训练）
+  timesteps: 400000            # 总训练步数（4e5，约 4000 个 rollout）
+  environment_info: log        # 将 extras["log"] 中的内容写入 tensorboard
