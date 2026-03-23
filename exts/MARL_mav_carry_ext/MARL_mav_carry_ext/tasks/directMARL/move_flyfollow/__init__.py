@@ -17,7 +17,7 @@ gym.register(
     entry_point=f"{__name__}.marl_move_flyfollow_env:MARLMoveEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.marl_move_env_cfg:MARLMoveEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.marl_move_flyfollow_env_cfg:MARLMoveEnvCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
         "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
     },

@@ -4,3 +4,4 @@ from .hover_flypent import *
 from .flyfollow import *
 from .river_flyfollow import *
 from .move import *
+from .move_flyfollow import *
