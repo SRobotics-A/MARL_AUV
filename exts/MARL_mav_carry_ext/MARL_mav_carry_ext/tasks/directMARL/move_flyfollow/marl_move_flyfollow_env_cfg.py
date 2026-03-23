@@ -192,7 +192,6 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     def __post_init__(self):
         """根据 possible_agents 动态填充动作/观测空间字典。"""
-        super().__post_init__()
         obs_dim = self.obs_dim_per_step * self.history_len if self.partial_obs else self.obs_dim_per_step
         self.action_spaces = {agent: self.action_dim for agent in self.possible_agents}
         self.observation_spaces = {agent: obs_dim for agent in self.possible_agents}
