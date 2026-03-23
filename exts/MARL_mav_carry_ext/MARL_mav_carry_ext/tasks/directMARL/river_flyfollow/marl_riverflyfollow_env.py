@@ -157,10 +157,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.target_captured_by = torch.full(
             (self.num_envs, self._num_targets), -1, dtype=torch.long, device=self.device
         )
-        self._target_assignment = torch.full(
-            (self.num_envs, self._num_targets), -1, dtype=torch.long, device=self.device
-        )  # 目标分配给哪个无人机（固定 per-episode，用于观测）
-
         # 目标沿x轴匀速移动
         self._target_velocities[..., 0] = cfg.target_speed
 
@@ -208,6 +204,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self.all_targets_captured = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         # 持续跟随计时器（per-env，与 move 对齐：暂停而非归零）
         self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
+        self.targets_out_of_bounds = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.time_out = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # 归一化配置参数
@@ -217,62 +214,11 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         self._norm_ang_vel_scale = 10.0
         self._norm_target_value_scale = torch.clamp(self._target_values.max(), min=1.0)
 
-        # 每个 episode 固定的 target assignment（每架无人机一个目标）
-        self._assigned_target_idx = torch.zeros(
-            (self.num_envs, self._num_drones), dtype=torch.long, device=self.device
-        )
-
         # 初始化目标位置
         self._reset_targets(torch.arange(self.num_envs, device=self.device))
 
         # 调试可视化设置
         self.set_debug_vis(cfg.debug_vis)
-
-    def _assign_targets_for_envs(self, env_ids: torch.Tensor) -> None:
-        """为指定环境固定每架无人机的目标，保持一个 episode 内不变。
-
-        分配策略（价值优先贪心）：
-        1. 按目标价值降序取前 num_drones 个高价值目标作为候选（低价值目标自动排除）
-        2. 在候选目标内做贪心最近距离匹配：每轮选距离最近的（无人机, 候选目标）对完成配对
-        效果：3架无人机自动追踪价值最高的3个目标，最低价值目标不参与分配。
-        结果写入 _assigned_target_idx[env_id, drone_idx] = target_idx。
-        """
-        if env_ids.numel() == 0:
-            return
-
-        # 按价值降序取前 num_drones 个目标索引（固定，全批次共用）
-        priority_targets = torch.argsort(self._target_values, descending=True)[: self._num_drones].tolist()
-
-        drone_pos_xy = self.drone_positions[env_ids, :, :2]
-        target_pos_xy = self._target_positions[env_ids, :, :2]
-
-        self._assigned_target_idx[env_ids] = priority_targets[0]  # 默认指向最高价值目标
-        self._target_assignment[env_ids] = -1
-
-        for local_env_idx, env_id in enumerate(env_ids.tolist()):
-            dist = torch.norm(
-                target_pos_xy[local_env_idx].unsqueeze(0) - drone_pos_xy[local_env_idx].unsqueeze(1),
-                dim=-1,
-            )  # (D, T)
-            free_drones = set(range(self._num_drones))
-            free_targets = set(priority_targets)  # 只在高价值候选目标中匹配
-
-            # 贪心最近距离匹配（在高价值候选集内）
-            while free_drones and free_targets:
-                best_pair = None
-                best_dist = None
-                for drone_idx in free_drones:
-                    for target_idx in free_targets:
-                        d = float(dist[drone_idx, target_idx].item())
-                        if best_dist is None or d < best_dist:
-                            best_dist = d
-                            best_pair = (drone_idx, target_idx)
-
-                drone_idx, target_idx = best_pair
-                self._assigned_target_idx[env_id, drone_idx] = target_idx
-                self._target_assignment[env_id, target_idx] = drone_idx
-                free_drones.remove(drone_idx)
-                free_targets.remove(target_idx)
 
     def _setup_scene(self):
         """设置场景：在悬停环境基础上添加跟随任务特有的元素"""
@@ -472,6 +418,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
 
         # 解析每个无人机动作
         for drone, action in actions.items():
+            action = torch.clamp(action, -1.0, 1.0)  # 防止极端动作值
             if self._control_mode == "geometric":
                 # 几何控制模式：12维动作 [pos, lin_vel, lin_acc, jerk]
                 self._setpoints[drone]["pos"] = action[:, :3]
@@ -660,10 +607,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.num_envs, self._num_targets, self._num_drones, device=self.device
         )
         closest_drone_one_hot.scatter_(2, closest_drone.unsqueeze(-1), 1.0)
-        assigned_target_one_hot = torch.zeros(
-            self.num_envs, self._num_drones, self._num_targets, device=self.device
-        )
-        assigned_target_one_hot.scatter_(2, self._assigned_target_idx.unsqueeze(-1), 1.0)
 
         # 统一归一化连续物理量，降低不同量纲对策略学习的干扰
         drone_pos_xy_norm = drone_pos_xy / self._norm_pos_scale
@@ -712,7 +655,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                     target_vel_xy_norm.reshape(self.num_envs, -1),  # 目标速度XY(2*num_targets维)
                     closest_drone_one_hot.reshape(self.num_envs, -1),  # 最近无人机one-hot(num_targets*num_drones维)
                     target_values_norm,         # 目标价值(num_targets维)
-                    assigned_target_one_hot[:, drone_idx],  # 固定分配目标one-hot(num_targets维)
                 ),
                 dim=-1,
             )
@@ -743,10 +685,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         target_positions_norm = self._target_positions / self._norm_pos_scale
         target_velocities_norm = self._target_velocities / self._norm_vel_scale
         target_values_norm = self._target_values.unsqueeze(0).repeat(self.num_envs, 1) / self._norm_target_value_scale
-        assigned_target_one_hot = torch.zeros(
-            self.num_envs, self._num_drones, self._num_targets, device=self.device
-        )
-        assigned_target_one_hot.scatter_(2, self._assigned_target_idx.unsqueeze(-1), 1.0)
 
         states = torch.cat(
             (
@@ -758,7 +696,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 target_velocities_norm.view(self.num_envs, -1),  # 目标速度 (12)
                 self.target_captured.float().view(self.num_envs, -1),  # 捕获状态 (4)
                 target_values_norm,  # 目标价值 (4)
-                assigned_target_one_hot.view(self.num_envs, -1),  # 固定分配关系 (num_drones*num_targets)
             ),
             dim=-1,
         )
@@ -1058,8 +995,20 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         dd.masked_fill_(eye_mask, float("inf"))
         drone_collision = (dd < self.cfg.drone_collision_threshold).any(dim=-1).any(dim=-1)  # (E,)
 
-        # 综合终止条件（与 move 对齐，成功不终止 episode）
-        terminations = falcon_fly_low | falcon_fly_high | body_pos_outside | drone_collision | self.illegal_contact
+        # 目标越界终止（与 move 对齐）
+        self.targets_out_of_bounds = (
+            self._target_positions[:, :, 0] > self.cfg.target_end_x
+        ).any(dim=-1)
+
+        # 综合终止条件（成功不终止 episode，与 move 对齐）
+        terminations = (
+            falcon_fly_low
+            | falcon_fly_high
+            | body_pos_outside
+            | drone_collision
+            | self.illegal_contact
+            | self.targets_out_of_bounds
+        )
         timed_outs = self.time_out
 
         # 调试日志
@@ -1132,11 +1081,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 重置目标状态
         self._reset_targets(env_ids)
 
-        # 在 reset 后基于当前初始几何关系固定 assignment
-        for i, robot in enumerate(self.robots):
-            root_state = robot.data.root_state_w
-            self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
-        self._assign_targets_for_envs(env_ids)
         self._sustained_follow_timer[env_ids] = 0.0
         self.target_captured[env_ids] = False
         self.target_captured_by[env_ids] = -1
@@ -1171,6 +1115,9 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         log["Episode_Termination/sustained_success"] = torch.count_nonzero(
             self.all_targets_captured[env_ids]
         ).item()
+        log["Episode_Termination/targets_out_of_bounds"] = torch.count_nonzero(
+            self.targets_out_of_bounds[env_ids]
+        ).item()
         log["Episode_Termination/time_out"] = torch.count_nonzero(self.time_out[env_ids]).item()
 
         # 奖励成分平均值
@@ -1200,8 +1147,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self._target_positions[env_ids, :, 2] = 0.0  # z坐标为0（地面高度）
 
         # 重置目标状态
-        self.target_captured[env_ids] = False      # 未被捕获
-        self._target_assignment[env_ids] = -1      # 未分配
+        self.target_captured[env_ids] = False
 
         # 将目标位置写入场景（XFormPrim可视化）
         # 注意：仅 env_0 有可视化 prim，因此只在 env_0 被重置时更新可视化

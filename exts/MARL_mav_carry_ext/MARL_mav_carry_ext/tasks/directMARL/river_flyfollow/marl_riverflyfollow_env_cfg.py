@@ -230,7 +230,6 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
             + (self.num_targets * 2)                      # target velocities xy
             + (self.num_targets * self.num_drones)        # closest drone one-hot for each target
             + self.num_targets                            # target values
-            + self.num_targets                            # assigned target one-hot
         )
 
         if self.control_mode == "geometric":
@@ -256,5 +255,4 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
             + self.num_targets * 3        # target velocities
             + self.num_targets            # target claimed (bool)
             + self.num_targets            # target values
-            + self.num_drones * self.num_targets  # assigned target one-hot
         )
