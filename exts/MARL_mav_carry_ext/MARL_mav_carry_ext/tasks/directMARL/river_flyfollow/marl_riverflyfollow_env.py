@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from collections.abc import Sequence
 from pathlib import Path
@@ -54,7 +53,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             **kwargs: 其他参数
         """
         super().__init__(cfg, render_mode, **kwargs)
-        print("[river_flyfollow] reward version: assigned-target-priority-v1")
 
         # 多无人机与控制模式配置
         self._num_drones = cfg.num_drones
@@ -125,7 +123,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.geo_controllers[i] = GeometricController(self.num_envs, self._control_mode)
         self._ll_counter = 0                                                      # 低层控制计数器
         self._constant_yaw = torch.zeros([self.num_envs, 1], device=self.device)  # 恒定偏航角
-        self._zeros = torch.zeros([self.num_envs, 3], device=self.device)         # 零向量
 
         # 内环控制器（INDI增量式控制器）
         self._indi_controllers = {}
@@ -191,16 +188,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 "illegal_contact",       # 接触传感器：非法碰撞（障碍物/地面）
             ]
         }
-
-        # 性能指标
-        self.metrics = {}
-        self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["orientation_error"] = torch.zeros(
-            self.num_envs, device=self.device
-        )
-        # 临时调试：奖励 batch mean 打印
-        self._reward_debug_print_interval = 500
-        self._reward_debug_counter = 0
 
         # ── 终止条件缓冲区 ────────────────────────────────────────────────────
         # 每个 bool 张量形状均为 (num_envs,)，在 _get_dones() 中更新，
@@ -505,20 +492,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 commanded_acc = torch.clamp(commanded_acc, -self.cfg.lin_acc_max, self.cfg.lin_acc_max)
                 self._setpoints[drone]["lin_acc"] = commanded_acc
                 self._setpoints[drone]["body_rates"] = action[:, 3:6] * self.cfg.ang_vel_max
-                if (
-                    drone_idx_ap == 0
-                    and self._reward_debug_counter % self._reward_debug_print_interval == 0
-                    and self.num_envs > 0
-                ):
-                    print(
-                        "[river_flyfollow][z-ctrl]",
-                        "z=", self.drone_positions[0, :, 2].detach().cpu().tolist(),
-                        "vz=", self.drone_linear_velocities[0, :, 2].detach().cpu().tolist(),
-                        "des_vz=", desired_vel[0, 2].item(),
-                        "err_z=", vel_error[0, 2].item(),
-                        "d_err_z=", d_error[0, 2].item(),
-                        "cmd_az=", commanded_acc[0, 2].item(),
-                    )
 
             # 维持恒定偏航角设定
             self._setpoints[drone]["yaw"] = self._constant_yaw
@@ -664,8 +637,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         for i, robot in enumerate(self.robots):
             root_state = robot.data.root_state_w
             self.drone_positions[:, i] = root_state[:, :3] - self.scene.env_origins
-            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
-            self.drone_linear_velocities[:, i] = root_state[:, 7:10]
             self.drone_orientations[:, i] = root_state[:, 3:7]
             self.drone_linear_velocities[:, i] = root_state[:, 7:10]
             self.drone_angular_velocities[:, i] = root_state[:, 10:13]
@@ -749,18 +720,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             # 存入观测缓冲区并返回展平后的观测
             self._observation_buffers[agent].append(obs_t)
             observations[agent] = self._observation_buffers[agent].buffer.reshape(self.num_envs, -1)
-
-        if self._reward_debug_counter % self._reward_debug_print_interval == 0 and self.num_envs > 0:
-            z = self.drone_positions[0, :, 2]
-            vz = self.drone_linear_velocities[0, :, 2]
-            print(
-                "[river_flyfollow][obs-alt]",
-                "z=", z.detach().cpu().tolist(),
-                "vz=", vz.detach().cpu().tolist(),
-                "z_norm=", (z / 5.0).detach().cpu().tolist(),
-                "soft_margin=", (z - self.cfg.altitude_upper_soft_threshold).detach().cpu().tolist(),
-                "to_max=", (self.cfg.max_altitude - z).detach().cpu().tolist(),
-            )
 
         return observations
 
@@ -1037,19 +996,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             - safety_penalty
         ) * step_dt + (collision_penalty_r + drone_out_r + fly_low_r + illegal_contact_r)
 
-        if self._reward_debug_counter % self._reward_debug_print_interval == 0 and self.num_envs > 0:
-            print(
-                "[river_flyfollow][reward]",
-                "dist=", distance_reward[0].item(),
-                "track=", tracking_reward[0].item(),
-                "vel_follow=", velocity_follow_reward[0].item(),
-                "high_alt=", high_alt_penalty[0].mean().item(),
-                "up_vz=", upward_vz_penalty[0].mean().item(),
-                "safety=", safety_penalty[0].item(),
-                "total=", total_reward[0].item(),
-            )
-        self._reward_debug_counter += 1
-
         # =========================
         # 15) 日志
         # =========================
@@ -1089,16 +1035,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # 时间超时
         self.time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        assigned_target_pos_xy = torch.gather(
-            self._target_positions[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
-            2,
-            self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
-        ).squeeze(2)
-        assigned_target_vel_xy = torch.gather(
-            self._target_velocities[:, :, :2].unsqueeze(1).expand(-1, self._num_drones, -1, -1),
-            2,
-            self._assigned_target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2),
-        ).squeeze(2)
         # 非法接触终止（contact sensor，与 move 对齐）
         self.illegal_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         for cs in self.contact_sensors:
@@ -1311,20 +1247,3 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             prim.set_world_poses(positions=pos, orientations=ori)
 
 
-# JIT编译的辅助函数
-@torch.jit.script
-def scale(x, lower, upper):
-    """将[-1,1]范围的值缩放到[lower, upper]范围"""
-    return 0.5 * (x + 1.0) * (upper - lower) + lower
-
-@torch.jit.script
-def unscale(x, lower, upper):
-    """将[lower, upper]范围的值反缩放到[-1,1]范围"""
-    return (2.0 * x - upper - lower) / (upper - lower)
-
-@torch.jit.script
-def randomize_rotation(rand0, rand1, x_unit_tensor, y_unit_tensor):
-    """随机化旋转：通过两个轴的旋转组合生成随机旋转"""
-    return quat_mul(
-        quat_from_angle_axis(rand0 * np.pi, x_unit_tensor), quat_from_angle_axis(rand1 * np.pi, y_unit_tensor)
-    )
