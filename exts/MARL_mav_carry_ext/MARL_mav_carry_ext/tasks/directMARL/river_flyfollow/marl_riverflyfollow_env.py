@@ -21,6 +21,7 @@ from isaacsim.core.prims import XFormPrim
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.sensors import ContactSensor
+from isaaclab.sim import schemas as sim_schemas
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from pxr import UsdPhysics
 from isaaclab.utils import CircularBuffer
@@ -53,6 +54,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             **kwargs: 其他参数
         """
         super().__init__(cfg, render_mode, **kwargs)
+        print("[river_flyfollow] reward version: assigned-target-priority-v1")
 
         # 多无人机与控制模式配置
         self._num_drones = cfg.num_drones
@@ -393,6 +395,7 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # spawn=None：不重新生成 prim，而是绑定到 USD 中已有的 ArticulationRoot prim
         # robot_cfg.prim_path 使用 env_.* 通配符，Isaac Lab 会自动映射到所有并行环境
         self.robots = []
+        self.contact_sensors = []
         self._usd_root_state_rel = torch.zeros(
             len(self.cfg.possible_agents), 7, device=self.device
         )  # 缓存每架无人机在 env_0 中的初始位姿（相对 env_origin），用于 reset 时恢复
@@ -418,6 +421,17 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             self.robots.append(robot)
             self.scene.articulations[f"robot_{i}"] = robot  # 注册到 scene，确保物理更新
 
+            # 现有 USD 资产使用 spawn=None 绑定，不会自动传播 activate_contact_sensors。
+            # 因此需要显式给每个并行环境下的对应无人机子树补开 PhysX contact reporter API。
+            for env_id in range(self.num_envs):
+                env_agent_prim = env0_agent_prim.replace("/env_0", f"/env_{env_id}", 1)
+                sim_schemas.activate_contact_sensors(env_agent_prim, threshold=self.cfg.contact_sensor_threshold)
+
+            contact_cfg = self.cfg.contact_forces.replace(prim_path=f"{env_agent_prim_pattern}/.*")
+            contact = ContactSensor(contact_cfg)
+            self.contact_sensors.append(contact)
+            self.scene.sensors[f"contact_forces_{i}"] = contact
+
             # 缓存 USD 初始位姿（相对于 env_0 原点），reset 时用于 usd_fixed/usd_perturbed 模式
             try:
                 prim = XFormPrim(env0_agent_prim)
@@ -430,11 +444,6 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
         # scene.articulations["robot"] 需指向至少一个机器人，用于 contact sensor 等基础接口
         if self.robots:
             self.scene.articulations["robot"] = self.robots[0]
-
-        # ── 5b. 创建接触传感器（单传感器覆盖全部无人机子 prim，与 move 对齐）──────
-        contact = ContactSensor(self.cfg.contact_forces)
-        self.contact_sensors = [contact]
-        self.scene.sensors["contact_forces"] = contact
 
         # ── 6. 添加环境光照 ──────────────────────────────────────────────────
         # USD 内已有 DistantLight，此处再添加 DomeLight 补充环境亮度
@@ -496,6 +505,20 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
                 commanded_acc = torch.clamp(commanded_acc, -self.cfg.lin_acc_max, self.cfg.lin_acc_max)
                 self._setpoints[drone]["lin_acc"] = commanded_acc
                 self._setpoints[drone]["body_rates"] = action[:, 3:6] * self.cfg.ang_vel_max
+                if (
+                    drone_idx_ap == 0
+                    and self._reward_debug_counter % self._reward_debug_print_interval == 0
+                    and self.num_envs > 0
+                ):
+                    print(
+                        "[river_flyfollow][z-ctrl]",
+                        "z=", self.drone_positions[0, :, 2].detach().cpu().tolist(),
+                        "vz=", self.drone_linear_velocities[0, :, 2].detach().cpu().tolist(),
+                        "des_vz=", desired_vel[0, 2].item(),
+                        "err_z=", vel_error[0, 2].item(),
+                        "d_err_z=", d_error[0, 2].item(),
+                        "cmd_az=", commanded_acc[0, 2].item(),
+                    )
 
             # 维持恒定偏航角设定
             self._setpoints[drone]["yaw"] = self._constant_yaw
@@ -726,6 +749,18 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             # 存入观测缓冲区并返回展平后的观测
             self._observation_buffers[agent].append(obs_t)
             observations[agent] = self._observation_buffers[agent].buffer.reshape(self.num_envs, -1)
+
+        if self._reward_debug_counter % self._reward_debug_print_interval == 0 and self.num_envs > 0:
+            z = self.drone_positions[0, :, 2]
+            vz = self.drone_linear_velocities[0, :, 2]
+            print(
+                "[river_flyfollow][obs-alt]",
+                "z=", z.detach().cpu().tolist(),
+                "vz=", vz.detach().cpu().tolist(),
+                "z_norm=", (z / 5.0).detach().cpu().tolist(),
+                "soft_margin=", (z - self.cfg.altitude_upper_soft_threshold).detach().cpu().tolist(),
+                "to_max=", (self.cfg.max_altitude - z).detach().cpu().tolist(),
+            )
 
         return observations
 
@@ -1001,6 +1036,19 @@ class MARLRiverFlyFollowEnv(DirectMARLEnv):
             + upright_penalty
             - safety_penalty
         ) * step_dt + (collision_penalty_r + drone_out_r + fly_low_r + illegal_contact_r)
+
+        if self._reward_debug_counter % self._reward_debug_print_interval == 0 and self.num_envs > 0:
+            print(
+                "[river_flyfollow][reward]",
+                "dist=", distance_reward[0].item(),
+                "track=", tracking_reward[0].item(),
+                "vel_follow=", velocity_follow_reward[0].item(),
+                "high_alt=", high_alt_penalty[0].mean().item(),
+                "up_vz=", upward_vz_penalty[0].mean().item(),
+                "safety=", safety_penalty[0].item(),
+                "total=", total_reward[0].item(),
+            )
+        self._reward_debug_counter += 1
 
         # =========================
         # 15) 日志

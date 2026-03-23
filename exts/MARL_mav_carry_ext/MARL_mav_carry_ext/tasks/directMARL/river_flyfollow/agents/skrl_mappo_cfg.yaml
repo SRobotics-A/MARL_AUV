@@ -76,5 +76,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 2000000          # 从 400000 增至 2000000：river_flyfollow 任务更复杂
+  timesteps: 400000          # 从 400000 增至 2000000：river_flyfollow 任务更复杂
   environment_info: log

@@ -152,11 +152,11 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     height_error_quadratic_weight = 0.0                 # 关闭高度二次惩罚
     height_hold_deadband = 0.10                         # 保留参数（已不生效）
     vertical_direction_penalty_weight = 0.0             # 关闭方向性垂直速度惩罚（不需要定高）
-    upward_vz_penalty_weight: float = 0.45             # 上升速度惩罚基础权重：持续爬升会更明显吃亏
-    upward_vz_penalty_altitude_start: float = 3.0      # 高于该高度后，上升速度惩罚开始随高度继续增强
+    upward_vz_penalty_weight: float = 1.2              # 上升速度惩罚基础权重：更早压制高速冲高
+    upward_vz_penalty_altitude_start: float = 1.5      # 高于该高度后，上升速度惩罚开始随高度继续增强
     upward_vz_penalty_altitude_scale: float = 1.0      # 高度增强系数：每高于起点1m，惩罚系数额外增加1.0
-    upward_acc_z_alt_lo: float = 2.5                   # 正向 az 限幅起点高度（m）：低于此值 cap=1.0 不限制
-    upward_acc_z_alt_hi: float = 3.5                   # 正向 az 限幅饱和高度（m）：高于此值 cap=az_min_scale
+    upward_acc_z_alt_lo: float = 1.5                   # 正向 az 限幅起点高度（m）：更早限制继续上冲
+    upward_acc_z_alt_hi: float = 2.3                   # 正向 az 限幅饱和高度（m）：在中低空就基本禁止继续上冲
     upward_acc_z_min_scale: float = 0.02               # 饱和高度处正向 az 最小缩放比例（几乎禁止继续上升）
     safety_penalty_weight = 1.0                         # 安全惩罚权重
 
@@ -179,7 +179,7 @@ class MARLRiverFlyFollowEnvCfg(DirectMARLEnvCfg):
     contact_sensor_threshold = 1.0  # N，低于此值忽略（与 move 一致）
 
     # ACCBR 速度指令 + PD 控制参数（与 move.ACCBR 对齐）
-    lin_vel_max: float = 3.0    # 速度指令最大值（m/s），action[:, :3] 缩放到 ±lin_vel_max
+    lin_vel_max: float = 2.5    # 速度指令最大值（m/s），适度压低整体机动强度
     ang_vel_max: float = 3.0    # 角速度指令最大值（rad/s）
     lin_acc_max: float = 5.0    # 加速度饱和限幅（m/s²）
     vel_Kp: float = 3.0         # 速度 PD 比例增益
