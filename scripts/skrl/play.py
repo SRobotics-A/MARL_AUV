@@ -282,7 +282,8 @@ def main():
             
             # 处理多智能体动作（确定性动作）
             if hasattr(env, "possible_agents"):
-                actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
+                # actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
+                actions = outputs[0]
             # 处理单智能体动作（确定性动作）
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])

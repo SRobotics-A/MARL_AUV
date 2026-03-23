@@ -55,7 +55,7 @@ class DirectMARLPlotter:
         # 环境相关属性
         self.control_mode = control_mode  # 控制模式
         self.env = env                    # 环境实例
-        self.robot = env.scene[asset_cfg.name]  # 机器人实体
+        self.robot = self._resolve_robot_asset(env, asset_cfg.name)  # 机器人实体
         # 负载ID（若环境不含负载则为None）
         self.load_id = None
         try:
@@ -74,6 +74,20 @@ class DirectMARLPlotter:
         self.metrics: dict = {}           # 训练指标数据
         self.load_data: dict = {}         # 负载状态数据
         self.drone_data_by_id: dict = {}  # 按无人机ID分类的数据
+
+    @staticmethod
+    def _resolve_robot_asset(env: DirectMARLEnv, asset_name: str):
+        """Resolve the robot asset for both single-robot and multi-robot DirectMARL scenes."""
+        try:
+            return env.scene[asset_name]
+        except KeyError:
+            articulation_names = []
+            if hasattr(env.scene, "articulations"):
+                articulation_names = list(env.scene.articulations.keys())
+            fallback_name = next((name for name in articulation_names if name.startswith(f"{asset_name}_")), None)
+            if fallback_name is None:
+                raise
+            return env.scene[fallback_name]
 
     def collect_metrics(self):
         """
