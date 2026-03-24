@@ -258,6 +258,10 @@ class MARLMoveEnv(DirectMARLEnv):
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self.time_out = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        # falcon_fly_high：任一无人机超过 fly_high_termination_z（高飞终止）
+        self.falcon_fly_high = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
 
         # ===== 观测归一化参数（目前依赖 RunningStandardScaler，仅备用）=====
         self._norm_pos_scale = self.cfg.bounding_box_threshold
@@ -944,6 +948,16 @@ class MARLMoveEnv(DirectMARLEnv):
         fly_low = (self.drone_positions[:, :, 2] < 0.1).any(dim=-1)
         rewards["fly_low"] = -fly_low.float() * self.cfg.fly_low_penalty
 
+        # --- 9.5 高飞软惩罚（超过 fly_high_threshold 后每步惩罚，防止高飞局部最优）---
+        # [Fix-B] exp(z - threshold) - 1：高度越高惩罚越大，threshold 以下惩罚为0
+        excess_z = (
+            self.drone_positions[:, :, 2] - self.cfg.fly_high_threshold
+        ).clamp(min=0.0)  # (N, D)
+        fly_high_soft = (torch.exp(excess_z) - 1.0).sum(dim=-1)  # (N,)
+        rewards["fly_high_penalty"] = (
+            -self.cfg.fly_high_penalty_weight * fly_high_soft * step_dt
+        )
+
         # --- 10. 非法接触惩罚（接触传感器读取）---
         # 遍历所有无人机的接触传感器，检测是否有接触力超过阈值
         illegal_any = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1027,9 +1041,16 @@ class MARLMoveEnv(DirectMARLEnv):
             self.target_positions[:, :, 0] > self.cfg.target_end_x
         ).any(dim=-1)
 
+        # --- 条件6：高飞终止（z > fly_high_termination_z，避免高飞浪费训练时间）---
+        # [Fix-C] 任意无人机超过终止高度即触发，强制 episode 重置
+        self.falcon_fly_high = (
+            self.drone_positions[:, :, 2] > self.cfg.fly_high_termination_z
+        ).any(dim=-1)
+
         # --- 组合所有终止条件（任一触发即终止）---
         terminations = (
             self.falcon_fly_low
+            | self.falcon_fly_high
             | self.illegal_contact
             | self.drone_collision
             | self.body_pos_outside
@@ -1045,6 +1066,10 @@ class MARLMoveEnv(DirectMARLEnv):
                 if self.falcon_fly_low[idx]:
                     reasons.append(
                         f"Fly Low (z={self.drone_positions[idx, :, 2].min():.2f})"
+                    )
+                if self.falcon_fly_high[idx]:
+                    reasons.append(
+                        f"Fly High (z={self.drone_positions[idx, :, 2].max():.2f} > {self.cfg.fly_high_termination_z})"
                     )
                 if self.illegal_contact[idx]:
                     reasons.append("Illegal Contact")
@@ -1135,6 +1160,9 @@ class MARLMoveEnv(DirectMARLEnv):
         ).item()
         self.extras["log"]["Episode_Termination/falcon_fly_low"] = torch.count_nonzero(
             self.falcon_fly_low[env_ids]
+        ).item()
+        self.extras["log"]["Episode_Termination/falcon_fly_high"] = torch.count_nonzero(
+            self.falcon_fly_high[env_ids]
         ).item()
         self.extras["log"]["Episode_Termination/crash"] = torch.count_nonzero(
             self.falcon_fly_low[env_ids] | self.illegal_contact[env_ids]
