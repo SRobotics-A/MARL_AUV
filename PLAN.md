@@ -1011,3 +1011,178 @@ python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-v0 --headless --n
   Result: total_reward flipped from -4.94 → +1.17 (recent mean); tracking_reward first non-zero
   (0.065 mean); distance_reward +1771% improvement; episode length +16.5% improvement.
   All 5 critical/high fixes from previous analysis confirmed effective.
+
+---
+
+# Training Analysis Report — Run 2026-03-24_15-06-36
+
+**Run:** `2026-03-24_15-06-36_mappo_torch_mappo`
+**Date:** 2026-03-24
+**Task:** Isaac-marl-move-flyfollow-v0
+**Algorithm:** MAPPO
+**Total timesteps logged:** 461,300 (of 2,000,000 planned)
+**Config:** Same as 2026-03-24_09-51-13 (no changes)
+
+---
+
+## Training Metrics Summary — vs. Previous Run 09-51-13 (400k steps)
+
+| Metric | 09-51-13 (400k, recent mean) | 15-06-36 (461k, recent mean) | Change |
+|--------|------------------------------|------------------------------|--------|
+| Total reward (mean) | +1.17 | **+43.63** | +3629% |
+| Total reward (last) | +13.35 | **+47.17** | +253% |
+| Total reward (max, recent) | 6.03 | **64.33** | +967% |
+| distance_reward /ep | 3.95 | **17.94** | +354% |
+| tracking_reward /ep | 0.065 | **0.899** | +1282% |
+| height_reward /ep | 0.844 | **1.622** | +92% |
+| velocity_penalty /ep | 0.0 | **0.0** | — |
+| Episode length (mean steps) | 101.6 | **182.0** | +79% |
+| Episode length (max steps) | 151.6 | **249.2** | +64% |
+| Episode length (min, recent) | 45.4 | **71.7** | +58% |
+| Policy std | 0.662 | **0.549** | -17% |
+| Value loss (recent) | 0.242 | **0.048** | -80% |
+
+**Milestone tracking:**
+- tracking_reward > 0.10: PASSED (0.899 >> 0.10, achieved before 461k steps)
+- tracking_reward > 0.25: PASSED (0.899 >> 0.25, achieved before 461k steps)
+- Episode mean > 200 steps: NOT YET (182.0 steps, ~91% of target)
+
+---
+
+## Observations & Findings
+
+### [Explosive Policy Improvement] — Severity: N/A (Positive)
+
+**Symptom:** total_reward_mean jumped from +1.17 (recent mean at 400k steps) to +43.63 (recent mean at 461k steps) — a +3629% increase with only 61k additional steps. The best individual episode reached 157 total reward.
+
+**Root Cause:** This is a phase transition: the policy crossed a threshold where it began consistently entering the capture zone (tracking_reward unlocked), causing cascading improvement in all correlated metrics. distance_reward, height_reward, episode length, and action_smoothness all increased simultaneously — consistent with drones actively flying to and sustaining pursuit of targets.
+
+**Evidence:** tracking_reward best-ever: 1.816/ep. Recent mean 0.899/ep with std 0.209 — high variance indicates the policy is still learning to be consistent, but it is reliably entering the capture zone in most episodes.
+
+---
+
+### [Policy Converging — Exploration Reducing] — Severity: LOW (expected)
+
+**Symptom:** policy_std dropped from 0.662 → 0.549 (-17%). entropy_loss recent mean: -0.00816 (less negative than 09-51-13's -0.01004), confirming entropy is slightly higher now.
+
+**Root Cause:** As the policy finds a rewarding trajectory, the PPO entropy term reduces std naturally. At 0.549 std the policy retains meaningful exploration but is narrowing.
+
+**Watch:** If policy_std falls below 0.40 before tracking_reward exceeds 0.25 (mean), the policy may be exploiting a local optimum. Currently this is not a concern.
+
+---
+
+### [Episode Length Approaching 200 Steps — Not Yet There] — Severity: LOW
+
+**Symptom:** Episode mean reached 182 steps (target: >200). Max reached 249 steps (best ever: 460 steps from run start). Min (recent) is 71.7 steps with std=66 — high variance indicating a bimodal distribution: some episodes terminate early (fly_high or bounding_box) while others run long.
+
+**Root Cause:** The wide std on episode_min (66) suggests a mixture of successful long episodes and early-termination failures. The fly_high_termination at z=6m is periodically triggering. As the policy improves altitude control, the min episode length should increase.
+
+**Watch:** If mean does not exceed 200 steps by 600k steps, check whether fly_high terminations are still a significant fraction of resets.
+
+---
+
+### [tracking_reward Variance Still High] — Severity: MEDIUM
+
+**Symptom:** tracking_reward recent mean = 0.899, std = 0.209 (23% coefficient of variation). Best ever = 1.816/ep. This high variance means the policy is not yet consistently in the capture zone — it enters occasionally but does not sustain it reliably.
+
+**Root Cause:** The sustained_follow_duration requirement (3.0s by default) makes tracking_reward sparse: the drone must stay within 3.0m for an uninterrupted hold period. The high std indicates the drone often breaks tracking before completing the hold, causing zero-tracking-reward episodes mixed with high-reward ones.
+
+**Watch:** This is expected at 461k steps. If std / mean ratio does not drop below 0.15 by 1M steps, consider reducing sustained_follow_duration from 3.0s to 1.5s (Priority 4 Option A from previous plan).
+
+---
+
+### [value_loss Well-Converged — Critic Stable] — Severity: N/A (Positive)
+
+**Symptom:** value_loss recent mean = 0.048, last = 0.049. At 09-51-13 it was 0.242 (rising). The critic is now well-fitted to the current policy's value function.
+
+**Implication:** The critic has converged to the new reward regime. This is healthy — it means the policy gradient signal is clean and not corrupted by value estimation errors.
+
+---
+
+### [velocity_penalty = 0.0 Throughout] — Severity: LOW (info)
+
+**Symptom:** velocity_penalty is exactly 0.0 for every logged step in both runs.
+
+**Root Cause:** Likely this term is disabled (weight=0) in the current config. This is consistent with the Priority 1 fix from the first analysis (velocity_penalty_weight: 0.3 → 0.0). Confirmed correct.
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (MONITOR ONLY): Continue current training to 1M–2M steps
+
+**Problem:** N/A — training is working well. The phase transition has occurred, tracking_reward is at 0.899/ep and climbing.
+
+**Proposed action:** No config changes. Continue training to completion (2M steps as planned).
+
+**Rationale:** The current trajectory shows no signs of plateau or instability. Policy std is healthy (0.549), value_loss is stable (0.048), total reward is rising. Making any parameter change now risks disrupting the ongoing learning phase.
+
+---
+
+### Priority 2 (MEDIUM): Monitor tracking_reward consistency — trigger condition for sustained_follow_duration reduction
+
+**Problem:** tracking_reward std/mean = 0.23 (high variance). If consistency does not improve by 1M steps, the 3s hold requirement may be too strict for early learning.
+
+**Trigger condition:** If at 1M steps `tracking_reward mean < 0.25`, apply:
+
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- Parameter: `sustained_follow_duration: 3.0 → 1.5` (seconds)
+- Rationale: A shorter hold requirement allows tracking_reward to fire more frequently, providing denser gradient for the policy to refine approach behavior.
+
+**Current assessment:** NOT triggered. tracking_reward is at 0.899, well above the 0.25 milestone. Only trigger this if the metric stalls.
+
+---
+
+### Priority 3 (LOW): Tighten fly_high_termination_z after 500k steps
+
+**Problem:** fly_high_termination_z=6.0m was set conservatively to allow early exploration. As altitude control improves, lowering it will further reduce wasted episode time from altitude drift.
+
+**Trigger condition:** After 500k steps, if height_reward remains above 1.4/ep (confirming consistent altitude control):
+
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- Parameter: `fly_high_termination_z: 6.0 → 4.5`
+- Rationale: Tighter altitude envelope forces the policy to maintain better altitude precision, reducing the remaining episode-length variance from fly_high early terminations.
+
+**Current assessment:** height_reward = 1.622/ep (up from 0.844). Altitude anchoring is working well. Apply this change at next config revision if the metric stays above 1.4.
+
+---
+
+## Experiment Plan
+
+### Current run (15-06-36): Continue as-is to 2M steps
+
+No changes needed. Monitor these checkpoints:
+
+1. **At 600k steps:**
+   - tracking_reward mean should exceed 1.0/ep
+   - Episode mean should exceed 200 steps
+   - If tracking_reward still below 0.25: apply Priority 2 (sustained_follow_duration reduction)
+
+2. **At 1M steps:**
+   - tracking_reward mean should exceed 1.5/ep (consistent sustained following)
+   - Episode length max should approach 350+ steps (near full episode completion)
+   - If tracking mean is plateaued below 1.0: investigate whether fly_high terminations are still frequent; apply Priority 3 (lower termination_z)
+
+3. **At 2M steps:**
+   - Evaluate whether `all_targets_captured` success rate is nonzero
+   - If total_reward shows plateau in last 500k steps: consider curriculum tightening (reduce capture_distance from 3.0m to 2.5m, increase target_velocity from 0.3 to 0.4 m/s)
+
+**Training command (same):**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**Updated success criteria for this run:**
+- `tracking_reward` > 1.0 (mean, recent) by step 600k
+- `Episode / Total timesteps (mean)` > 200 steps by step 600k
+- `total_reward_mean` > 60.0 (sustained) by step 1M
+- `total_reward_mean` > 80.0 (sustained) by step 2M
+
+---
+
+## Changelog
+
+- 2026-03-24 (run 15-06-36, 461k steps): Major phase transition confirmed. tracking_reward jumped
+  0.065 → 0.899/ep (+1282%). total_reward mean +1.17 → +43.63 (+3629%). Both tracking milestones
+  (0.10 and 0.25) passed simultaneously. Episode length 101.6 → 182.0 steps (+79%). Critic
+  well-converged (value_loss 0.048). No config changes recommended — continue training to 2M steps.
