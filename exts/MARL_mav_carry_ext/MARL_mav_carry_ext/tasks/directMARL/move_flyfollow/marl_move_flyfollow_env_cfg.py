@@ -177,7 +177,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # ===== 终止条件阈值 =====
     drone_collision_threshold = 0.6   # 两无人机中心距离 < 0.6m 触发碰撞终止
-    bounding_box_threshold = 12.0     # 超出 ±12m 范围终止
+    bounding_box_threshold = 120.0     # 超出 ±12m 范围终止
 
     # 接触传感器触发阈值（N）
     contact_sensor_threshold = 1.0
