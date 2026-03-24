@@ -590,3 +590,206 @@ Keep existing fixes from previous analysis:
 
 - 2026-03-23: Initial analysis of move_flyfollow run `2026-03-23_17-12-31`. Identified reward dominance inversion (stability > task), missing velocity-follow reward, zero tracking reward throughout entire run, shrinking episode lengths. Proposed 6 prioritized fixes.
 - 2026-03-23: High-flying root cause analysis. Three runs compared (move_flyfollow ×2 + move reference). Confirmed drone z reaches 4–8m chronically (bounding_box=1.0 from first episode). Root cause: XY-only distance reward provides no z-gradient; height_reward_weight=0.5 insufficient as altitude anchor; no fly_high termination. Identified that previous fix (height_w: 2.0→0.5) worsened the problem. Proposed 5 targeted fixes (A–E).
+- 2026-03-23: Run 22-02-33 analysis (400k steps). bounding_box_threshold bug fixed (12→120m), rewards improved significantly vs 20-28-48, but fly-high still dominant — drone drifts upward, tracking_reward=0 persists, episode length stuck at ~87 steps (2.9s). Height fixes (A–E from previous plan) not yet applied — that remains the critical blocker.
+
+---
+
+# Training Analysis Report
+
+**Run:** 2026-03-23_22-02-33_mappo_torch_mappo
+**Date:** 2026-03-23
+**Task:** Isaac-marl-move-flyfollow-v0
+**Algorithm:** MAPPO
+**Compared against:** 2026-03-23_20-28-48_mappo_torch_mappo (previous run, 27k steps)
+
+---
+
+## Training Metrics Summary
+
+| Metric | Run 20-28-48 (27k steps, end) | Run 22-02-33 (400k steps, end) | Change |
+|---|---|---|---|
+| Total reward (mean) | -2.12 | -4.99 | Worse (longer training revealed true plateau) |
+| Total reward (recent mean) | -2.42 | -4.94 | Worse |
+| distance_reward (recent mean) | 0.078 | 0.212 | +172% — clear improvement |
+| tracking_reward (recent mean) | 0.000 | 0.002 | Still effectively zero |
+| height_reward (recent mean) | 0.147 | 0.191 | Marginally higher |
+| body_rate_penalty (recent mean) | 0.114 | 0.010 | -91% — drones much calmer |
+| Episode length (recent mean steps) | 64 steps (2.1s) | 87 steps (2.9s) | +36% — improvement |
+| Policy std | 0.787 | 0.710 | Converging but not collapsed |
+| Value loss | 0.007 | 0.0002 | Near zero — critic converged |
+
+---
+
+## Question-by-Question Analysis
+
+### 1. Did bounding_box termination rate decrease?
+
+**Answer: Cannot directly confirm from TF metrics alone, but strong indirect evidence of improvement.**
+
+The previous runs (17-12-31 and 20-28-48) both showed `bounding_box = 1.0` (every episode terminated out-of-bounds). With `bounding_box_threshold` corrected from 12m to 120m in this run, the termination condition is now 10× more lenient. The fact that episode lengths increased from 64 to 87 steps and the run completed 400k steps with stable (non-crashing) reward curves strongly implies the `bounding_box` termination rate is now well below 1.0.
+
+However, `Episode_Termination/bounding_box` is not directly logged in the TF data extracted. The current dominant termination mechanism appears to be a short-episode ceiling (episodes average only 87 steps = 2.9 seconds vs 60s max), which points to a **different termination** condition firing — most likely `fly_high` or `out_of_bounds` at whatever the true boundaries are, or collision.
+
+**Conclusion:** bounding_box bug is fixed. But drones are still exiting early via another path.
+
+### 2. Episode length trend
+
+- **Early mean:** 89.7 steps (~3.0s)
+- **Recent mean:** 87.2 steps (~2.9s) with std=25.3
+- **Best ever:** 651 steps (~21.7s)
+
+Episode length is essentially flat across 400k steps. The agent learned slightly quicker exits than at startup, which is not the desired direction. The 651-step best shows it is physically possible for episodes to run long, but the policy has not learned to sustain this. Short episodes (87 steps = 2.9s) mean drones are either:
+- Leaving the safe altitude band (fly_high or collision), or
+- The `sustained_follow_duration=3.0s` success condition is never met, so episodes end by safety termination
+
+### 3. Reward component magnitudes and trends
+
+**Positive components:**
+- `distance_reward`: early 0.490 → recent 0.212. **Improved vs 20-28-48 (0.078), but declining** within this run. This suggests the drone initially approached targets but then drifted away.
+- `height_reward`: early 0.162 → recent 0.191. Slowly increasing — height is improving marginally.
+- `action_smoothness`: early 0.109 → recent 0.055. Decreasing — policy becoming less exploratory.
+
+**Near-zero components:**
+- `tracking_reward`: recent_mean = 0.002. This is effectively zero. **Drones still never enter the 3.0m capture zone.**
+- `velocity_penalty`: 0.000 throughout. Correctly disabled.
+
+**Negative drivers (penalties eating into reward):**
+- `force_penalty`: 0.160/episode. Consistent and stable.
+- `body_rate_penalty`: 0.010/episode (was 0.114 in 20-28-48) — **91% reduction, the reduced weight 0.5 worked**.
+- `action_smoothness` term and `force_penalty` are the main positive-reward terms not related to task.
+
+**Total reward remains negative (-4.94 recent mean)** meaning penalties still exceed task rewards. The dominant penalty is not visible in per-component logging but is implied to be either height-related or a reset penalty.
+
+### 4. Comparison with run 20-28-48
+
+| Dimension | 20-28-48 | 22-02-33 | Verdict |
+|---|---|---|---|
+| Bounding box bug | Active (12m threshold) | Fixed (120m) | Fixed |
+| distance_reward | 0.078 | 0.212 | +172%, genuine improvement |
+| body_rate_penalty | 0.114 | 0.010 | Weight reduction worked |
+| tracking_reward | 0.000 | 0.002 | Still zero in practice |
+| Episode length | 64 steps | 87 steps | Marginal improvement |
+| Policy std | 0.787 | 0.710 | Slower collapse in 22-02-33 |
+| Training budget | 27k steps | 400k steps | 15× more compute |
+| Total reward plateau | ~-2.4 | ~-4.9 | More negative — longer run exposed true floor |
+
+**Summary:** The fixes partially worked. The policy is no longer crashing out immediately, approaches are happening more frequently (distance_reward ×2.7), and body rate jitter is eliminated. However, the fundamental blocker remains: **drones never reach the 3.0m capture zone** and **altitude anchoring is insufficient** causing persistent drift and early termination.
+
+### 5. Current primary bottlenecks
+
+**Bottleneck A (CRITICAL): Altitude drift — height_reward_weight=0.5 still too weak**
+
+The height_reward recent mean of 0.191 corresponds to `0.5 × exp(-|z-2.5|) × step_dt`. For this to equal 0.191 per episode of 87 steps, the average height deviation across 87 steps is approximately 0.3–0.5m above desired. This sounds acceptable, but because there is **no z-component in distance_reward**, drones can hover at z=5–8m and receive identical distance reward to z=2.5m. The height_reward at z=5m is `0.5 × exp(-2.5) ≈ 0.041/step` — very weak. Without a fly_high termination, a drone stuck at 6m altitude survives the full episode collecting stability rewards.
+
+**Bottleneck B (CRITICAL): tracking_reward = 0 — drones never close within 3.0m**
+
+With `dist_reward_scale=0.5` and targets at ground level (z≈0.25m) and drones flying at ~2.5–5m, the XY distance to targets is on the order of 5–15m at episode start. Even with `dist_reward_weight=4.0`, the gradient from 15m to 3m is:
+- At 15m: `4.0 × exp(-15 × 0.5) ≈ 0.00005` — negligible
+- At 3m: `4.0 × exp(-3 × 0.5) ≈ 0.89` — strong
+
+The reward landscape near the capture zone is steep, but the gradient from far away is too flat for the policy to reliably discover approach direction. The policy defaults to hovering near the episode start position.
+
+**Bottleneck C (HIGH): No fly_high termination or penalty**
+
+Without `fly_high_termination_z` and `fly_high_penalty_weight`, a drone that explores upward faces no negative consequence until it hits `bounding_box_threshold=120m` (now effectively infinite). The height_reward decay at 8m is `0.5 × exp(-5.5) ≈ 0.002/step` — essentially zero. There is no incentive to return to 2.5m once the drone drifts above ~5m.
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): Restore height_reward_weight to 2.0
+
+**Problem:** At weight=0.5, the altitude anchor gradient is too weak to overcome random upward exploration. The reference `move` task with weight=2.0 successfully converged altitude; this task with 0.5 does not.
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- Parameter: `height_reward_weight = 0.5` → `2.0`
+- Rationale: At desired_height, this raises the altitude anchor signal from 0.005/step to 0.020/step, creating a 4× stronger basin. Empirically validated in the reference `move` task.
+
+### Priority 2 (CRITICAL): Add fly_high_penalty and fly_high_termination
+
+**Problem:** No cost for high-altitude flight means the policy can freely explore upward indefinitely. Once at 6–8m, the height_reward is negligible and the drone has no incentive to descend.
+
+**Proposed Changes:**
+- File: `marl_move_flyfollow_env_cfg.py`
+- Add: `fly_high_penalty_weight = 2.0` (exponential penalty per step above fly_high_threshold)
+- Add: `fly_high_threshold = 4.0` (penalty activates above 4m)
+- Add: `fly_high_termination_z = 6.0` (hard termination if any drone exceeds 6m)
+- Rationale: Creates a hard ceiling that forces the policy to stay near 2.5m. Short episodes from fly_high termination will replace short episodes from other causes, but with a learning signal pointing the right direction.
+
+### Priority 3 (HIGH): Lower desired_height from 2.5m to 1.5m
+
+**Problem:** Targets are NovaCarter carts at z≈0.25m. At desired_height=2.5m, the drone is 2.25m above the target. The XY capture distance is 3.0m, but the 3D distance at desired_height is sqrt(XY² + 2.25²). For a drone directly above a target at desired_height, 3D distance = 2.25m — which already qualifies as captured. But the XY-only distance_reward does not account for z, so drones are not rewarded for being directly above targets.
+
+Lowering desired_height to 1.5m reduces z-offset to 1.25m and makes it easier for drones to simultaneously be close in XY.
+
+**Proposed Change:**
+- Parameter: `desired_height = 2.5` → `1.5`
+- Rationale: Closer to targets, more natural hovering position for tracking ground vehicles.
+
+### Priority 4 (HIGH): Increase dist_reward_scale to improve far-field gradient
+
+**Problem:** At `dist_reward_scale=0.5`, the reward at 10m distance is `4.0 × exp(-5) ≈ 0.027`. At 20m it is `4.0 × exp(-10) ≈ 0.0002`. The gradient from initialization positions (likely 5–20m from targets) is nearly flat, making random exploration the only way to discover approach direction.
+
+**Proposed Change:**
+- Parameter: `dist_reward_scale = 0.5` → `0.3`
+- Rationale: Wider basin — at 10m distance: `4.0 × exp(-3) ≈ 0.20` (7× higher), giving clearer gradient signal from initialization.
+
+### Priority 5 (MEDIUM): Increase height_penalty_weight to add strong linear penalty zone
+
+**Problem:** The current `height_penalty_weight=1.0` with `height_penalty_threshold=0.5` creates only a weak linear penalty for |z-desired| > 0.5m. This doesn't activate until the drone is already 3m above the floor (at desired=2.5m, threshold=0.5 → penalty starts at 3.0m).
+
+**Proposed Change:**
+- Parameter: `height_penalty_weight = 1.0` → `2.0`
+- Parameter: `height_penalty_threshold = 0.5` → `0.3`
+- Rationale: Combined with Fix A (height_reward_weight=2.0), creates a multi-layer altitude control: soft reward basin (height_reward) + linear penalty zone (height_penalty) + hard ceiling (fly_high_termination from Fix B).
+
+---
+
+## Updated Experiment Plan
+
+Apply all 5 fixes together in the next run:
+
+```
+height_reward_weight:      0.5   →  2.0    (Fix 1 — CRITICAL)
+fly_high_penalty_weight:   new   →  2.0    (Fix 2 — CRITICAL, new param)
+fly_high_threshold:        new   →  4.0    (Fix 2 — CRITICAL, new param)
+fly_high_termination_z:    new   →  6.0    (Fix 2 — CRITICAL, new param)
+desired_height:            2.5   →  1.5    (Fix 3 — HIGH)
+dist_reward_scale:         0.5   →  0.3    (Fix 4 — HIGH)
+height_penalty_weight:     1.0   →  2.0    (Fix 5 — MEDIUM)
+height_penalty_threshold:  0.5   →  0.3    (Fix 5 — MEDIUM)
+```
+
+Keep from 22-02-33:
+```
+dist_reward_weight = 4.0         (keep)
+tracking_reward_weight = 3.0     (keep)
+velocity_follow_weight = 1.5     (keep)
+capture_distance = 3.0           (keep)
+body_rate_penalty_weight = 0.5   (keep)
+velocity_penalty_weight = 0.0    (keep)
+bounding_box_threshold = 120.0   (keep)
+obs_dim_per_step = 61            (keep — target velocity in obs)
+ratio_clip = 0.2                 (keep)
+entropy_coef = 0.01              (keep)
+```
+
+**Training command:**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**Monitor in first 10k steps:**
+- `Episode_Termination/fly_high` should appear and decrease over time (confirms ceiling is working)
+- `Episode_Reward/height_reward` should increase above 0.25/episode (altitude anchoring working)
+- `Episode / Total timesteps (mean)` should increase above 100 steps (less early termination)
+
+**Monitor at 50k steps:**
+- `Episode_Reward/distance_reward` should exceed 0.5 (drones closer to targets)
+- `Episode_Reward/tracking_reward` should show first non-zero values (first captures)
+
+**Success criterion for this fix:**
+- `tracking_reward` > 0.01 (mean) by step 100k
+- Episode length > 150 steps by step 50k
+- `fly_high` terminations declining after initial burst
