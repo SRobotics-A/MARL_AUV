@@ -1427,3 +1427,154 @@ policy_std 继续下降至 0.40 以下，可考虑小幅提升 entropy 系数（
 **当前运行是否应中断：否。**
 建议在当前 checkpoint（agent_1460000.pt）基础上，以上述参数修改重启一次新运行，
 以 2M 步为目标评估 tracking_reward 是否突破 1.5/ep。
+
+---
+
+# Training Analysis Report
+
+**Run:** `2026-03-25_11-01-07_mappo_torch_mappo`
+**Date:** 2026-03-25
+**Task:** Isaac-marl-move-flyfollow-v0
+**Algorithm:** MAPPO (CTDE, shared actor/critic)
+**Total timesteps logged:** 805,300
+**Base checkpoint:** `2026-03-24_15-06-36_mappo_torch_mappo/checkpoints/best_agent.pt`
+**Changes vs previous run:** fly_high_termination_z 6.0→4.5m, sustained_follow_duration 3.0→1.5s, tracking_reward_weight 3.0→4.0, body_rate_penalty_weight 0.5→1.0, upright_penalty_weight 0.5→1.0
+
+---
+
+## Training Metrics Summary
+
+| Metric | Early mean | Recent mean | Last value | Best ever |
+|--------|-----------|-------------|------------|-----------|
+| Total reward (mean) | **56.33** | 47.39 | 47.06 | 120.04 |
+| Total reward (max) | 85.94 | 78.43 | 63.74 | 154.46 |
+| Total reward (min) | 15.62 | 9.82 | −4.51 | 91.26 |
+| distance_reward | 22.98 | 19.42 | 11.30 | 42.12 |
+| tracking_reward | **1.894** | 1.434 | 0.545 | 4.923 |
+| height_reward | 1.812 | 1.773 | 1.370 | 3.193 |
+| body_rate_penalty | 0.381 | 0.378 | 0.201 | 0.689 |
+| force_penalty | 0.406 | 0.371 | 0.273 | 0.692 |
+| action_smoothness | 0.672 | 0.562 | 0.334 | 1.165 |
+| velocity_penalty | 0.000 | 0.000 | 0.000 | 0.000 |
+| Episode length (mean steps) | 205.8 | 185.3 | 193.3 | 348.1 |
+| Episode length (max steps) | 288.0 | 271.3 | 271.0 | 523.0 |
+| Policy std | 0.436 | 0.410 | 0.410 | 0.456 |
+| Value loss | 0.056 | 0.061 | 0.077 | 0.333 |
+| Policy loss | −0.021 | −0.017 | −0.033 | +0.126 |
+| Entropy loss | −0.00577 | −0.00502 | −0.00502 | — |
+
+Script verdict: **regressing**
+
+---
+
+## Observations & Findings
+
+### 1. Checkpoint 加载验证 — CONFIRMED
+
+**关键证据：** Early mean total_reward = **+56.33**（run 开始即为高正值），而从零开始训练的早期均值为负数（如 22-02-33 run 早期 ≈ −4.94）。上一轮（15-06-36，1.46M 步时）recent_mean ≈ 47.76，本轮 early_mean = 56.33，高出约 +8.6 点。
+
+**结论：** Checkpoint 加载成功生效，本次训练从上一轮的学习基础上继续，而非重零开始。
+
+---
+
+### 2. tracking_reward 趋势 — Severity: HIGH（回退而非增长）
+
+**症状：** tracking_reward early_mean = **1.894**，recent_mean = **1.434**，last = **0.545**（下降 71%）。
+Best ever = 4.923，说明策略在某些剧集中确实能产生更高的跟踪奖励，但整体趋势是下滑的。
+
+**与预期对比：** 上一轮（15-06-36）1.46M 步时 tracking_reward mean ≈ 1.068，本轮初始即跳至 1.894（+77%），说明 sustained_follow_duration 3.0→1.5s 的改动生效，tracking 信号变得更易触发。但随后出现系统性下滑，说明存在新的不稳定因素。
+
+**根本原因分析：** tracking 下滑与 total_reward 同步下滑（early 56.33 → recent 47.39），且 distance_reward 也从 22.98 → 19.42 下滑，说明**整体追踪能力下降**，而非单独的 tracking 问题。这是一次整体性能回退，不是单一奖励项的问题。
+
+---
+
+### 3. episode 长度变化 — Severity: MEDIUM
+
+**观察：** Episode 长度 early_mean = 205.8 步 → recent_mean = 185.3 步（−10%）。
+最大值：early_mean 288 → recent_mean 271 步（−6%）。Best ever = 523 步（高于上一轮 best 585 步之前的历史最高）。
+
+**与上一轮对比：** 上一轮 1.46M 步时 episode_mean ≈ 180.7 步，本轮初始 205.8 步（继续改善），但近期又回落至 185.3 步。episode_min recent_mean 仅 66 步（std=61.8），说明存在部分剧集极早终止（可能是 fly_high）。
+
+---
+
+### 4. fly_high 终止分析 — Severity: HIGH
+
+**关键数据：** episode_min 的 recent_mean = 66 步，std = 61.8（极高方差）。这意味着部分剧集在 40–80 步就终止，与 fly_high_termination_z 收紧至 4.5m 高度相关。
+
+**证据链：** fly_high_termination_z 从 6.0→4.5m 是本次最大结构性改动。Total reward (min) 的 recent_mean 降至 **9.82**（早期 15.62），且 last value 已变成 **−4.51**（负值），说明存在整体剧集质量恶化。distance_reward 下滑 15%（22.98→19.42）也印证了剧集提前终止导致追踪时间缩短。
+
+**结论：** 4.5m 上限比当前策略的飞行高度更严格，触发了更多 fly_high 早期终止，这是性能回退的主要原因之一。
+
+---
+
+### 5. 姿态稳定性奖励 — Severity: LOW（无明显问题）
+
+**body_rate_penalty：** early_mean = 0.381，recent_mean = 0.378（几乎不变）。权重从 0.5→1.0 后，绝对值提升应明显，但 early_mean 仅 0.381——这与上一轮（15-06-36）的 body_rate_penalty ≈ 0.378（weight=0.5 时）处于同一量级，说明**实际 body_rate 水平降低了约一半**（相同奖励值但权重翻倍）。
+
+**upright_penalty（未单独记录）：** env.yaml 确认 upright_penalty_weight = 1.0，但 TensorBoard 中未单独记录 upright 奖励项，只能间接从 total_reward 判断。姿态稳定性改进未导致明显的正向奖励变化，可能因为该项绑定在 total_reward 中。
+
+**整体判断：** body_rate/upright 权重翻倍（0.5→1.0）没有造成奖励惩罚爆炸，说明策略的姿态控制本身是合理的。此项改动对性能的负面影响有限，不是回退主因。
+
+---
+
+### 6. 总体判断 — 性能回退，原因以 fly_high 收紧为主
+
+**核心发现：**
+- Checkpoint 加载成功：early total_reward +56.33 显著高于历史从零起步水平
+- 初始 tracking_reward 跳升至 1.894（sustained_follow_duration 缩短效果立竿见影）
+- 但后续出现系统性回退（tracking、distance、episode 长度、total_reward 全线下滑）
+- 回退的主要机制：fly_high_termination_z 4.5m 使更多剧集提前终止，策略当前飞行高度在 4.5m 附近，触发率高
+- tracking_reward best ever = 4.923（大幅高于上一轮 best 1.816），说明策略潜力已大幅提升，但被fly_high终止截断
+
+**Script 给出 "regressing" 判断的原因：** early_mean (56.33) > recent_mean (47.39)，说明后期表现弱于初期。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (HIGH): 适度放宽 fly_high_termination_z 至 5.0m
+
+**问题：** 4.5m 收紧导致剧集提前终止，策略还未适应新上限。本轮运行仅 ~805k 步，尚不足以让策略完全收敛到 4.5m 以下飞行。tracking best=4.923 说明策略具备能力，但被过早终止打断。
+
+**权衡：** 4.5m 是正确的长期目标，但引入过快导致不稳定。建议在当前 checkpoint 基础上设置为 5.0m（折中），待 tracking_reward > 2.0/ep 稳定后再收紧至 4.5m。
+
+**或者：** 若不想修改终止高度，则**延长当前运行**至 1.5M+ 步，给策略时间适应 4.5m 约束。回退趋势发生在 800k 步内，可能是过渡期震荡，而非永久退化。
+
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+- 参数：`fly_high_termination_z: 4.5 → 5.0`（若选择折中方案）
+- 理由：给策略足够的适应窗口，避免 fly_high 终止主导 reset 类型
+
+### Priority 2 (MEDIUM): 继续当前运行，等待超越 1M 步
+
+**理由：** 训练仅进行了 ~805k 步（等效于总有效步数），policy_std = 0.410（仍有健康探索空间，未坍缩到 0.40 以下）。tracking best=4.923 是迄今最高值，说明策略能力在提升，只是稳定性还差。上一轮的"相变"发生在 450k 步，本轮可能在适应 fly_high 约束后出现二次相变。
+
+**关键观察点（1.2M 步时检查）：**
+- tracking_reward recent_mean 是否重新超过 1.5/ep
+- episode_min 是否不再频繁出现 40–80 步的极短剧集
+- total_reward recent_mean 是否回升至 50+
+
+### Priority 3 (LOW): 监控 policy_std 下限
+
+**当前状态：** policy_std = 0.410，与上一轮 1.46M 步时的 0.447 相比已更低。recent_std = 0.0054（极小），说明 std 正在单调下降。若在 1.2M 步检查时 policy_std < 0.38，应考虑在下次重启时调高 `entropy_loss_scale`。
+
+---
+
+## Experiment Plan
+
+1. **当前运行继续**（不中断），目标运行至 1.5M+ 步
+2. **1.2M 步检查点：**
+   - tracking_reward recent_mean > 1.5/ep → 继续运行至 2M 步
+   - tracking_reward recent_mean < 1.2/ep 且仍在下滑 → 考虑重启并放宽 fly_high_termination_z 至 5.0m
+   - policy_std < 0.38 → 下次重启加入 entropy_loss_scale 微调
+3. **成功标准（2M 步目标）：**
+   - tracking_reward mean > 2.0/ep（稳定，recent_std < 0.3）
+   - episode_mean > 200 步
+   - total_reward mean > 55
+
+---
+
+## Changelog
+
+- 2026-03-25：分析 run 11-01-07（checkpoint 继续训练，805k 步）。确认 checkpoint 加载成功（early +56.33），
+  sustained_follow_duration 缩短效果立竿见影（tracking 初始 +77%），但 fly_high_termination_z 4.5m 过严
+  导致系统性回退。tracking best=4.923（历史新高），说明策略潜力已大幅提升，需等待适应期。
