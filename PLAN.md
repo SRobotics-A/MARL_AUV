@@ -1304,3 +1304,126 @@ If tracking_reward mean stops growing between 800k–1M steps and remains below 
 | 1M | Episode max (recent mean) | > 350 steps |
 | 1.5M | tracking_reward (recent mean) | > 2.0/ep |
 | 2M | Evaluate all_targets_captured success rate; if plateau → tighten capture_distance 3.0 → 2.5m |
+
+---
+
+## 训练进展分析 — 1.46M 步快照
+
+**分析时间：** 2026-03-25
+**Run：** `2026-03-24_15-06-36_mappo_torch_mappo`
+**当前步数：** 1,463,400 步（最新 checkpoint: agent_1460000.pt）
+
+### 最新指标汇总
+
+| 指标 | 上次快照 (670k) | 本次近期均值 (1.46M) | 最新值 | 历史最佳 |
+|------|--------------|-------------------|--------|---------|
+| Total reward (mean) | +51.99 | +47.76 | +53.62 | +94.87 |
+| tracking_reward | 1.220/ep | 1.068/ep | 1.251/ep | 2.754/ep |
+| distance_reward | 21.57/ep | 19.27/ep | 17.32/ep | 36.46/ep |
+| height_reward | 1.646/ep | 1.621/ep | 1.565/ep | 3.003/ep |
+| timesteps_mean | 202 steps | 180.7 steps | 212.7 steps | 456.7 steps |
+| timesteps_max (recent mean) | 283 steps | 270.5 steps | 292 steps | 585 steps |
+| policy_std | 0.489 | 0.447 | 0.450 | 0.820 |
+| value_loss | 0.028 | 0.061 | 0.043 | — |
+| entropy_loss | −0.007 | −0.00595 | −0.00605 | — |
+
+### 逐项分析
+
+**1. 当前步数：1,463,400 步（超过 1M 里程碑）**
+
+训练已超过预设的 1M 步检查点，进入 1.5M 步阶段。距上次 670k 快照增加了约 793k 步。
+
+**2. tracking_reward：1.068/ep（均值），未达 1M 目标 >1.5/ep**
+
+这是本次快照最重要的发现。1M 步里程碑目标（tracking_reward > 1.5/ep）**未达成**。最新单值
+1.251/ep 略高于近期均值，但历史最佳为 2.754/ep，说明策略有峰值能力但不稳定。从 670k（1.220/ep
+均值）到 1.46M（1.068/ep 均值），tracking_reward 均值实际**小幅下降**。这是停滞信号，不是崩溃，
+但与预期的持续增长方向相反。
+
+**根因分析：**
+- `policy_std` 从 0.549（670k）降至 0.447（当前），探索空间压缩，策略趋向固化。
+- `entropy_loss` 近期均值 −0.00595（接近零），熵惩罚几乎消失，策略已接近局部确定性。
+- `distance_reward` 近期均值从 21.57 降至 19.27（−11%），说明无人机接近目标的表现略有退步。
+  这可能与策略收敛到保守行为（减少追踪动作的幅度）有关。
+- `timesteps_min` 近期均值仅 63.4 步（std=59.2，方差极大），说明部分剧集仍在早期终止，
+  可能由 fly_high 触发，拉低了 tracking_reward 统计均值。
+
+**3. episode 长度：均值 180.7 步，最大均值 270.5 步，未达目标（最大均值 >350 步）**
+
+均值相对 670k 时（202 步）轻微下降。最新单值 212.7 步，最大值 292 步。最大步数目标（350 步）
+**未达成**。说明剧集长度增长已停滞，部分剧集频繁提前终止。与 tracking_reward 停滞的模式一致。
+
+**4. 总奖励趋势：缓慢增长，但近期均值低于上次快照**
+
+recent_mean（近 20% 数据）为 47.76，而 670k 时的 last 值为 63.07。这反映出近期表现低于 670k
+附近的峰值期。最新值 53.62 和历史最佳 94.87 之间有较大缺口。上行趋势未完全终止，但增长动力
+明显减弱。
+
+**5. 收敛停滞迹象：已出现**
+
+综合以下信号，训练已进入接近收敛平台期的阶段：
+- `policy_std` 在 0.44–0.45 区间内几乎稳定（670k→1.46M 缓慢下降）
+- `entropy_loss` 近零，策略熵已压缩至接近下限
+- `tracking_reward` 均值停止增长（1.220→1.068）
+- `distance_reward` 轻微下降
+
+这不是训练崩溃，而是策略在当前奖励结构下已接近其能学到的上限。**需要干预以解锁更高性能。**
+
+**6. 无新病态（奖励 hacking / 高飞复发 / 速度惩罚）**
+
+- `velocity_penalty` = 0.0 全程
+- `height_reward` 稳定在 1.62/ep，高飞未复发
+- `body_rate_penalty` 稳定（0.119/ep）
+- `force_penalty` 稳定（0.357/ep）
+
+### 当前状态判断
+
+**状态：接近停滞的精化阶段。1M 步里程碑目标未达成（tracking +episode长度均不足）。需要在下次重启时施加改进措施。**
+
+策略探索已压缩（policy_std=0.447），tracking_reward 均值停止增长，当前奖励结构已触及其学习上限。
+预计在现有配置下继续训练至 2M 步只会在当前平台期附近徘徊，无法解锁 tracking > 1.5/ep。
+
+### 下一步行动建议
+
+**Priority 1 (HIGH): 在下次重启时应用 fly_high_termination_z 6.0 → 4.5m（已触发条件，之前确认）**
+
+此项在 670k 分析时已确认（height_reward > 1.4/ep 持续满足）。本次 1.621/ep 仍满足。
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- 参数：`fly_high_termination_z: 6.0 → 4.5`
+- 预期效果：减少 fly_high 提前终止，提高 timesteps_min，拉高 tracking_reward 统计均值
+
+**Priority 2 (HIGH): 降低 sustained_follow_duration 3.0s → 1.5s（激活停滞应急预案）**
+
+之前 670k 分析的应急预案条件是：tracking_reward 在 800k–1M 步前停滞于 1.5/ep 以下。
+该条件已触发（1.46M 步，tracking 均值 1.068/ep < 1.5/ep，且均值未再增长）。
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- 参数：`sustained_follow_duration: 3.0 → 1.5`
+- 理由：3.0s 的持续跟随要求对于 timesteps_mean=180 步（≈6s）的剧集来说成功概率极低。
+  降至 1.5s 可显著提高每剧集内成功触发 tracking_reward 的频率，为策略提供更密集的正向反馈。
+
+**Priority 3 (MEDIUM): 考虑小幅提升 tracking_reward_weight 3.0 → 4.0**
+
+当前 tracking_reward 占 total_reward 比例偏低（1.068 / 47.76 ≈ 2.2%）。distance_reward（19.27）
+主导了奖励信号。适度提升 tracking_reward_weight 可增强进入捕获区的激励，但需避免过大导致不稳定。
+- 文件：同上
+- 参数：`tracking_reward_weight: 3.0 → 4.0`
+- 风险：中等。需监控 total_reward 是否在调整后持续上升（而非振荡）。
+
+**Priority 4 (LOW, 监控项): 观察 entropy 是否需要干预**
+
+entropy_loss 近期均值 −0.00595（最初约 −0.0096），说明策略已从高熵探索状态收缩。若下次重启后
+policy_std 继续下降至 0.40 以下，可考虑小幅提升 entropy 系数（skrl agent config 中的
+`entropy_loss_scale`），或暂时提升 initial_log_std 重启策略探索。
+
+### 行动摘要
+
+| 优先级 | 参数 | 变更 | 时机 |
+|--------|------|------|------|
+| HIGH | `fly_high_termination_z` | 6.0 → 4.5m | 下次重启时 |
+| HIGH | `sustained_follow_duration` | 3.0 → 1.5s | 下次重启时 |
+| MEDIUM | `tracking_reward_weight` | 3.0 → 4.0 | 下次重启时（可选） |
+| LOW | 监控 `policy_std` 趋势 | 若 < 0.40 考虑熵干预 | 1.8M 步检查 |
+
+**当前运行是否应中断：否。**
+建议在当前 checkpoint（agent_1460000.pt）基础上，以上述参数修改重启一次新运行，
+以 2M 步为目标评估 tracking_reward 是否突破 1.5/ep。
