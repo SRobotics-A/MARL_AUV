@@ -102,7 +102,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 机体角速率：exp(-||ω||)，抑制过激角运动（大角速率 = 不稳定飞行）
     # [PLAN fix-1] 降低权重，避免稳定性奖励掩盖追踪信号
-    body_rate_penalty_weight = 0.5
+    body_rate_penalty_weight = 1.0
 
     # 时间惩罚（已禁用）：可用于鼓励快速完成任务
     time_penalty = 0.0
@@ -117,7 +117,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 竖直姿态：w * (R_zz - 1.0) × dt，R_zz = 机体 z 轴与世界 z 轴夹角余弦
     # 完全竖直时 R_zz=1（奖励=0），翻滚时 R_zz=-1（奖励=-2×w×dt）
     # [PLAN fix-1] 降低权重
-    upright_penalty_weight = 0.5
+    upright_penalty_weight = 1.0
     upright_expect_dir = (0.0, 0.0, 1.0)  # 期望机体上方向 = 世界 z 轴
 
     # 高度奖励：鼓励维持在 desired_height 附近飞行
