@@ -69,7 +69,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     target_velocity = 0.3     # 小车沿 x 轴正方向的匀速（m/s）
     # [PLAN fix-3] 暂时放宽至 3.0m 引导首次进入捕获区，收敛后可收紧
     capture_distance = 3.0    # 捕获/跟随判定距离（m）：NovaCarter 车身较大，适当放宽
-    sustained_follow_duration = 3.0  # 成功终止需持续跟随的时间（秒）
+    sustained_follow_duration = 1.5  # 成功终止需持续跟随的时间（秒）
     # 目标小车边界：x 超过此值触发 targets_out_of_bounds 终止
     target_end_x = 30.0       # 小车跑出场景边界的 x 坐标（与场景 bounding_box 匹配）
 
@@ -89,7 +89,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 跟随奖励：仅在捕获状态下（dist < capture_distance）给予
     # 与距离奖励叠加，增强进入捕获区后的保持动机
     # [PLAN fix-3] 提升 tracking 权重，放宽 capture_distance 以引导首次进入捕获区
-    tracking_reward_weight = 3.0
+    tracking_reward_weight = 4.0
     tracking_reward_scale = 1.0
 
     # 速度跟随奖励：鼓励无人机匹配目标速度（0.3 m/s x 向），解决"悬停局部最优"
@@ -138,7 +138,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 高飞终止：超过此高度直接终止 episode，避免长时间高飞浪费训练时间
     # [Fix-C] 新增：z > fly_high_termination_z 触发终止
-    fly_high_termination_z = 6.0     # 终止触发高度（m）
+    fly_high_termination_z = 4.5     # 终止触发高度（m）
 
     # 安全惩罚（固定值，不乘 dt）
     drone_out_of_bounds_penalty = 1.0  # 单次出界惩罚
