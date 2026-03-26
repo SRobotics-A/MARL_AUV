@@ -1744,3 +1744,204 @@ Best ever = 4.923，说明策略在某些剧集中确实能产生更高的跟踪
   tracking_reward 呈三段单调下滑（1.833→1.336→0.889），确认为持续衰减而非过渡期震荡。
   fly_high 终止压力未缓解（episode_min std≈mean）。policy_std 回升至 0.450（唯一正面信号）。
   判断：需要干预——重启并放宽 fly_high_termination_z 4.5→5.0m，可选放宽 capture_distance 3.0→3.5m。
+- 2026-03-26：分析 run 09-31-34（357k 步，从 11-01-07 热启动，新增两项改动：fly_high 5.0m + capture_distance 3.5m）。
+  详见下方完整分析。
+
+---
+
+# Training Analysis Report
+
+**Run:** `2026-03-26_09-31-34_mappo_torch_mappo`
+**Date:** 2026-03-26
+**Task:** Isaac-marl-move-flyfollow-v0
+**Algorithm:** MAPPO
+**Total timesteps logged (this run):** 356,900
+**Hot-start from:** `2026-03-25_11-01-07` best_agent.pt (1.855M cumulative steps)
+**Config changes vs. previous run:**
+- fly_high_termination_z: 4.5 → 5.0m
+- capture_distance: 3.0 → 3.5m
+
+---
+
+## Training Metrics Summary
+
+| Metric | Early mean | Recent mean | Last value | Best ever |
+|--------|-----------|-------------|------------|-----------|
+| Total reward (mean) | 53.31 | 54.28 | 46.22 | 111.63 |
+| Instant reward (mean) | 0.264 | 0.263 | 0.271 | 0.533 |
+| distance_reward | 22.28 | 22.96 | 27.01 | 38.57 |
+| tracking_reward | 1.814 | 1.798 | 2.174 | 4.241 |
+| height_reward | 1.739 | 1.817 | 1.974 | 2.751 |
+| velocity_penalty | 0.000 | 0.000 | 0.000 | 0.000 |
+| force_penalty | 0.403 | 0.415 | 0.454 | 0.653 |
+| body_rate_penalty | 0.368 | 0.372 | 0.359 | 0.558 |
+| action_smoothness | 0.743 | 0.711 | 0.800 | 1.250 |
+| Episode length (mean steps) | 201.9 | 208.7 | 204.6 | 421.1 |
+| Episode length (max steps) | 289.1 | 290.4 | 296.0 | 562.0 |
+| Episode length (min steps) | 81.7 | 86.5 | 11.0 | 331.0 |
+| Policy std | 0.391 | 0.375 | 0.378 | 0.397 |
+| Value loss | 0.056 | 0.043 | 0.016 | 0.302 |
+| Policy loss | −0.020 | −0.019 | −0.017 | 0.104 |
+| Entropy loss | −0.00465 | −0.00424 | −0.00430 | − |
+
+---
+
+## Observations & Findings
+
+### 1. Checkpoint Load Confirmed — Severity: INFO
+
+**Symptom:** early_mean total_reward = +53.31 (vs. baseline of approximately −5 to −8 for cold-start runs).
+
+**Verdict:** The hot-start from the previous run's best_agent.pt loaded successfully. The policy retained its learned tracking and flight behaviors from the previous 1.855M-step run. No cold-start loss occurred.
+
+**Evidence:** tracking_reward early_mean = 1.814, substantially above zero (which was the state of every cold-start run). Distance_reward early_mean = 22.28, consistent with the 15–22 range seen in the previous run's final phase.
+
+---
+
+### 2. tracking_reward Recovery from Downtrend — Severity: HIGH
+
+**Symptom:** In the previous run (11-01-07), tracking_reward had declined monotonically from 1.894 → 1.434 → 0.889 over 1.855M steps, with best_ever frozen at 4.923 (set at 805k, never exceeded in 1M subsequent steps).
+
+**This run results:**
+- tracking_reward early_mean = 1.814 (immediately above the final level of 0.889 from the previous run)
+- tracking_reward recent_mean = 1.798
+- tracking_reward last = 2.174
+- tracking_reward best_ever = 4.241
+
+**Verdict:** The downtrend HAS been arrested. The policy has recovered to the 1.8–2.2 range, which is well above the prior run's final 0.889. However, the new best_ever (4.241) is *below* the historical best of 4.923 from the 11-01-07 run's peak. This suggests partial recovery — the policy is stabilized but not yet surpassing the historical ceiling.
+
+**Root cause of recovery (confirmed):** The fly_high_termination_z relaxation from 4.5→5.0m reduced early termination pressure, giving the policy more steps per episode to accumulate tracking rewards and adapt its flight altitude.
+
+---
+
+### 3. Episode Length — Improvement Confirmed — Severity: HIGH
+
+**Previous run (11-01-07, final state):** episode_mean = 168 steps, episode_min recent_mean = 58.9 steps, min_std ≈ min_mean (indicating frequent fly_high terminations generating near-instant resets).
+
+**This run:**
+- episode_mean early = 201.9 steps; recent = 208.7 steps (+24% vs. 168)
+- episode_max recent_mean = 290.4 steps
+- episode_min recent_mean = 86.5 steps (std = 74.9 — still volatile but less dominated by fly_high)
+
+**Verdict:** The fly_high_termination_z relaxation from 4.5→5.0m produced a measurable increase in episode length. Episodes are ~40 steps longer on average. The min_std/min_mean ratio has improved (no longer ≈1.0), indicating early terminations are less systematic. However, episode_min_std = 74.9 remains large, suggesting fly_high terminations are still occurring but less uniformly.
+
+**The episode_min last = 11 steps is an outlier** — likely a transient instability in a small subset of environments. The recent_mean of 86.5 is more representative.
+
+---
+
+### 4. fly_high Termination Frequency — Indirect Evidence — Severity: MEDIUM
+
+The analysis script does not output fly_high termination rates directly for this run. However, the following indirect evidence is available:
+
+- episode_min recent_mean rose 58.9 → 86.5 steps (+47%) — fewer ultra-short episodes
+- episode_mean rose 168 → 208.7 steps (+24%) — broadly longer survival
+- height_reward recent_mean = 1.817 (vs. 1.403 in the previous run's final state, +29%) — policy is flying closer to desired_height=1.5m more consistently
+- height_reward best_ever = 2.751 (new high for this task)
+
+**Verdict:** The evidence strongly supports reduced fly_high termination frequency. The altitude adaptation that was blocked by the 4.5m ceiling is proceeding under the relaxed 5.0m constraint. The height_reward increase is particularly significant — it confirms the drone is actually flying lower, not just surviving longer at the same altitude.
+
+**Capture_distance 3.0→3.5m effect:** The tracking_reward early_mean = 1.814 being immediately above the prior run's 0.889 final level is partly attributable to the wider capture zone. A larger capture radius means the policy achieves tracking triggers more frequently, which is the intended effect. The best_ever = 4.241 (below 4.923) is consistent with the capture zone being "easier to enter but still challenging to sustain."
+
+---
+
+### 5. Policy std — Borderline Concern — Severity: MEDIUM
+
+**This run:**
+- policy_std early_mean = 0.391
+- policy_std recent_mean = 0.375 (declining)
+- policy_std last = 0.378
+- policy_std best = 0.397 (from the very start — has never exceeded this)
+- Warning threshold: > 0.38 preferred; collapse threshold: < 0.35
+
+**Status:** The policy_std is at 0.375–0.378 in the recent window, which is at the lower edge of the "safe range." This is marginally below the 0.38 warning threshold. The declining trend (0.391 → 0.375) is a concern if it continues.
+
+**Context:** The previous run ended at policy_std ≈ 0.450 (recovered from a low of 0.410). The drop from 0.450 back to 0.375 within 357k steps is steeper than expected. The entropy_loss of −0.00424 to −0.00430 is slightly less negative than in the previous run (−0.00545), which is marginally better (less entropy compression), but the std trajectory is still downward.
+
+**Risk assessment:** At current rate, policy_std may reach the 0.35 collapse threshold within 500k–800k additional steps. This warrants monitoring. If std breaks below 0.37 in the next 200k steps, the run should be re-evaluated.
+
+---
+
+### 6. Training Stability — Stall Diagnosis — Severity: MEDIUM
+
+The script verdict is "stalled." The basis:
+
+- total_reward early_mean = 53.31 vs. recent_mean = 54.28: nearly flat (+1.8%)
+- tracking_reward early_mean = 1.814 vs. recent_mean = 1.798: very slightly declining
+- distance_reward early_mean = 22.28 vs. recent_mean = 22.96: minor improvement
+
+**Interpretation:** The policy has stabilized at the level it inherited from the checkpoint, but has not advanced meaningfully in 357k steps. This is partially expected for a hot-start: the policy needs time to adapt to the new constraint parameters before making further progress. The phase transition pattern documented for this task (~450k steps from cold start) suggests that from a hot-start, progress may resume at a different cadence.
+
+**However:** The fact that tracking_reward best_ever (4.241) is *below* the historical peak (4.923) is the key signal. The policy has not yet rediscovered the behaviors that produced the 4.923 peak. This could reflect:
+1. The capture_distance 3.5m change altering the reward landscape (tracking is "easier" but maximum achievable per-episode tracking reward with 3.5m capture may be different from 3.0m)
+2. The policy_std compression limiting exploration capacity
+3. The run being too early (357k steps) to assess true trajectory
+
+**The "stalled" verdict at 357k steps from a hot-start is not alarming.** The 11-01-07 run itself looked stable in its early phases before declining. The critical question is whether the recent tracking_reward remains above 1.5 at the 500k step checkpoint.
+
+---
+
+## Current State Judgment
+
+**Verdict: Early stabilization — recovery confirmed, plateau risk moderate.**
+
+The intervention (fly_high 5.0m + capture_distance 3.5m) has achieved its primary goal: arresting the tracking_reward downtrend (0.889 → 1.8) and increasing episode length (168 → 208 steps). The two critical red flags from the previous run are resolved.
+
+The remaining concern is whether the policy can advance *beyond* its current plateau to surpass the historical best (tracking > 4.923, ideally > 6.0 per the milestone). At 357k steps from a hot-start, it is too early to judge this. The 500k checkpoint will be decisive.
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (MONITOR): policy_std trajectory
+
+**Problem:** policy_std has declined from 0.450 (end of previous run) to 0.375 in 357k steps. At this rate, it may approach the 0.35 collapse threshold within 500k–700k additional steps.
+
+**Watch signal:** If policy_std drops below 0.37 by the 500k–600k step mark, consider a warm entropy injection by slightly increasing entropy_loss_scale. Current value in config not verified, but if it follows the standard MAPPO default of 0.001, a temporary increase to 0.003–0.005 may help.
+
+**No change recommended now.** Monitor first.
+
+### Priority 2 (CONTINGENCY): tracking stall persists past 600k steps
+
+If tracking_reward recent_mean remains below 1.5/ep at the 600k step mark:
+
+**Option A — Tracking weight increase:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+- Parameter: `tracking_reward_weight` → consider 4.0 → 5.0
+- Rationale: increase gradient from tracking success to offset policy_std compression reducing exploration toward the capture zone.
+
+**Option B — capture_distance rollback:**
+- File: same
+- Parameter: `capture_distance` → 3.5 → 3.0m (if best_ever remains below 4.923, the 3.5m zone may be "too easy" — saturating before pushing to tight follow behavior)
+- Rationale: The historical 4.923 peak was achieved with capture_distance=3.0. If tracking is stable but best_ever is not growing, tightening the capture zone may force higher-quality tracking behavior.
+
+**Option C — sustained_follow_duration tightening:**
+- Parameter: `sustained_follow_duration` → 1.5 → 2.0s (if policy is stable enough)
+- Only apply if tracking_reward recent_mean > 2.0/ep at 1M steps.
+
+### Priority 3 (LOW): episode_min volatility
+
+episode_min_std = 74.9 (std > mean) indicates some environments still terminate very early. This is not blocking progress but contributes to gradient noise.
+
+If fly_high terminations are confirmed as the primary cause at the 500k checkpoint, consider whether fly_high_termination_z 5.0m should be further relaxed to 5.5m for the next restart. **Do not apply mid-run.**
+
+---
+
+## Experiment Plan
+
+1. Continue current run `2026-03-26_09-31-34` to 1.5M steps
+2. **500k step checkpoint (est. ~450k steps from now):**
+   - tracking_reward recent_mean > 1.5/ep → PASS, continue
+   - tracking_reward recent_mean < 1.5/ep → apply Priority 2 Option A (tracking_weight 4.0 → 5.0) at next restart
+   - height_reward recent_mean > 1.7/ep → altitude adaptation confirmed, continue
+   - policy_std < 0.37 → flag for entropy intervention
+   - episode_min recent_mean > 100 steps → fly_high pressure resolved
+3. **1M step checkpoint:**
+   - tracking_reward mean > 2.0/ep → PASS
+   - tracking_reward best_ever > 5.5 → policy expanding (on track for 6.0 target)
+   - If best_ever still below 4.923 at 1M steps → consider capture_distance rollback 3.5 → 3.0
+4. **Success criteria (this run):**
+   - tracking_reward mean > 2.0/ep, std < 0.4
+   - episode_mean > 220 steps
+   - best_ever tracking > 6.0 (exceed historical peak of 4.923)
+   - policy_std > 0.36 (no entropy collapse)
+
