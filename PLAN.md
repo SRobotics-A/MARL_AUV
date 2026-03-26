@@ -1578,3 +1578,169 @@ Best ever = 4.923，说明策略在某些剧集中确实能产生更高的跟踪
 - 2026-03-25：分析 run 11-01-07（checkpoint 继续训练，805k 步）。确认 checkpoint 加载成功（early +56.33），
   sustained_follow_duration 缩短效果立竿见影（tracking 初始 +77%），但 fly_high_termination_z 4.5m 过严
   导致系统性回退。tracking best=4.923（历史新高），说明策略潜力已大幅提升，需等待适应期。
+
+---
+
+# Training Analysis Report
+
+**Run:** `2026-03-25_11-01-07_mappo_torch_mappo`（续训分析）
+**Date:** 2026-03-26
+**Task:** Isaac-marl-move-flyfollow-v0
+**Algorithm:** MAPPO
+**当前步数：** 1,855,100 步（上次分析时约 805k 步，本次已过 1.2M 检查节点）
+
+---
+
+## Training Metrics Summary（1.855M 步）
+
+| Metric | early_mean | recent_mean | last | best ever |
+|--------|-----------|-------------|------|-----------|
+| Total reward (mean) | 54.96 | **39.36** | 32.97 | **120.04** |
+| Total reward (max) | 85.0 | 61.1 | 60.2 | 154.5 |
+| Total reward (min) | 14.8 | 7.8 | 7.6 | 91.3 |
+| distance_reward | 22.28 | **17.54** | 15.26 | 42.12 |
+| tracking_reward | 1.833 | **1.336** | 0.889 | **4.923** |
+| height_reward | 1.791 | 1.403 | 1.351 | 3.193 |
+| body_rate_penalty | 0.375 | 0.214 | 0.258 | 0.689 |
+| action_smoothness | 0.675 | 0.247 | 0.257 | 1.165 |
+| force_penalty | 0.395 | 0.334 | 0.333 | 0.692 |
+| velocity_penalty | 0.0 | 0.0 | 0.0 | 0.0 |
+| Episode timesteps (mean) | 199.4 | **167.9** | 192.6 | 348.1 |
+| Episode timesteps (max) | 282.8 | 236.6 | 247.0 | 523.0 |
+| Episode timesteps (min) | 78.8 | **58.9** | 101.0 | 275.0 |
+| Policy std | 0.417 | **0.437** | 0.450 | 0.458 |
+| Value loss | 0.054 | 0.038 | 0.034 | 0.333 |
+| Policy loss | −0.022 | −0.022 | −0.061 | +0.126 |
+| Entropy loss | −0.00530 | −0.00545 | −0.00559 | −0.00465 |
+
+---
+
+## 六项关键问题逐一分析
+
+### 1. 当前最新步数
+
+**1,855,100 步。** 本次分析时已超越上次分析设定的 1.2M 检查节点，并已接近 2.0M 步目标。
+
+### 2. tracking_reward 震荡是否已收敛——Severity: HIGH
+
+**结论：震荡未收敛，处于持续衰减趋势。**
+
+- early_mean = 1.833 → recent_mean = 1.336（−27%）
+- last = 0.889（远低于 recent_mean，说明近期仍在下滑）
+- 1.2M 检查目标：recent_mean > 1.5/ep。**未达到**（1.336 < 1.5）
+- 2M 步目标：mean > 2.0/ep。**明确无法达到**（当前 last=0.889）
+- best ever = 4.923 保持不变（与 805k 步时相同），说明 800k 步后未出现更高峰值，策略能力未进一步提升
+
+**症状：** 呈"高开低走"形态。early 阶段继承了热启动的高质量策略，后续随探索压缩，tracking 质量单调下降，未出现二次相变。
+
+### 3. episode 长度是否趋于稳定——Severity: HIGH
+
+**结论：不稳定，均值缩短且方差极大。**
+
+- 805k 时：mean ≈ 185 步；现在 recent_mean = 167.9 步（−9.3%）
+- timesteps_min 的 recent_mean = 58.9（recent_std = 58.7，几乎等于均值）。这意味着每批 rollout 中始终有少量极短剧集（~1–40 步），是 fly_high 终止或其他早终止的信号
+- timesteps_max recent_mean = 236.6，而 best ever = 523 步（原始热启动时创造的），说明策略当前无法维持长时间追踪
+
+### 4. fly_high 终止频率变化
+
+脚本未直接输出 fly_high 计数，但可从多个间接指标推断：
+
+- timesteps_min recent_mean = 58.9 步 ≈ 1.97 秒（step_dt=0.033s），且 std=58.7（极端分散），说明**短剧集频繁发生**。最短剧集（worst=1 步）表明存在即时终止。
+- 上次分析结论是 fly_high_termination_z=4.5m 过于激进，导致频繁提前终止。
+- 当前 height_reward recent_mean = 1.403（vs. early 1.791，下降 −22%）。高度奖励衰减 + 短剧集并存，说明策略在飞行高度控制上仍未完全适应 4.5m 约束。
+- **推论：fly_high 终止频率仍然偏高，未见改善。**
+
+### 5. policy_std 是否跌破 0.38 警戒线——Severity: MEDIUM（好转）
+
+**结论：未跌破 0.38，且近期呈回升趋势。**
+
+- 805k 步时：policy_std = 0.410（下滑趋势，当时接近警戒线）
+- 1.855M 步时：recent_mean = 0.437，last = **0.450**（early_mean = 0.417，即 recent > early）
+- worst 历史最低值 = 0.392（高于 0.38，从未跌破）
+- **policy_std 正在从 0.41 回升至 0.45，探索空间有所恢复。** 这是本次分析最积极的信号。
+
+可能原因：entropy_loss 略有加深（−0.00530 → −0.00545），PPO 熵正则化开始发挥作用，阻止策略进一步坍缩。
+
+### 6. 当前状态判断
+
+**判断：需要干预（不能继续等待，但不是紧急重启）。**
+
+核心依据：
+
+| 指标 | 上次预期 | 实际结果 | 判断 |
+|------|---------|---------|------|
+| tracking_reward recent_mean > 1.5/ep（1.2M 检查） | 目标 | 1.336 | 未达到 |
+| tracking_reward mean > 2.0/ep（2M 目标） | 目标 | 0.889（last）| 明确无法达到 |
+| episode_min 稳定 | 目标 | std=58.7（极不稳定） | 未达到 |
+| total_reward mean > 55（2M 目标） | 目标 | last=32.97 | 明确无法达到 |
+| policy_std > 0.38 | 安全线 | 0.450 | 达到（唯一亮点） |
+
+当前训练处于**持续性衰减期**，而非过渡期震荡：
+- tracking_reward 从 early 1.833 到 recent 1.336 到 last 0.889，呈三段单调下降，不是震荡
+- distance_reward 同步衰减（early 22.3 → recent 17.5 → last 15.3），说明追踪能力在退化而非只是 tracking bonus 难以触发
+- action_smoothness 大幅衰减（early 0.675 → recent 0.247），动作质量明显下降
+- best ever 自 805k 步后无更新，策略最高能力已冻结
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (HIGH): 重启训练，放宽 fly_high_termination_z 至 5.0m
+
+**问题：** fly_high_termination_z=4.5m 造成的终止压力持续了整个 1.855M 步训练期，策略始终未能完全适应，表现为持续的高度奖励衰减和短剧集。
+
+**判断依据：** height_reward early→recent 衰减 22%，timesteps_min 极不稳定（std≈mean），800k 步后 tracking best 无新高。策略已消耗完"过渡期"，但仍未完成适应。继续等待边际收益极低。
+
+**提议变更：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+- 参数：`fly_high_termination_z: 4.5 → 5.0`
+- 理由：折中方案，比原始 6.0m 更严但比 4.5m 宽松约 11%，给策略减少中断频率，同时保留高度约束压力。
+
+### Priority 2 (MEDIUM): 调整 tracking_reward_weight 与 capture_distance 的组合
+
+**问题：** tracking_reward 的绝对量级已降至 last=0.889/ep，说明 drones 进入 capture zone 的频率在减少。两个可能方向：
+
+方向 A — 放宽捕获距离（更大信号覆盖面）：
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+- 参数：`capture_distance: 3.0 → 3.5`（临时放宽，提升 tracking 触发频率，待 mean>2.0 后再收窄）
+- 注意：不要超过 4.0，避免过度稀释追踪精度要求
+
+方向 B — 提升 tracking_reward_weight（已是 4.0，不建议继续上调）：
+- 当前 weight=4.0，distance_reward_weight=4.0，两者已均等。进一步上调 tracking 可能引起不平衡。**不推荐。**
+
+**推荐方向 A**。
+
+### Priority 3 (LOW): 确认 entropy_loss_scale 设置，防止 policy_std 再次下滑
+
+**当前状态：** policy_std 已从 0.410 回升至 0.450，是好转信号。entropy_loss_scale 当前值未知（需核查 cfg），但 entropy_loss ≈ −0.00545 表明熵正则化在工作。
+
+**建议：** 重启时验证 `entropy_loss_scale` 设置值，确保不低于 0.001。无需修改，只需记录确认。
+
+---
+
+## Experiment Plan（更新）
+
+1. **终止当前 run 11-01-07**（已 1.855M 步，继续意义有限）
+2. **重启配置变更：**
+   - fly_high_termination_z: 4.5 → 5.0（Priority 1）
+   - capture_distance: 3.0 → 3.5（Priority 2，可选）
+   - 其他参数保持不变（sustained_follow_duration=1.5s、tracking_weight=4.0 已验证有效，不动）
+3. **从最新 checkpoint 热启动**（保留策略能力，避免从零开始）
+4. **运行目标：** 1.5M 步，监控以下指标
+5. **500k 步检查点（新运行）：**
+   - tracking_reward recent_mean > 1.5/ep → 继续
+   - height_reward recent_mean > 1.6/ep（确认 fly_high 不再是主要终止源）
+   - episode_min std < 30（稳定性恢复）
+6. **成功标准（本轮）：**
+   - tracking_reward mean > 2.0/ep，std < 0.4
+   - episode_mean > 200 步
+   - best ever tracking > 6.0（超越历史最高 4.923）
+
+---
+
+## Changelog
+
+- 2026-03-26：分析 run 11-01-07（1.855M 步，超越 1.2M 检查节点）。1.2M 和 2M 里程碑均未达到。
+  tracking_reward 呈三段单调下滑（1.833→1.336→0.889），确认为持续衰减而非过渡期震荡。
+  fly_high 终止压力未缓解（episode_min std≈mean）。policy_std 回升至 0.450（唯一正面信号）。
+  判断：需要干预——重启并放宽 fly_high_termination_z 4.5→5.0m，可选放宽 capture_distance 3.0→3.5m。
