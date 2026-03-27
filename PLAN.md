@@ -2244,3 +2244,205 @@ If fly_high terminations are confirmed as the primary cause at the 500k checkpoi
 ## Changelog
 - 2026-03-27: 357k 步复检（与上次分析数据相同，events 未更新）。Policy_std 斜率转正，跌破 0.37 风险消除。发现 upright_penalty（−4.1/ep）为最大负向项，crash/illegal_contact 终止率 71% 为新关注点。综合判断：继续等待，等待 500k 步检查点。
 
+---
+
+# Training Analysis Report
+
+**Run:** 2026-03-26_14-02-25_mappo_torch_mappo
+**Date:** 2026-03-27
+**Task:** Isaac-marl-flyfollow-v0 (move_flyfollow variant)
+**Algorithm:** MAPPO
+**Total Timesteps:** 2,000,000
+**Script Status:** regressing（分析器评级）
+
+## Training Metrics Summary
+
+| 指标 | 数值 | 对比上轮（357k步） |
+|------|------|------------------|
+| total_reward_mean（最后值） | 69.65 | 46.22 |
+| total_reward_mean（recent_mean） | 51.10 | 54.28 |
+| total_reward_best_ever | 111.63 | 111.63（相同） |
+| tracking_reward（最后值） | 2.446 | 2.174 |
+| tracking_reward（recent_mean） | 1.663 | 1.798 |
+| tracking_reward（best_ever） | 4.757 | 4.241 |
+| height_reward（recent_mean） | 1.797 | 1.817 |
+| distance_reward（recent_mean） | 21.20 | 22.96 |
+| episode_mean（recent_mean） | 192.7 步 | 208.7 步 |
+| policy_std（最后值） | 0.3551 | 0.3778 |
+| policy_std（recent_mean） | 0.3712 | 0.3754 |
+| crash 终止率（recent_mean） | 83.1% | 71%（估算） |
+| fly_high 终止率（recent_mean） | 21.0% | ~31% |
+| illegal_contact 终止率（recent_mean） | 81.8% | ~71% |
+| success_reward | 0.000（从未触发） | 0.000 |
+| velocity_penalty | 0.000（始终为零） | 0.000 |
+
+---
+
+## 问题 1：热启动判断 — 确认为同一连续 run 的 TFEvents 延续
+
+**证据：**
+- 两个 run 的前 5 步 `total_reward_mean` 完全相同：`[50.6, 55.4, 43.0, 54.9, 41.7]`，均值 49.1。
+- 两个 run 的前 5 步 `policy_std` 完全相同：`[0.3963, 0.3967, 0.3968, 0.3968, 0.397]`。
+- 新 run step 从 200 开始（而非从 0 重置），与上轮 step 范围（100–356900）高度重叠。
+
+**结论：** 这两个 run 目录共享同一批 TFEvents 数据（或新 run 从上轮 checkpoint 热启动后重放了相同的初始轨迹）。**新 run 并非从零冷启动，而是上轮训练的直接延续，共 2M 步。** 上轮（09-31-34）已达到 best_ever=111.63（对应某早期高峰），新 run 的 best_ever 同样为 111.63，进一步确认数据连续性。
+
+---
+
+## 问题 2：tracking_reward 趋势 — 下降，进入衰退期
+
+**数据：**
+- early_mean: 1.790 → recent_mean: **1.663**（-7.1%）
+- best_ever: 4.757（远高于上轮的 4.241，说明在训练中途有过高峰）
+- 最后值 2.446 高于 recent_mean，表明存在局部反弹，但趋势仍向下
+
+**诊断：** tracking_reward 在 2M 步时已从早期均值下滑。结合 total_reward_mean 的 early→recent 也从 53.6 降至 51.1，判断训练整体处于轻度衰退状态。policy 已接近当前 reward 设计下的局部最优，无法进一步优化 tracking。
+
+**根因假设：**
+1. upright_penalty（recent_mean = **-3.90/ep**）+ height_penalty（recent_mean = **-2.94/ep**）合计约 **-6.84/ep**，是总奖励中最大的负向来源，压制了 tracking 信号。
+2. illegal_contact 终止率 81.8% 意味着大多数 episode 在碰撞中终止，无法积累足够的 tracking 奖励。
+
+---
+
+## 问题 3：crash/illegal_contact 终止率 — 恶化（HIGH）
+
+**数据：**
+- `Episode_Termination/crash`: early_mean=83.1%，recent_mean=**83.1%**（无改善）
+- `Episode_Termination/illegal_contact`: early_mean=81.2%，recent_mean=**81.8%**（轻微恶化）
+- 与上轮报告的 71% 相比，**上升约 10–12 个百分点**
+
+**严重程度：** HIGH。超过 80% 的 episode 以碰撞终止，无人机无法建立长时稳定的追踪行为。
+
+**诊断：** 碰撞率高有两种成因：
+1. 无人机飞得过低（fly_low 终止 recent_mean=1.9%）-- 低空坠地
+2. 无人机碰到地面/目标小车/其他无人机 -- 接触碰撞
+
+`Episode_Termination/drones_collide` recent_mean=0.11%，可排除无人机间碰撞。主因应为无人机与地面或小车的接触（illegal_contact）。这与 fly_high 终止率下降（31%→21%）一致——无人机改为飞低，但代价是碰地率上升。
+
+---
+
+## 问题 4：episode 长度 — 轻微缩短（MEDIUM）
+
+**数据：**
+- episode_mean recent_mean: **192.7 步**（vs 上轮 208.7 步，-7.7%）
+- timesteps_min recent_mean: 74.4 步（极短 episode 持续存在）
+- timesteps_max recent_mean: 276 步（最长 episode 未改善）
+
+**诊断：** episode 长度轻微缩短，与 crash 率恶化一致。无人机越来越难以维持长时间飞行。2M 步时距离任务目标（episode_length_s=60s，对应约 600 步）仍有巨大差距。
+
+---
+
+## 问题 5：policy_std — 继续收窄（MEDIUM）
+
+**数据：**
+- 上轮（357k步）：0.3778
+- 本轮最后值：**0.3551**（-5.8%）
+- recent_mean: 0.3712，recent_std 仅 0.0069（极低波动）
+- 趋势：单调下降，从 early_mean=0.3816 持续降低
+
+**诊断：** policy_std 继续收窄，探索空间压缩。在 crash 率未改善的情况下，过早的探索收缩意味着 policy 正在收敛到一个次优局部解（碰撞-重置循环），而非真正学会追踪。
+
+**风险：** 若 policy_std 降至 0.34 以下，可能需要熵奖励干预。当前尚未触发紧急阈值，但需监控。
+
+---
+
+## 问题 6：height_penalty 与 upright_penalty 主导负向奖励（HIGH）
+
+**数据：**
+- `height_penalty` recent_mean: **-2.94/ep**（early=-3.33，小幅改善）
+- `upright_penalty` recent_mean: **-3.90/ep**（early=-4.17，小幅改善）
+- 两者合计 **-6.84/ep**，远超 tracking_reward(+1.66) + height_reward(+1.80)
+
+**诊断：** 无人机存在严重的姿态不稳定和高度控制不良。当前配置：
+- `height_penalty_weight=2.0`，`height_penalty_threshold=0.3`（高度偏差超过 0.3m 即触发）
+- `upright_penalty_weight=1.0`
+- `desired_height=1.5m`
+
+这些惩罚的绝对值（各约 -3 至 -4/ep）意味着无人机大部分时间都在偏离期望姿态和高度，且这一问题在 2M 步训练后**未能有效解决**。
+
+---
+
+## 综合判断
+
+**结论：当前训练陷入局部次优，需要干预。**
+
+2M 步训练后的状态：
+- tracking_reward 从峰值（best=4.757）回落至 recent_mean=1.663，**处于下降趋势**
+- crash/illegal_contact 率 **83%**，绝大多数 episode 在碰撞中结束
+- policy_std 持续收窄（0.355），探索能力萎缩
+- height_penalty + upright_penalty 合计约 -6.84/ep，成为主导的负向信号
+- success_reward 从未触发
+
+这不是"继续等待"可以解决的问题。policy 已在当前 reward 设计下达到稳定的次优均衡：无人机学会了在碰撞-重置循环中积累 distance_reward（21.2/ep），但无法突破到稳定追踪阶段。
+
+---
+
+## 改进建议
+
+### Priority 1 (HIGH)：降低 height_penalty_weight，放宽高度容忍阈值
+
+**问题：** height_penalty 贡献 -2.94/ep，high_penalty_threshold=0.3m 过于严苛，在高速追踪动态目标时难以维持。
+**建议改动：**
+- 文件：`marl_flyfollow_env_cfg.py`
+- `height_penalty_weight`: 2.0 → **1.0**
+- `height_penalty_threshold`: 0.3 → **0.5**
+- **理由：** 减少高度惩罚主导效应，让 policy 更多关注 tracking 而非姿态微调。
+
+### Priority 2 (HIGH)：降低 upright_penalty_weight
+
+**问题：** upright_penalty -3.90/ep 为最大单项负向奖励，在追踪动态小车时姿态倾斜是必要的机动动作，过重惩罚会阻碍机动性。
+**建议改动：**
+- 文件：`marl_flyfollow_env_cfg.py`
+- `upright_penalty_weight`: 1.0 → **0.5**
+- **理由：** 先前 2026-03-12 已有将 body_rate_penalty 等权重下调的成功经验（body_rate/upright 0.5→1.0 的回调是因姿态崩溃，但当前 crash=83% 说明过重惩罚已适得其反）。
+
+### Priority 3 (MEDIUM)：提高 illegal_contact 惩罚以主动惩戒碰撞行为
+
+**问题：** `illegal_contact_penalty=1.0`，`crash_penalty_scale=1.0`。当前惩罚幅度不足以改变 policy 行为（crash 率 83% 说明 policy 已将碰撞终止视为"正常"）。
+**建议改动：**
+- 文件：`marl_flyfollow_env_cfg.py`
+- `illegal_contact_penalty`: 1.0 → **3.0**
+- `crash_penalty_scale`: 1.0 → **2.0**
+- **理由：** 大幅提升碰撞惩罚，使 policy 学会规避碰撞，延长 episode 长度，进而有更多机会积累 tracking_reward。
+
+### Priority 4 (MEDIUM)：降低 desired_height 以减少高度追踪难度
+
+**问题：** `desired_height=1.5m`，`fly_high_threshold=4.0m`，留白充裕，但无人机频繁触发 height_penalty（1.5m ±0.3m），说明控制精度不足。
+**建议改动：**
+- 文件：`marl_flyfollow_env_cfg.py`
+- `desired_height`: 1.5 → **2.0m**（远离地面，减少意外碰地）
+- `fly_high_threshold`: 4.0 → **4.5m**（对应放宽上界）
+- **理由：** 飞行高度提升可减少与地面/小车的意外接触，降低 illegal_contact 率。
+
+### Priority 5 (LOW)：增加熵系数以缓解 policy_std 收缩
+
+**问题：** policy_std 单调下降至 0.355，在 crash 率未改善的情况下提前收敛。
+**建议改动：**
+- 文件：SKRL MAPPO 训练配置
+- `entropy_loss_scale`（或等效的 `entropy_coeff`）：当前值 → 适当增大（参考当前 entropy_loss=-0.0036）
+- 时机：在 Priority 1-3 改动后重新训练，若 policy_std < 0.35 再介入。
+
+---
+
+## 实验计划
+
+1. 按 Priority 1→2→3→4 顺序修改 `marl_flyfollow_env_cfg.py`
+2. 重启训练（冷启动或从本 run 的最佳 checkpoint 热启动）：
+   ```bash
+   python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 \
+     --headless --num_envs=2048 --algorithm="MAPPO"
+   ```
+3. 关键监控指标（前 500k 步）：
+   - crash 终止率：目标 < 60%（当前 83%）
+   - episode_mean：目标 > 220 步（当前 192 步）
+   - tracking_reward recent_mean：目标 > 2.0/ep（当前 1.663）
+   - height_penalty：目标 > -1.5/ep（当前 -2.94）
+   - upright_penalty：目标 > -2.5/ep（当前 -3.90）
+4. 成功标准（1M 步检查点）：
+   - crash 率 < 50%，tracking_reward > 2.5/ep，success_reward > 0.1（至少偶发触发）
+
+---
+
+## Changelog
+- 2026-03-27: 分析 2026-03-26_14-02-25 run（2M步，热启动延续自09-31-34）。确认为同一连续训练的延续。发现训练进入轻度衰退：tracking_reward 下滑至 1.663，crash 率恶化至 83%，height_penalty+upright_penalty 合计-6.84/ep 成为主导负向信号，policy_std 收窄至 0.355。综合判断需要干预：建议降低 height_penalty_weight(2→1)、upright_penalty_weight(1→0.5)，提升 illegal_contact_penalty(1→3)，提高 desired_height(1.5→2.0m)。
+
