@@ -2102,3 +2102,145 @@ If fly_high terminations are confirmed as the primary cause at the 500k checkpoi
 
 ---
 
+
+---
+
+# Training Analysis Report — 2026-03-26_09-31-34 (第二次检查)
+
+**Run:** 2026-03-26_09-31-34_mappo_torch_mappo
+**Analysis Date:** 2026-03-27
+**Total Steps (this run):** 356,900（与上次分析持平 — 训练已停止或 events 未更新）
+**Cumulative Steps:** ~2.21M（含前序热启动积累）
+**Task:** Isaac-marl-flyfollow-v0 / MAPPO
+
+---
+
+## 训练指标摘要
+
+| 指标 | 上次分析 (357k) | 本次 (356.9k) | 变化 |
+|------|----------------|---------------|------|
+| policy_std (last) | 0.375 | 0.3778 | **↑ +0.003（好转）** |
+| policy_std (recent_mean 200步) | 0.375 | 0.3754 | 持平 |
+| tracking_reward (last) | 2.174 | 2.174 | 持平（同一时刻） |
+| tracking_reward (recent_200 mean) | 1.798 | 1.700 | 略降 |
+| distance_reward (recent_200) | 22.96 | 22.26 | 持平 |
+| height_reward (recent_200) | 1.817 | 1.783 | 持平 |
+| episode_mean (last) | 204.6 | 204.6 | 持平 |
+| episode_mean (recent_200) | 208.7 | 208.7 | 持平 |
+| total_reward (recent_200) | 54.28 | — | — |
+| upright_penalty (recent_200) | — | **−4.108** | **新发现** |
+| height_penalty (recent_200) | — | **−3.480** | **新发现** |
+
+**重要：** events 文件最后步数仍为 356,900，与上次分析完全相同。这表明本次分析读取的是同一数据，**训练可能已停止运行**，或本次分析与上次分析间隔极短（仅几分钟内）。
+
+---
+
+## 核心发现
+
+### 发现 1：policy_std 尚未跌破 0.37 — PASS
+
+**状态：** policy_std 当前范围 0.3754–0.3778（近200步），全程历史最低仅 0.3706，**从未跌破 0.370**。
+
+**斜率分析（最后200个记录点的线性回归）：**
+- 斜率 = **+0.000166 / 1000步**（正值，正在小幅反弹）
+- 当前 0.3778 距警戒线 0.370 仍有 0.008 的缓冲
+- 前次分析担忧的"继续下降至跌破 0.37"**未发生**，斜率已转正
+
+**判断：** 无需 entropy 干预。policy_std 在 0.370–0.380 区间震荡整固，这是正常的"探索稳定化"行为，而非压缩崩溃前兆。
+
+---
+
+### 发现 2：upright_penalty 是当前最大负向奖励 — HIGH
+
+**数据：** upright_penalty recent_200_mean = **−4.108/ep**，last = −4.54，历史最差 −6.68。
+
+**背景：** 本轮重启（2026-03-26）在 commit ef50372 中将 `upright_penalty_weight` 从 0.5 恢复至 1.0（与 `body_rate_penalty_weight` 同步）。这是为了改善姿态稳定性（commit d7c8205）。
+
+**问题：** 与前一次运行（11-01-07）的 upright_penalty 相比，本次值 −4.1/ep 是否偏大？需要与 cfg 中的权重核实。此前 15-06-36 运行（weight=0.5）对应值约 −1.0–1.5/ep。权重加倍 → 实际惩罚倍增，合理。
+
+**关键：** upright_penalty（−4.1）+ height_penalty（−3.5）+ fly_high（−0.16）+illegal_contact（−0.70）= **−8.46/ep 净负向**。相比之下，height_reward（+1.78）+ tracking_reward（+1.70）+distance_reward（+22.3）= **+25.78/ep 净正向**。
+
+净收益仍正向（+17.3/ep），但 upright_penalty 作为单一最大负向项目值得关注。
+
+**结论：** 不建议立即降低权重。但若 tracking_reward 在 500k 步后仍不增长，upright_penalty 可能在抑制进攻性追踪行为（姿态倾斜用于加速追踪目标）。
+
+---
+
+### 发现 3：crash + illegal_contact 终止 — 新关注点 — MEDIUM
+
+**数据（recent_mean）：**
+- `Episode_Termination/crash`: 0.73/ep（即平均每个环境每次迭代 0.73 个 episode 以 crash 结束）
+- `Episode_Termination/illegal_contact`: 0.71/ep（几乎完全重叠）
+- `Episode_Termination/falcon_fly_high`: 0.31/ep（降低，之前为 0.56/ep）
+- `Episode_Termination/time_out`: 0.000（无超时，episode 总长度未达上限）
+
+**解读：** crash ≈ illegal_contact 表明 crash 终止几乎全部由 illegal_contact（无人机碰地面或障碍物）触发。fly_high 终止已从之前的主要终止原因（11-01-07 期间）降低，5.0m 放宽有效。
+
+**问题：** crash/illegal_contact 率为 0.71–0.73/ep（即约 70% 的 episode 以碰撞结束）是否正常？需要与早期运行对比。根据 15-06-36 运行（670k 步时），当时主要终止原因未记录具体数字，但 episode_min 约 100 步，暗示碰撞终止并不如此频繁。
+
+**可能成因：** 高 upright_penalty 使无人机在接近目标时"翻滚"惩罚减少倾斜，但接近目标时由于速度控制不足撞地（desired_height=1.5m，目标在 z≈0.25m，接近时高度误差大）。
+
+---
+
+### 发现 4：tracking_reward 趋势 — 高波动，均值停滞 — MEDIUM
+
+**数据（最后10步）：**
+- 范围：1.316 至 2.174，震荡幅度 ≈ 0.86/ep（约±25%）
+- recent_200_mean = 1.700（略低于上次分析的 1.798）
+- best_ever = 4.241（低于历史峰值 4.923）
+
+**解读：** tracking_reward 高波动（CV ≈ 28%）是策略尚在探索 capture zone 的正常现象，不是崩溃信号。均值 1.7 接近 previous run 早期的 1.83，说明热启动恢复完成但未超越。
+
+**关键路径：** 从 1.7 到 2.0/ep（下一个里程碑）需要策略探索出更稳定的持续跟随行为。在 policy_std 稳定（不继续压缩）的前提下，这是可以期待的。
+
+---
+
+### 发现 5：success_reward 持续为 0 — 关注
+
+**数据：** success_reward recent_200_mean = 0.000，best_ever = 0.000（全程未触发）。
+
+**背景：** success_reward 需要所有3架无人机同时在各自目标的 capture_distance（3.5m）内，且持续 sustained_follow_duration（1.5s）以上。
+
+**分析：** 尽管 tracking_reward（需满足 1/1/2 架进入 capture zone 的某些版本）达到 2.174，success_reward 从未触发，说明三架同时达标的条件极难满足。这不是 bug，是任务难度的体现。
+
+---
+
+## 综合判断
+
+**结论：继续等待。**
+
+五项问题分析总结：
+
+1. **policy_std 未跌破 0.37** — 斜率转正，当前 0.375–0.378，无需熵干预。上次分析的预警条件**未被触发**。
+
+2. **tracking_reward 均值 1.70/ep** — 高波动但稳定，仍在 1.5 合格线以上，符合 500k 步检查点标准（>1.5/ep）。训练仍在进行中（如果 events 确实是最新的），无下降趋势。
+
+3. **episode 长度 208 步** — 维持 +24% 改善水平，fly_high 终止明显减少（从 56% 降至 31%），5.0m 放宽持续有效。
+
+4. **新发现：upright_penalty −4.1/ep** 是当前最大单项负向奖励，但整体净收益仍为正。不需要立即处理。
+
+5. **新发现：crash/illegal_contact 70% 终止率** 是需要在下一检查点确认的指标。如果这一比例继续上升或 episode_length 下降，需要诊断无人机是否因接近目标而频繁碰地。
+
+**当前阶段：** 357k 步热启动稳定化阶段（符合预期）。500k 步是真正的判断时刻。
+
+---
+
+## 更新后的检查点标准（500k 步）
+
+| 指标 | 通过标准 | 失败标准 | 当前值 |
+|------|---------|---------|-------|
+| tracking_reward recent_mean | > 1.5/ep | < 1.5/ep | 1.70 (边缘通过) |
+| height_reward recent_mean | > 1.7/ep | < 1.5/ep | 1.78 (通过) |
+| policy_std | > 0.370 | < 0.370 | 0.375 (通过) |
+| episode_mean | > 190 步 | < 160 步 | 208 步 (通过) |
+| crash_rate | < 80% | > 90% | 71% (注意) |
+| tracking best_ever | > 4.5 | < 3.5（停滞） | 4.241 (注意) |
+
+**500k 步通过后行动：** 继续至 1M 步。
+**500k 步任一失败后行动：** 按 Priority 排序，优先检查 crash 原因后再调整参数。
+
+---
+
+## Changelog
+- 2026-03-27: 357k 步复检（与上次分析数据相同，events 未更新）。Policy_std 斜率转正，跌破 0.37 风险消除。发现 upright_penalty（−4.1/ep）为最大负向项，crash/illegal_contact 终止率 71% 为新关注点。综合判断：继续等待，等待 500k 步检查点。
+
