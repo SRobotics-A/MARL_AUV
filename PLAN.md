@@ -1,3 +1,157 @@
+## TensorBoard 训练图表含义说明
+
+> 适用任务：Isaac-move-flyfollow-marl-v0（MAPPO）
+> 本节说明 TensorBoard 中每张图的含义，便于团队成员快速理解训练状态。
+
+---
+
+### 一、Reward（奖励）
+
+#### `Reward / Instantaneous reward (mean/max/min)`
+
+- **含义**：每个训练步（rollout step）的即时奖励，跨所有并行环境的均值/最大值/最小值
+- **单位**：奖励值（无量纲，已乘 step_dt 归一化）
+- **如何读**：mean 持续上升 = 策略整体在进步；max 远高于 mean = 存在少数高质量 episode；min 长期为负 = 部分环境仍在受惩罚
+- **正常范围**：本任务中 mean 从 −5 起步，收敛后约 +3～+5/step
+
+#### `Reward / Total reward (mean/max/min)`
+
+- **含义**：每个 episode（回合）累计总奖励的均值/最大值/最小值
+- **如何读**：与 Instantaneous 的区别是它是 episode 维度的，受 episode 长度影响——episode 越长，total 越高
+- **诊断用途**：若 total mean 上升但 episode 长度也在上升，需分离两者贡献
+
+---
+
+### 二、Episode（回合统计）
+
+#### `Episode / Total timesteps (mean/max/min)`
+
+- **含义**：每个 episode 持续的控制步数（1步=10ms，100步=1秒）
+- **如何读**：
+  - mean 短（<100步）= 频繁提前终止，说明存在终止条件过严或策略不稳定
+  - mean 长（>200步）= 策略存活能力强，有机会积累更多追踪奖励
+  - min 极短（<30步）= 大量 fly_high 或坠机终止，需重点排查
+- **本任务目标**：mean > 200步，max mean > 350步
+
+---
+
+### 三、Episode_Reward（分项奖励，每 episode 均值）
+
+每个分项代表该奖励分量在一个 episode 内的累计均值。正值越大越好，负值越接近 0 越好。
+
+#### 追踪类（核心任务指标）
+
+| 图表名            | 含义                                                         | 期望趋势                   |
+| ----------------- | ------------------------------------------------------------ | -------------------------- |
+| `distance_reward` | exp(−dist×0.3)×target_value 的 episode 累计值，反映无人机离目标的远近 | 持续上升，最终稳定         |
+| `tracking_reward` | 仅在进入捕获区（dist<3.5m）时给予的奖励，是任务成功的核心信号 | **最重要指标**，应持续上升 |
+| `velocity_follow` | 无人机 XY 速度与目标速度（0.3m/s x向）匹配程度，exp(−vel_err²) | 应随 tracking 同步上升     |
+
+#### 稳定性类（姿态与控制质量）
+
+| 图表名              | 含义                                                         | 期望趋势       |
+| ------------------- | ------------------------------------------------------------ | -------------- |
+| `body_rate_penalty` | exp(−                                                        |                |
+| `upright_penalty`   | (R_zz−1.0)×dt，机体偏离竖直越多惩罚越大，接近 0 表示飞行姿态良好 | 应接近 0       |
+| `action_smoothness` | exp(−                                                        |                |
+| `height_reward`     | exp(−                                                        | z−1.5m         |
+| `force_penalty`     | exp(−max_thrust_normalized)×dt，旋翼推力越低奖励越高         | 上升后稳定即可 |
+
+#### 惩罚类（安全与约束违反，越接近 0 越好）
+
+| 图表名              | 含义                                       | 期望趋势         |
+| ------------------- | ------------------------------------------ | ---------------- |
+| `fly_high_penalty`  | exp(z−4.0m)×dt，超过 4m 后指数增长的软惩罚 | 应趋向 0         |
+| `height_penalty`    | \|z−desired\|>0.3m 时的线性惩罚            | 应趋向 0         |
+| `collision_penalty` | 无人机两两间距 <0.6m 时的碰撞惩罚          | 应趋向 0         |
+| `drone_out`         | 无人机超出 ±60m 边界的惩罚                 | 正常训练中应为 0 |
+| `fly_low`           | z<0.1m 时的坠地惩罚                        | 应为 0           |
+| `illegal_contact`   | 接触传感器力 >1N 时的惩罚                  | 应为 0           |
+| `velocity_penalty`  | 当前已禁用（权重=0），恒为 0               | 忽略             |
+
+---
+
+### 四、Episode_Termination（终止原因统计）
+
+每项表示该终止原因在一批重置 episode 中的触发次数。**诊断早期训练问题最有用的一组图表。**
+
+| 图表名                  | 含义                                         | 正常状态                     |
+| ----------------------- | -------------------------------------------- | ---------------------------- |
+| `falcon_fly_high`       | z > 5.0m 触发的高飞终止                      | 早期高，随训练降至接近 0     |
+| `falcon_fly_low`        | z < 0.1m 触发的坠地终止                      | 应始终为 0                   |
+| `bounding_box`          | 无人机超出 ±60m 边界终止                     | 应为 0（已修复）             |
+| `crash`                 | fly_low + illegal_contact 的合并统计         | 应为 0                       |
+| `drones_collide`        | 无人机互撞终止                               | 应为 0                       |
+| `targets_out_of_bounds` | 目标小车 x > 30m 跑出场景终止                | 偶发，episode 较长时出现     |
+| `time_out`              | episode 达到最大长度（60s）正常超时          | 越多越好，代表策略存活能力强 |
+| `all_targets_captured`  | 成功：≥3个目标同时被跟随持续 1.5s            | **目标**：越多越好           |
+| `out_of_bounds`         | 目标超出边界（= targets_out_of_bounds 别名） | 同上                         |
+
+---
+
+### 五、Loss（损失函数）
+
+#### `Loss / Policy loss`
+
+- **含义**：Actor（策略网络）的 PPO Clipped Surrogate Loss
+- **如何读**：正常训练中应在 −0.05～−0.005 范围内波动，接近 0 表示策略更新平稳；突然变大（绝对值 >0.1）表示梯度爆炸或 ratio_clip 过大
+
+#### `Loss / Value loss`
+
+- **含义**：Critic（价值网络）的均方误差损失，衡量价值估计精度
+- **如何读**：应随训练单调下降至接近 0；下降停滞说明 Critic 已收敛（好）或卡住（需检查 reward scale）
+- **本任务**：从 ~1.0 降至 0.02~0.05 为正常收敛区间
+
+#### `Loss / Entropy loss`
+
+- **含义**：策略熵的负值，体现探索程度（entropy_loss_scale=0.01 时，此值 = −0.01×H）
+- **如何读**：绝对值越大 = 熵越高 = 探索越充分；趋向 0 = 策略趋于确定性（探索减少）
+- **警戒**：若接近 0 且 policy_std 也在下降，说明探索耗尽，需考虑增大 entropy_loss_scale
+
+---
+
+### 六、Policy（策略统计）
+
+#### `Policy / Standard deviation`
+
+- **含义**：Actor 输出的高斯动作分布标准差（平均值），直接反映策略的探索程度
+- **如何读**：
+  - 初始值 ≈ exp(initial_log_std) = exp(−0.2) ≈ 0.82
+  - 正常收敛：0.4～0.6（适度确定性）
+  - **警戒线 <0.38**：探索不足，策略可能陷入局部最优
+  - **警戒线 <0.35**：探索崩溃风险，建议增大 entropy_loss_scale
+- **本任务当前值**：0.375（需监控）
+
+#### `Policy / Gradient norm actor / critic`
+
+- **含义**：Actor/Critic 梯度的 L2 范数（已经过 grad_norm_clip=1.0 裁剪）
+- **如何读**：稳定在 0.1～1.0 之间为正常；持续为 1.0 说明梯度被裁剪（学习率可能过大）；接近 0 说明梯度消失
+
+---
+
+### 七、Performance（训练效率）
+
+| 图表名            | 含义                                               | 参考值                        |
+| ----------------- | -------------------------------------------------- | ----------------------------- |
+| `total FPS`       | 每秒处理的仿真帧数（num_envs × steps/s）           | num_envs=16 时约 300～500 FPS |
+| `Collection Time` | 每次 rollout 数据采集耗时（秒）                    | 应稳定，突然增大说明仿真卡顿  |
+| `Learning time`   | 每次网络更新（learning_epochs × mini_batches）耗时 | 应稳定                        |
+
+---
+
+### 八、快速诊断指南
+
+| 现象                   | 最可能原因            | 查哪张图                                              |
+| ---------------------- | --------------------- | ----------------------------------------------------- |
+| episode 很短（<100步） | fly_high 终止过多     | `Episode_Termination/falcon_fly_high`                 |
+| tracking=0             | 从未进入捕获区        | `distance_reward` 是否在增长                          |
+| 总奖励为负             | 惩罚项压制奖励        | `fly_high_penalty`、`height_penalty`                  |
+| 训练停滞               | 探索耗尽              | `Policy/Standard deviation`                           |
+| value loss 不降        | Critic 收敛慢         | 检查 reward scale 是否过大                            |
+| tracking 下滑          | fly_high 过于频繁截断 | `Episode_Termination/falcon_fly_high` + `episode min` |
+
+------
+
 # Training Analysis Report
 
 **Run:** `2026-03-23_17-12-31_mappo_torch_mappo`
@@ -1947,148 +2101,4 @@ If fly_high terminations are confirmed as the primary cause at the 500k checkpoi
 
 
 ---
-
-## TensorBoard 训练图表含义说明
-
-> 适用任务：Isaac-move-flyfollow-marl-v0（MAPPO）
-> 本节说明 TensorBoard 中每张图的含义，便于团队成员快速理解训练状态。
-
----
-
-### 一、Reward（奖励）
-
-#### `Reward / Instantaneous reward (mean/max/min)`
-- **含义**：每个训练步（rollout step）的即时奖励，跨所有并行环境的均值/最大值/最小值
-- **单位**：奖励值（无量纲，已乘 step_dt 归一化）
-- **如何读**：mean 持续上升 = 策略整体在进步；max 远高于 mean = 存在少数高质量 episode；min 长期为负 = 部分环境仍在受惩罚
-- **正常范围**：本任务中 mean 从 −5 起步，收敛后约 +3～+5/step
-
-#### `Reward / Total reward (mean/max/min)`
-- **含义**：每个 episode（回合）累计总奖励的均值/最大值/最小值
-- **如何读**：与 Instantaneous 的区别是它是 episode 维度的，受 episode 长度影响——episode 越长，total 越高
-- **诊断用途**：若 total mean 上升但 episode 长度也在上升，需分离两者贡献
-
----
-
-### 二、Episode（回合统计）
-
-#### `Episode / Total timesteps (mean/max/min)`
-- **含义**：每个 episode 持续的控制步数（1步=10ms，100步=1秒）
-- **如何读**：
-  - mean 短（<100步）= 频繁提前终止，说明存在终止条件过严或策略不稳定
-  - mean 长（>200步）= 策略存活能力强，有机会积累更多追踪奖励
-  - min 极短（<30步）= 大量 fly_high 或坠机终止，需重点排查
-- **本任务目标**：mean > 200步，max mean > 350步
-
----
-
-### 三、Episode_Reward（分项奖励，每 episode 均值）
-
-每个分项代表该奖励分量在一个 episode 内的累计均值。正值越大越好，负值越接近 0 越好。
-
-#### 追踪类（核心任务指标）
-
-| 图表名 | 含义 | 期望趋势 |
-|--------|------|---------|
-| `distance_reward` | exp(−dist×0.3)×target_value 的 episode 累计值，反映无人机离目标的远近 | 持续上升，最终稳定 |
-| `tracking_reward` | 仅在进入捕获区（dist<3.5m）时给予的奖励，是任务成功的核心信号 | **最重要指标**，应持续上升 |
-| `velocity_follow` | 无人机 XY 速度与目标速度（0.3m/s x向）匹配程度，exp(−vel_err²) | 应随 tracking 同步上升 |
-
-#### 稳定性类（姿态与控制质量）
-
-| 图表名 | 含义 | 期望趋势 |
-|--------|------|---------|
-| `body_rate_penalty` | exp(−||角速率||)×dt，角速率越低奖励越高，反映姿态平稳程度 | 应保持较高且稳定（>0.3） |
-| `upright_penalty` | (R_zz−1.0)×dt，机体偏离竖直越多惩罚越大，接近 0 表示飞行姿态良好 | 应接近 0 |
-| `action_smoothness` | exp(−||Δaction||²)，相邻两步动作变化越小奖励越高 | 上升后稳定 |
-| `height_reward` | exp(−|z−1.5m|)×dt，维持在期望高度 1.5m 附近的奖励 | 应随训练上升并稳定 |
-| `force_penalty` | exp(−max_thrust_normalized)×dt，旋翼推力越低奖励越高 | 上升后稳定即可 |
-
-#### 惩罚类（安全与约束违反，越接近 0 越好）
-
-| 图表名 | 含义 | 期望趋势 |
-|--------|------|---------|
-| `fly_high_penalty` | exp(z−4.0m)×dt，超过 4m 后指数增长的软惩罚 | 应趋向 0 |
-| `height_penalty` | \|z−desired\|>0.3m 时的线性惩罚 | 应趋向 0 |
-| `collision_penalty` | 无人机两两间距 <0.6m 时的碰撞惩罚 | 应趋向 0 |
-| `drone_out` | 无人机超出 ±60m 边界的惩罚 | 正常训练中应为 0 |
-| `fly_low` | z<0.1m 时的坠地惩罚 | 应为 0 |
-| `illegal_contact` | 接触传感器力 >1N 时的惩罚 | 应为 0 |
-| `velocity_penalty` | 当前已禁用（权重=0），恒为 0 | 忽略 |
-
----
-
-### 四、Episode_Termination（终止原因统计）
-
-每项表示该终止原因在一批重置 episode 中的触发次数。**诊断早期训练问题最有用的一组图表。**
-
-| 图表名 | 含义 | 正常状态 |
-|--------|------|---------|
-| `falcon_fly_high` | z > 5.0m 触发的高飞终止 | 早期高，随训练降至接近 0 |
-| `falcon_fly_low` | z < 0.1m 触发的坠地终止 | 应始终为 0 |
-| `bounding_box` | 无人机超出 ±60m 边界终止 | 应为 0（已修复） |
-| `crash` | fly_low + illegal_contact 的合并统计 | 应为 0 |
-| `drones_collide` | 无人机互撞终止 | 应为 0 |
-| `targets_out_of_bounds` | 目标小车 x > 30m 跑出场景终止 | 偶发，episode 较长时出现 |
-| `time_out` | episode 达到最大长度（60s）正常超时 | 越多越好，代表策略存活能力强 |
-| `all_targets_captured` | 成功：≥3个目标同时被跟随持续 1.5s | **目标**：越多越好 |
-| `out_of_bounds` | 目标超出边界（= targets_out_of_bounds 别名） | 同上 |
-
----
-
-### 五、Loss（损失函数）
-
-#### `Loss / Policy loss`
-- **含义**：Actor（策略网络）的 PPO Clipped Surrogate Loss
-- **如何读**：正常训练中应在 −0.05～−0.005 范围内波动，接近 0 表示策略更新平稳；突然变大（绝对值 >0.1）表示梯度爆炸或 ratio_clip 过大
-
-#### `Loss / Value loss`
-- **含义**：Critic（价值网络）的均方误差损失，衡量价值估计精度
-- **如何读**：应随训练单调下降至接近 0；下降停滞说明 Critic 已收敛（好）或卡住（需检查 reward scale）
-- **本任务**：从 ~1.0 降至 0.02~0.05 为正常收敛区间
-
-#### `Loss / Entropy loss`
-- **含义**：策略熵的负值，体现探索程度（entropy_loss_scale=0.01 时，此值 = −0.01×H）
-- **如何读**：绝对值越大 = 熵越高 = 探索越充分；趋向 0 = 策略趋于确定性（探索减少）
-- **警戒**：若接近 0 且 policy_std 也在下降，说明探索耗尽，需考虑增大 entropy_loss_scale
-
----
-
-### 六、Policy（策略统计）
-
-#### `Policy / Standard deviation`
-- **含义**：Actor 输出的高斯动作分布标准差（平均值），直接反映策略的探索程度
-- **如何读**：
-  - 初始值 ≈ exp(initial_log_std) = exp(−0.2) ≈ 0.82
-  - 正常收敛：0.4～0.6（适度确定性）
-  - **警戒线 <0.38**：探索不足，策略可能陷入局部最优
-  - **警戒线 <0.35**：探索崩溃风险，建议增大 entropy_loss_scale
-- **本任务当前值**：0.375（需监控）
-
-#### `Policy / Gradient norm actor / critic`
-- **含义**：Actor/Critic 梯度的 L2 范数（已经过 grad_norm_clip=1.0 裁剪）
-- **如何读**：稳定在 0.1～1.0 之间为正常；持续为 1.0 说明梯度被裁剪（学习率可能过大）；接近 0 说明梯度消失
-
----
-
-### 七、Performance（训练效率）
-
-| 图表名 | 含义 | 参考值 |
-|--------|------|--------|
-| `total FPS` | 每秒处理的仿真帧数（num_envs × steps/s） | num_envs=16 时约 300～500 FPS |
-| `Collection Time` | 每次 rollout 数据采集耗时（秒） | 应稳定，突然增大说明仿真卡顿 |
-| `Learning time` | 每次网络更新（learning_epochs × mini_batches）耗时 | 应稳定 |
-
----
-
-### 八、快速诊断指南
-
-| 现象 | 最可能原因 | 查哪张图 |
-|------|-----------|---------|
-| episode 很短（<100步）| fly_high 终止过多 | `Episode_Termination/falcon_fly_high` |
-| tracking=0 | 从未进入捕获区 | `distance_reward` 是否在增长 |
-| 总奖励为负 | 惩罚项压制奖励 | `fly_high_penalty`、`height_penalty` |
-| 训练停滞 | 探索耗尽 | `Policy/Standard deviation` |
-| value loss 不降 | Critic 收敛慢 | 检查 reward scale 是否过大 |
-| tracking 下滑 | fly_high 过于频繁截断 | `Episode_Termination/falcon_fly_high` + `episode min` |
 
