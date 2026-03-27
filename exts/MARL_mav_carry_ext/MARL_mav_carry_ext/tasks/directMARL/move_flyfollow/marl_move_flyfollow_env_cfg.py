@@ -117,24 +117,24 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 竖直姿态：w * (R_zz - 1.0) × dt，R_zz = 机体 z 轴与世界 z 轴夹角余弦
     # 完全竖直时 R_zz=1（奖励=0），翻滚时 R_zz=-1（奖励=-2×w×dt）
     # [PLAN fix-1] 降低权重
-    upright_penalty_weight = 1.0
+    upright_penalty_weight = 0.5
     upright_expect_dir = (0.0, 0.0, 1.0)  # 期望机体上方向 = 世界 z 轴
 
     # 高度奖励：鼓励维持在 desired_height 附近飞行
     # [Fix-A] 恢复到与 move 任务相同的权重（0.5→2.0），提供足够的高度锚定梯度
     height_reward_weight = 2.0
     # [Fix-D] 降低期望高度，更接近地面目标（NovaCarter 高约 0.25m）
-    desired_height = 1.5   # 期望飞行高度（m）
+    desired_height = 2.0   # 期望飞行高度（m）
 
     # 高度超限惩罚（线性）：|z - desired| > threshold 时额外惩罚
     # [Fix-E] 增强高度超限惩罚，收紧容忍偏差
-    height_penalty_weight = 2.0
-    height_penalty_threshold = 0.3   # 容忍偏差（m）
+    height_penalty_weight = 1.0
+    height_penalty_threshold = 0.5   # 容忍偏差（m）
 
     # 高飞惩罚：超过 fly_high_threshold 后每步软惩罚，防止无人机持续高飞
     # [Fix-B] 新增：每步 exp 形式惩罚，z 越高惩罚越大
     fly_high_penalty_weight = 2.0
-    fly_high_threshold = 4.0         # 超过此高度（m）开始惩罚
+    fly_high_threshold = 4.5         # 超过此高度（m）开始惩罚
 
     # 高飞终止：超过此高度直接终止 episode，避免长时间高飞浪费训练时间
     # [Fix-C] 新增：z > fly_high_termination_z 触发终止
@@ -144,7 +144,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     drone_out_of_bounds_penalty = 1.0  # 单次出界惩罚
     crash_penalty_scale = 1.0          # 坠机惩罚（未使用，保留接口）
     collision_penalty_scale = 1.0      # 无人机碰撞惩罚（per collision pair）
-    illegal_contact_penalty = 1.0      # 非法接触惩罚
+    illegal_contact_penalty = 3.0      # 非法接触惩罚
     fly_low_penalty = 1.0              # 飞低惩罚
     fly_high_penalty = 1.0             # 高飞终止固定惩罚（触发终止时一次性扣除）
 
