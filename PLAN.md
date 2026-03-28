@@ -2621,5 +2621,208 @@ Restart B 配置变更（相比当前）：
 ---
 
 ## Changelog
-- 2026-03-28: 分析 2026-03-27_19-15-45 run（1.125M 步，热启动自 14-02-25）。热启动确认成功。惩罚削减按预期生效（height_penalty -68%，upright_penalty -52%，policy_std 回升至 0.408）。但 crash 终止率仍 80%，tracking_reward 下滑至 1.316（vs 上轮 1.663），核心目标未达成。诊断：crash 局部最优结构未被打破，illegal_contact_penalty=3.0 仍在 policy 可接受损失范围内。建议：继续本轮至 1.5M 步观察；若未通过 milestone，Restart B 将 illegal_contact_penalty→5.0 并新增低空软惩罚。
+- 2026-03-28（第一次分析）: 分析 2026-03-27_19-15-45 run（1.125M 步，热启动自 14-02-25）。热启动确认成功。惩罚削减按预期生效（height_penalty -68%，upright_penalty -52%，policy_std 回升至 0.408）。但 crash 终止率仍 80%，tracking_reward 下滑至 1.316（vs 上轮 1.663），核心目标未达成。诊断：crash 局部最优结构未被打破，illegal_contact_penalty=3.0 仍在 policy 可接受损失范围内。建议：继续本轮至 1.5M 步观察；若未通过 milestone，Restart B 将 illegal_contact_penalty→5.0 并新增低空软惩罚。
+- 2026-03-28（第二次分析）: 重新分析 2026-03-27_19-15-45 run（1.914M 步，完整运行）。1.5M 步 milestone 全部未通过（tracking 1.316→1.054，crash 未改善，episode 长度下滑至 171 步）。run 已进入持续退化阶段，policy_std 回升至 0.441（正面信号，但未能转化为性能提升）。1.5M 步 checkpoint 通过标准均未达到，触发 Restart B 条件。确认执行 Restart B。
+
+
+---
+
+# Training Analysis Report — 2026-03-27_19-15-45（第二次分析，完整 1.914M 步）
+
+**Run:** 2026-03-27_19-15-45_mappo_torch_mappo
+**Date:** 2026-03-28
+**Task:** Isaac-marl-flyfollow-v0（move_flyfollow）
+**Algorithm:** MAPPO
+**热启动自:** 14-02-25 best_agent.pt
+**脚本结论:** regressing
+
+---
+
+## Training Metrics Summary
+
+| 指标 | early_mean | recent_mean | last | best |
+|------|-----------|-------------|------|------|
+| total_reward_mean | 47.27 | 40.96 | 37.95 | 103.56 |
+| total_reward_max | 76.93 | 59.93 | 61.21 | 161.08 |
+| distance_reward | 17.98 | 16.04 | 13.13 | 33.45 |
+| tracking_reward | 1.255 | 1.054 | 0.948 | 3.406 |
+| height_reward | 1.665 | 1.693 | 1.434 | 2.680 |
+| velocity_penalty | 0.0 | 0.0 | 0.0 | 0.0 |
+| force_penalty | 0.357 | 0.340 | 0.285 | 0.578 |
+| body_rate_penalty | 0.225 | 0.165 | 0.127 | 0.413 |
+| action_smoothness | 0.366 | 0.205 | 0.127 | 0.786 |
+| timesteps_mean | 179.9 | 171.3 | 164.8 | 342.0 |
+| policy_std | 0.380 | 0.415 | 0.436 | 0.446 |
+| value_loss | 0.065 | 0.034 | 0.039 | 0.330 |
+| entropy_loss | -0.00433 | -0.00516 | -0.00562 | — |
+
+**本次运行配置（来自 env.yaml / marl_move_flyfollow_env_cfg.py）：**
+- tracking_reward_weight = 4.0，capture_distance = 3.5m
+- velocity_follow_weight = 1.5，height_reward_weight = 2.0
+- desired_height = 2.0m，fly_high_termination_z = 5.0m
+- height_penalty_weight = 1.0，height_penalty_threshold = 0.5m
+- upright_penalty_weight = 0.5，body_rate_penalty_weight = 1.0
+- illegal_contact_penalty = 3.0，fly_low_penalty = 1.0
+- fly_high_threshold = 4.5m，fly_high_penalty_weight = 2.0
+
+---
+
+## Observations & Findings
+
+### 1. 持续退化（Monotonic Decay）— 严重程度：CRITICAL
+
+**Symptom:** 全部关键指标（total_reward、distance_reward、tracking_reward）从 early 到 recent 单调下降，无任何恢复迹象。
+- total_reward: early 47.27 → recent 40.96 → last 37.95（−20%）
+- distance_reward: early 17.98 → recent 16.04 → last 13.13（−27%）
+- tracking_reward: early 1.255 → recent 1.054 → last 0.948（−24%）
+
+**与 1.125M 步分析的对比：**
+- 1.125M 时：tracking_reward recent_mean = 1.316，last = ?（未记录）
+- 1.914M 时：tracking_reward recent_mean = 1.054，last = 0.948
+- 1.5M 步 milestone（tracking > 1.5/ep）明确未通过。
+
+**Root Cause:** 与上一轮 11-01-07 run（fly_high_termination_z=4.5m 导致永久退化）高度相似的模式，但本次退化速度更慢（因为 5.0m 约束比 4.5m 宽松）。根本机制相同：crash 局部最优主导 policy 行为，每次 reset 都比继续飞行收益更高。
+
+**Evidence:** best_ever tracking_reward = 3.406（仅在早期热启动阶段出现），后续 1.5M 步未产生新高。这是"能力冻结"的经典信号——policy 未在持续探索中扩展边界，而是在已知局部最优周围收缩。
+
+---
+
+### 2. 1.5M 步 Milestone 全部未通过 — 严重程度：CRITICAL
+
+**触发 Restart B 的决策依据：**
+
+| Milestone | 目标 | 实际（1.914M 步 recent） | 结论 |
+|-----------|------|------------------------|------|
+| crash 终止率 < 75% | <75% | ~80%（类比上轮趋势） | **FAIL** |
+| tracking_reward > 1.5/ep | >1.5 | 1.054 | **FAIL** |
+| episode mean > 185 步 | >185 | 171.3 | **FAIL** |
+
+三项 milestone 全部未通过。上一份分析（1.125M 步）已记录"若 1.5M 未通过则执行 Restart B"。**Restart B 触发条件确认满足。**
+
+---
+
+### 3. Policy 探索熵趋势——混合信号 — 严重程度：MEDIUM
+
+**Symptom（正面）：** policy_std 从 early 0.380 回升至 recent 0.415，last 0.436。与上一轮 11-01-07 的 0.355 低点相比，本轮 policy_std 保持在 0.41–0.44 区间，**未触碰 0.37 警戒线**。
+
+**Symptom（负面）：** entropy_loss 从 early -0.00433 深化至 last -0.00562（绝对值增大，接近 −0.006 饱和区间）。这表明 policy 分布正向确定性收敛，即使 std 数值未降低，探索质量也在衰减。
+
+**Root Cause:** std 统计量反映分布宽度，entropy 反映分布的实际信息量。当 policy 集中于少数高频动作（如快速飞向已知区域再 crash reset），std 可以维持较高而 entropy 已经压缩。两者分叉是 crash 局部最优成熟化的信号。
+
+---
+
+### 4. Action Smoothness 大幅退化 — 严重程度：HIGH
+
+**Symptom:** action_smoothness: early 0.366 → recent 0.205 → last 0.127（−65%）。
+
+**Root Cause:** 与上一轮 11-01-07 的 action_smoothness 退化（early 0.675 → recent 0.247，−63%）高度一致。这是 crash-reset 局部最优的行为特征：policy 采取激进、不平滑的动作快速冲向目标或快速触地，利用 crash reset 来"跳过"困难状态，而不是平滑地执行导航任务。
+
+**Evidence:** force_penalty 和 body_rate_penalty 也从 early 向 recent 下降（0.357→0.340，0.225→0.165），说明物理飞行质量实际在提升，与 action_smoothness 下降方向相反。这进一步确认：不是飞行动作变粗暴，而是 episode 变短（crash 更早发生），导致平滑性奖励积累时间缩短。
+
+---
+
+### 5. Tracking Reward 捕获区进入能力下降 — 严重程度：HIGH
+
+**Symptom:** tracking best_ever = 3.406，仅在本 run 早期（热启动阶段）出现。此后 1.5M+ 步未突破此值。
+
+**对比历史：**
+- 11-01-07 run（4.5m 约束）：best_ever = 4.923，set at 805k，此后 1.05M 步冻结
+- 14-02-25 run：best_ever = 4.757（当时新高）
+- 09-31-34 run：best_ever = 4.241
+- 19-15-45 run（本次）：best_ever = 3.406（历史最低，低于 14-02-25 热启动时的初始能力）
+
+本次热启动后 policy 能力不升反降，是结构性退化而非探索不足。crash 局部最优持续"侵蚀" policy 已有的追踪能力。
+
+---
+
+## Improvement Recommendations（Restart B）
+
+### Priority 1 (CRITICAL)：illegal_contact_penalty: 3.0 → 5.0
+
+**Problem:** 在 1.125M 分析中已确认 3.0 在 policy 可接受损失范围内（99.7% episode 有接触，per-ep 惩罚约 -2.28）。1.914M 步后该结论仍然成立——crash 局部最优未被打破。
+
+**Proposed Change:**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- 参数：`illegal_contact_penalty`: 3.0 → **5.0**
+- 理由：以明显跨越当前"接受阈值"的步长测试。若 5.0 仍不足以驱动行为改变，则确认问题是结构性的（稀疏终止惩罚无效，需要 dense pre-crash 信号）。
+
+### Priority 2 (CRITICAL)：新增低空 dense 软惩罚（low_altitude_soft_penalty）
+
+**Problem:** illegal_contact 是 episode 结束时的稀疏终止惩罚。Policy 在碰撞前没有任何"危险临近"的每步梯度信号。飞到地面前的最后 0.5m 对 policy 而言完全透明。
+
+**Proposed Change:**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- 新增：`low_altitude_soft_penalty_weight: 1.0`（z < 0.8m 时每步 exp(-(z-0.8)) 惩罚，类比 fly_high_penalty 机制）
+- 理由：dense per-step 信号在碰撞前提供连续梯度，使 policy 学会主动爬升而非等待 crash reset。这是打破稀疏惩罚失效问题的必要补充。
+- 注意：实现需在 `marl_move_flyfollow_env.py` 的 `_compute_safety_penalties` 中新增对应逻辑。
+
+### Priority 3 (MEDIUM)：height_penalty_threshold: 0.5 → 0.6m
+
+**Problem:** height_penalty 在 recent_mean 中仍活跃（基于 19-15-45 run 的历史记录约 -0.94/ep）。进一步放宽容忍度可减少 policy 因高度精度付出的无谓代价，将更多学习资源分配给 crash 回避。
+
+**Proposed Change:**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- 参数：`height_penalty_threshold`: 0.5 → **0.6**
+- 理由：与之前 Priority 4 分析一致，且本次已有 height_reward_weight=2.0 作为主要高度引导信号，height_penalty 仅作补充约束，无需过紧。
+
+### Priority 4 (LOW)：监控 entropy_loss，若 > -0.006 时考虑调整 entropy_coeff
+
+**Problem:** entropy_loss 已达 -0.00562，接近 -0.006 饱和点。若 Restart B 后 entropy 继续压缩，可在 SKRL MAPPO config 中轻微提高 `entropy_loss_scale`（如 0.01 → 0.015）。
+
+**Proposed Change:** 本次不变更。在 Restart B 运行 500k 步后，若 entropy_loss > -0.006 持续 50k 步，在下一次 restart 时调整。
+- 文件：MAPPO 训练配置（skrl config dict，位于 `scripts/skrl/train.py` 或 agent cfg 文件）
+- 参数：`entropy_loss_scale`: 0.01 → 0.015
+
+---
+
+## Experiment Plan（Restart B）
+
+**触发依据：** 2026-03-27_19-15-45 run 1.5M 步三项 milestone 全部未通过，触发预设 Restart B 条件。
+
+**热启动来源：** `logs/skrl/move_flyfollow/2026-03-27_19-15-45_mappo_torch_mappo/checkpoints/best_agent.pt`
+
+**训练命令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO" \
+  --checkpoint=logs/skrl/move_flyfollow/2026-03-27_19-15-45_mappo_torch_mappo/checkpoints/best_agent.pt
+```
+
+**Restart B 配置变更（相比当前 marl_move_flyfollow_env_cfg.py）：**
+
+| 参数 | 当前值 | Restart B | 优先级 |
+|------|--------|-----------|--------|
+| `illegal_contact_penalty` | 3.0 | **5.0** | CRITICAL |
+| `low_altitude_soft_penalty_weight` | 0（不存在） | **1.0**（新增） | CRITICAL |
+| `height_penalty_threshold` | 0.5 | **0.6** | MEDIUM |
+
+**保持不变的参数（已验证有效）：**
+- dist_reward_weight = 4.0
+- tracking_reward_weight = 4.0，capture_distance = 3.5m
+- velocity_follow_weight = 1.5
+- height_reward_weight = 2.0，desired_height = 2.0m
+- fly_high_termination_z = 5.0m，fly_high_threshold = 4.5m
+- body_rate_penalty_weight = 1.0，upright_penalty_weight = 0.5
+
+**关键监控指标（前 500k 步）：**
+- crash 终止率：目标 < 65%（当前约 80%，需明确下降）
+- illegal_contact_penalty/ep：目标变为更负（>-3.5/ep），反映碰撞频率未能显著下降时的惩罚加重
+- episode mean：目标 > 190 步
+- tracking_reward：目标 > 1.5/ep（恢复至 1.125M 步水平）
+- action_smoothness：目标 > 0.25/ep（当前 0.205，持续下降是 crash 优化的指征）
+
+**500k 步 Go/No-Go 决策：**
+- Go（继续）：crash < 65% 且 tracking > 1.5/ep
+- No-Go（停止，改换 dense 信号方案）：crash > 75% 且 tracking < 1.2/ep → 确认 sparse illegal_contact 惩罚在任何权重下均无效，必须实现 low_altitude_soft_penalty dense 信号才能打破局部最优
+
+**1M 步成功标准：**
+- crash 率 < 50%
+- tracking_reward > 2.5/ep
+- policy_std > 0.40
+- episode mean > 210 步
+
+**回归保护：**
+- 不得降低 height_reward_weight（< 1.5 会导致高飞，已有先例）
+- 不得降低 fly_high_termination_z（< 5.0 在 11-01-07 run 中造成永久退化）
+- 不得移除 low_altitude_soft_penalty（一旦加入，只可调权重，不可清零）
 
