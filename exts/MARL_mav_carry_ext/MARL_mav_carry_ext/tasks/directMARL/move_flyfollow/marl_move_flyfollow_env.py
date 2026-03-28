@@ -219,6 +219,7 @@ class MARLMoveEnv(DirectMARLEnv):
                 "collision_penalty",  # 无人机碰撞惩罚
                 "drone_out",          # 出界惩罚
                 "fly_low",            # 飞太低惩罚
+                "low_altitude_soft",  # 低空软惩罚（dense per-step，z < threshold）
                 "illegal_contact",    # 非法接触惩罚（碰地面等）
                 "time_penalty",       # 时间惩罚（已移除）
                 "upright_penalty",    # 姿态惩罚：防止翻滚
@@ -947,6 +948,17 @@ class MARLMoveEnv(DirectMARLEnv):
         # --- 9. 飞行高度过低惩罚（z < 0.1m）---
         fly_low = (self.drone_positions[:, :, 2] < 0.1).any(dim=-1)
         rewards["fly_low"] = -fly_low.float() * self.cfg.fly_low_penalty
+
+        # --- 9.1 低空软惩罚（dense per-step，z < low_altitude_soft_threshold）---
+        # [Restart-B] 新增：exp 形式梯度惩罚，使无人机主动远离地面
+        # 与 fly_low 的区别：fly_low 是二值终止惩罚，此处提供连续梯度信号
+        deficit_z = (
+            self.cfg.low_altitude_soft_threshold - self.drone_positions[:, :, 2]
+        ).clamp(min=0.0)  # (N, D)
+        low_alt_soft = (torch.exp(deficit_z) - 1.0).sum(dim=-1)  # (N,)
+        rewards["low_altitude_soft"] = (
+            -self.cfg.low_altitude_soft_penalty_weight * low_alt_soft * step_dt
+        )
 
         # --- 9.5 高飞软惩罚（超过 fly_high_threshold 后每步惩罚，防止高飞局部最优）---
         # [Fix-B] exp(z - threshold) - 1：高度越高惩罚越大，threshold 以下惩罚为0

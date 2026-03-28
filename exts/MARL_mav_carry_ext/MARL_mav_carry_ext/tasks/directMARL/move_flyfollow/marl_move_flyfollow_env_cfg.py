@@ -128,8 +128,15 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 高度超限惩罚（线性）：|z - desired| > threshold 时额外惩罚
     # [Fix-E] 增强高度超限惩罚，收紧容忍偏差
+    # [Restart-B] threshold 0.5→0.6，稍微放宽允许带，避免与低空软惩罚重叠干扰
     height_penalty_weight = 1.0
-    height_penalty_threshold = 0.5   # 容忍偏差（m）
+    height_penalty_threshold = 0.6   # 容忍偏差（m）
+
+    # 低空软惩罚：z < low_altitude_soft_threshold 时每步 exp 形式惩罚
+    # [Restart-B] 新增 dense per-step 低空惩罚，解决 crash-reset 局部最优
+    # 梯度覆盖 0～0.5m 范围，使无人机主动远离地面而非坐等 crash 终止
+    low_altitude_soft_penalty_weight = 1.0
+    low_altitude_soft_threshold = 0.5  # 低于此高度（m）开始施加软惩罚
 
     # 高飞惩罚：超过 fly_high_threshold 后每步软惩罚，防止无人机持续高飞
     # [Fix-B] 新增：每步 exp 形式惩罚，z 越高惩罚越大
@@ -144,7 +151,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     drone_out_of_bounds_penalty = 1.0  # 单次出界惩罚
     crash_penalty_scale = 1.0          # 坠机惩罚（未使用，保留接口）
     collision_penalty_scale = 1.0      # 无人机碰撞惩罚（per collision pair）
-    illegal_contact_penalty = 3.0      # 非法接触惩罚
+    # [Restart-B] 3.0→5.0：加重终止惩罚，提高 crash-reset 行为成本
+    illegal_contact_penalty = 5.0      # 非法接触惩罚
     fly_low_penalty = 1.0              # 飞低惩罚
     fly_high_penalty = 1.0             # 高飞终止固定惩罚（触发终止时一次性扣除）
 
