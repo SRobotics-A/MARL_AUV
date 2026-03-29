@@ -89,7 +89,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 跟随奖励：仅在捕获状态下（dist < capture_distance）给予
     # 与距离奖励叠加，增强进入捕获区后的保持动机
     # [PLAN fix-3] 提升 tracking 权重，放宽 capture_distance 以引导首次进入捕获区
-    tracking_reward_weight = 4.0
+    # [Restart-C] 4.0→5.0：提升追踪信号，使低空追踪回报优于爬升逃避
+    tracking_reward_weight = 5.0
     tracking_reward_scale = 1.0
 
     # 速度跟随奖励：鼓励无人机匹配目标速度（0.3 m/s x 向），解决"悬停局部最优"
@@ -134,18 +135,20 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 低空软惩罚：z < low_altitude_soft_threshold 时每步 exp 形式惩罚
     # [Restart-B] 新增 dense per-step 低空惩罚，解决 crash-reset 局部最优
-    # 梯度覆盖 0～0.5m 范围，使无人机主动远离地面而非坐等 crash 终止
-    low_altitude_soft_penalty_weight = 1.0
-    low_altitude_soft_threshold = 0.5  # 低于此高度（m）开始施加软惩罚
+    # [Restart-C] threshold 0.5→1.5m，weight 1.0→2.0：扩大覆盖范围，提供有效梯度信号
+    low_altitude_soft_penalty_weight = 2.0
+    low_altitude_soft_threshold = 1.5  # 低于此高度（m）开始施加软惩罚
 
     # 高飞惩罚：超过 fly_high_threshold 后每步软惩罚，防止无人机持续高飞
     # [Fix-B] 新增：每步 exp 形式惩罚，z 越高惩罚越大
     fly_high_penalty_weight = 2.0
-    fly_high_threshold = 4.5         # 超过此高度（m）开始惩罚
+    # [Restart-C] 4.5→5.0：释放垂直空间，缓解 crash-to-fly_high 挤压效应
+    fly_high_threshold = 5.0         # 超过此高度（m）开始惩罚
 
     # 高飞终止：超过此高度直接终止 episode，避免长时间高飞浪费训练时间
     # [Fix-C] 新增：z > fly_high_termination_z 触发终止
-    fly_high_termination_z = 5.0     # 终止触发高度（m）
+    # [Restart-C] 5.0→5.5：与 fly_high_threshold 保持 0.5m 缓冲
+    fly_high_termination_z = 5.5     # 终止触发高度（m）
 
     # 安全惩罚（固定值，不乘 dt）
     drone_out_of_bounds_penalty = 1.0  # 单次出界惩罚

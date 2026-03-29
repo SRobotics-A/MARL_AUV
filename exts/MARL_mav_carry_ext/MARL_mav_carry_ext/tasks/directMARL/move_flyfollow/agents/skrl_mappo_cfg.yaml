@@ -80,7 +80,8 @@ agent:
 
   # ===== 损失系数 =====
   # [PLAN fix-5] 0.001→0.01：增大熵系数，鼓励早期阶段充分探索
-  entropy_loss_scale: 0.01    # 熵正则化权重（鼓励探索）
+  # [Restart-C] 0.01→0.015：entropy_loss 已过 -0.006 警告线，增强探索防止过早收敛
+  entropy_loss_scale: 0.015   # 熵正则化权重（鼓励探索）
   value_loss_scale: 1.0       # Critic 损失权重（与 Actor 损失的相对比例）
   kl_threshold: 0.0           # 0 = 不使用 KL 散度早停
 
