@@ -2826,15 +2826,6 @@ python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 \
 - 不得降低 fly_high_termination_z（< 5.0 在 11-01-07 run 中造成永久退化）
 - 不得移除 low_altitude_soft_penalty（一旦加入，只可调权重，不可清零）
 
-
-
-
-
-python scripts/skrl/train.py \                        
-    --task=Isaac-move-flyfollow-marl-v0 \                                                                                                                                                                          
-    --headless --num_envs=16 --algorithm=MAPPO \                                                                                                                                                                 
-    --resume --checkpoint=logs/skrl/move_flyfollow/2026-03-27_19-15-45_mappo_torch_mappo/checkpoints/best_agent.pt
-
 ---
 
 # Training Analysis Report
@@ -3023,3 +3014,215 @@ python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 \
   - low_altitude_soft 效果微弱（−0.001/ep），触发阈值 0.8m 过低
   - total_reward 四分位单调递减（42.1/37.6/36.7/30.4），tracking best 未刷新（2.85 < 历史 4.923）
   - 建议 Restart C：扩大 low_altitude_soft 范围（1.5m，权重 2.0）、放宽 fly_high 终止线（5.5m）、提高 tracking 权重（5.0）、轻提 entropy_loss_scale（0.015）
+
+---
+
+# Training Analysis Report
+
+**Run:** 2026-03-29_18-27-54_mappo_torch_mappo
+**Date:** 2026-03-29
+**Task:** Isaac-marl-flyfollow-v0 (move_flyfollow variant)
+**Algorithm:** MAPPO
+**Identity:** Restart C — hot-start from 2026-03-28_19-37-04 best_agent.pt
+
+## Training Metrics Summary
+
+| 指标 | early_mean | recent_mean | last | best |
+|------|-----------|-------------|------|------|
+| Total reward (mean) | 42.68 | 45.55 | 43.14 | 80.34 |
+| Total reward (max) | 68.55 | 70.88 | 61.98 | 127.18 |
+| Total reward (min) | 5.81 | 9.33 | 30.62 | 63.39 |
+| distance_reward | 16.84 | 17.60 | 18.48 | 27.68 |
+| tracking_reward | 1.43 | 1.56 | 1.61 | 3.20 |
+| height_reward | 1.66 | 1.66 | 1.70 | 2.28 |
+| velocity_penalty | 0.00 | 0.00 | 0.00 | 0.00 |
+| force_penalty | 0.34 | 0.35 | 0.35 | 0.50 |
+| body_rate_penalty | 0.18 | 0.18 | 0.17 | 0.32 |
+| action_smoothness | 0.27 | 0.25 | 0.22 | 0.44 |
+| Episode timesteps (mean) | 174.4 | 172.5 | 181.6 | 253.5 |
+| Episode timesteps (max, mean) | 236.6 | 237.8 | 249.0 | 489.0 |
+| policy_std | 0.417 | 0.481 | 0.480 | 0.490 |
+| value_loss | 0.059 | 0.050 | 0.026 | 0.230 |
+| policy_loss | −0.016 | −0.022 | −0.034 | +0.115 |
+| entropy_loss | −0.00785 | −0.00991 | −0.00991 | −0.00764 |
+
+**Total steps logged:** 334,000
+**Script verdict:** mixed（早期和近期均值差异小，无明确趋势）
+**Config key params (from env.yaml):**
+- tracking_reward_weight = 5.0 (Restart C: 4.0→5.0 已应用)
+- low_altitude_soft_penalty_weight = 2.0, threshold = 1.5m (Restart C 已应用)
+- fly_high_termination_z = 5.5m (Restart C: 5.0→5.5m 已应用)
+- fly_high_threshold (soft) = 5.0m (Restart C: 4.5→5.0m 已应用)
+- illegal_contact_penalty = 5.0 (Restart B 已应用，本次继承)
+- capture_distance = 3.5m, sustained_follow_duration = 1.5s
+- desired_height = 2.0m
+
+## Observations & Findings
+
+### 1. Restart C 参数全部确认生效 — Severity: INFO
+
+**Symptom:** env.yaml 中全部 4 项 Restart C 参数均已正确应用。
+**Evidence:**
+- `low_altitude_soft_threshold = 1.5`（旧：0.8）
+- `low_altitude_soft_penalty_weight = 2.0`（旧：1.0）
+- `fly_high_termination_z = 5.5`（旧：5.0）
+- `fly_high_threshold = 5.0`（旧：4.5）
+- `tracking_reward_weight = 5.0`（旧：4.0）
+- `illegal_contact_penalty = 5.0`（继承 Restart B，不变）
+
+### 2. 热启动效果显著：奖励从高起点开始 — Severity: INFO
+
+**Symptom:** early total_reward_mean = 42.68，比冷启动（约 −5 到 +13）高约 35+ 点。
+**Root Cause:** hot-start from 19-37-04 best_agent.pt（step ~7k 的最高点，历史 best=90.1）。
+**Evidence:** total_reward_min best = 63.39（所有并行环境中的最低 episode 也为正），说明策略起点健康，无负奖励区域。
+
+### 3. Tracking_reward 恢复至 1.5+ 水平，优于前序 run 末段 — Severity: HIGH (POSITIVE)
+
+**Symptom:** tracking_reward recent_mean = 1.56，last = 1.61，best = 3.20。
+**对比 Restart B (19-37-04) 末段：** tracking_reward last = 0.66，best = 2.85。
+**本次改善幅度：** last +144%，best +12%（新高 3.20 > 2.85）。
+**Root Cause:** Restart C 三项改动协同：
+  1. tracking_reward_weight 4.0→5.0 提高了进入捕获区的激励强度
+  2. fly_high_termination_z 5.0→5.5m 降低了 fly_high 提前终止压力，允许更长 episode
+  3. low_altitude_soft 范围扩大减少了底部崩溃压力
+**Evidence:** 34 万步内 tracking 从未降至 0，与 Restart B 早期的快速衰减形成对比。
+
+**重要提示：** 500k milestone（tracking > 1.5/ep）当前 recent_mean = 1.56 已处于达标边缘。需持续监测是否稳定保持。
+
+### 4. Policy_std 恢复至 0.48，探索能力健康 — Severity: INFO (POSITIVE)
+
+**Symptom:** policy_std early = 0.417 → recent = 0.481，呈上升趋势。
+**对比 Restart B：** 0.494（early）→ 0.469（recent）→ 末段仍在压缩。
+**对比 14-02-25 run 末段：** 0.355（曾经最低，接近崩溃）。
+**Root Cause:** Restart C 减少了双重终止压力，策略不再被迫收敛到 crash-reset 局部优化。
+**Evidence:** best policy_std = 0.490，当前 recent 与 best 仅差 0.009，说明策略处于历史最高探索水平。
+
+### 5. Action_smoothness 持续下降 — Severity: MEDIUM
+
+**Symptom:** action_smoothness early = 0.274 → recent = 0.253 → last = 0.215。下降趋势与 Restart B (0.316→0.112) 的崩溃模式相似，但幅度更小（−22% vs −65%）。
+**Root Cause:** 两种可能：
+  a. crash 终止率仍高（待 termination 统计确认），早期终止降低了每 episode 的平均平滑度；
+  b. tracking_weight 提高导致策略更激进追踪，动作抖动增大。
+**Evidence:** 当前 0.215 仍显著高于 Restart B 末段 0.097（相对健康），但需在 500k checkpoint 监测是否降至 0.18 以下（危险阈值）。
+
+### 6. Tracking_reward 的天花板迹象：best = 3.20 低于历史高点 4.923 — Severity: MEDIUM
+
+**Symptom:** 本次 best tracking = 3.20，仍低于历史最高 4.923（run 11-01-07 在 fly_high_termination_z=4.5m 的极限压迫下偶尔出现的峰值）。
+**Root Cause:** 脚本诊断 "tracking bonus is still relatively hard to reach"。当前 tracking_reward recent/total_reward recent 比 = 1.56/45.55 ≈ 3.4%，在总奖励中占比偏低。
+**Evidence:** distance_reward 占比 = 17.60/45.55 ≈ 38.7%（是 tracking 的 11.3 倍），策略仍以"接近目标"为主要学习信号，"进入捕获区停留"为次要信号。
+
+### 7. Height_reward 稳定在 1.66/ep，altitude 锚定继续有效 — Severity: INFO (POSITIVE)
+
+**Symptom:** height_reward early = 1.66 → recent = 1.66（几乎零漂移），best = 2.28。
+**Root Cause:** height_reward_weight = 2.0（已验证工作的锚定强度），desired_height = 2.0m。
+**Evidence:** 与高飞严重的早期 run 对比（如 20-28-48 的 height_reward 接近 0），本次高度控制稳健。
+
+### 8. Entropy_loss 接近 −0.010，临近饱和临界值 — Severity: MEDIUM
+
+**Symptom:** entropy_loss 从 −0.00785（early）压缩至 −0.00991（recent/last），接近 −0.010 饱和点。历史警告阈值为 −0.006（Restart B 末段 −0.00675 时进入饱和）。
+**Root Cause:** 本次 entropy_loss_scale 是否已升至 0.015？env.yaml 中未见 MAPPO agent cfg 参数，无法确认。若仍为 0.01，entropy 即将进入危险区间。
+**Evidence:** recent entropy = −0.00991，距警告阈值 −0.006 已超出 66%，但当前策略行为仍健康（policy_std 0.48）。entropy_loss 与 policy_std 当前同向（均在恢复），尚无立即危险。
+
+## 综合评估（334k 步）
+
+**整体状态：** Restart C 成效初步验证，核心指标均优于 Restart B 同期水平。
+
+| 500k milestone | 目标 | 当前状态（334k） | 达标可能性 |
+|----------------|------|-----------------|-----------|
+| crash 率 < 45% | <45% | 脚本未输出（需 termination 统计确认） | 未知 |
+| fly_high 率 < 35% | <35% | 脚本未输出 | 未知 |
+| tracking_reward > 1.5/ep | >1.5 | **recent 1.56（已达标边缘）** | 高 |
+| episode_mean > 175 步 | >175 | recent 172.5（接近临界） | 中 |
+| action_smoothness > 0.18/ep | >0.18 | recent 0.253（已达标） | 高 |
+
+**关键缺口：** TensorBoard 中 termination 统计未被脚本捕获（crash 率、fly_high 率）。这是 500k Go/No-Go 决策的最重要数据，需手动检查 TensorBoard 或扩展脚本 tag 列表。
+
+## Improvement Recommendations
+
+### Priority 1 (HIGH): 补充 termination 统计 tag 至分析脚本
+
+**Problem:** 脚本输出无 `Episode_Termination/*` 数据（crash 率、fly_high 率、timeout 率）。这是 Restart C 500k Go/No-Go 的核心决策依据。
+**Proposed Change:**
+- File: `/home/xtj/.codex/skills/flyfollow-training-analysis/scripts/analyze_flyfollow_run.py`
+- 增加 tag: `Episode_Termination/falcon_fly_high`, `Episode_Termination/crash`, `Episode_Termination/time_out`, `Episode_Termination/illegal_contact`
+- 若无此脚本修改权限，可手动在 TensorBoard 检查：`tensorboard --logdir logs/skrl/move_flyfollow/2026-03-29_18-27-54_mappo_torch_mappo`
+- Rationale: 无终止原因统计，无法判断 "低了撞地/高了飞出" 双重夹击是否已被打破。
+
+### Priority 2 (MEDIUM): 继续当前 run，等待 500k checkpoint
+
+**Problem:** 334k 步尚未到达 Restart C 的第一个里程碑检查点（500k）。
+**Proposed Change:**
+- 无需配置变更，继续训练至 500k 步
+- 500k checkpoint 时重点检查：
+  a. crash 终止率（目标 < 45%）
+  b. fly_high 终止率（目标 < 35%）
+  c. tracking_reward recent_mean 是否稳定 > 1.5/ep
+  d. action_smoothness 是否仍 > 0.18/ep（当前下降需关注）
+- Rationale: 当前指标改善明显，不需要提前干预。
+
+### Priority 3 (MEDIUM): 若 500k 后 tracking 停滞，评估 capture_distance 3.5→4.0m
+
+**Problem:** tracking_reward 在总奖励中占比仅 3.4%，distance_reward 占 38.7%。策略仍以"接近但不进入"为主要行为。
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- Parameter: `capture_distance`: 3.5 → **4.0m**（仅当 500k 后 tracking recent < 1.5/ep 时）
+- Rationale: 放宽捕获区有助于增加 tracking 信号频率，但需注意 3.5m 是上次已验证有效的值，应谨慎。
+
+### Priority 4 (MEDIUM): 确认 entropy_loss_scale = 0.015 是否已生效
+
+**Problem:** Restart C 计划要求 entropy_loss_scale 0.01→0.015，但 env.yaml 不含此参数，无法确认。
+**Proposed Change:**
+- File: MAPPO agent 训练配置（通常在 `scripts/skrl/train.py` 的 `cfg_ppo` 字典或 agent cfg yaml）
+- 检查并确认 `entropy_loss_scale = 0.015`
+- 若未修改，应在下次 restart 时补充
+- Rationale: 当前 entropy_loss = −0.00991，接近 −0.010 阈值，若 scale 仍为 0.01，需在 500k 后评估是否应提升。
+
+### Priority 5 (LOW): 若 1M 步 tracking 仍停滞，考虑 3D 距离奖励替代 XY 距离
+
+**Problem:** 脚本诊断 "tracking bonus is still relatively hard to reach"，distance_reward 为 XY 平面距离（无 Z 分量），tracking 信号依赖物理接近而非奖励塑形引导。
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env.py`
+- 修改 `distance_reward` 计算：`dist_xy = ||drone_pos[:,:,:2] - target_pos[:,:,:2]||` → `dist_3d = ||drone_pos - target_pos||`
+- 或：新增 `dist_z_reward` 分量（weight=0.5），激励 drone 与 target 高度对齐
+- Rationale: 当前 XY-only 距离奖励在 Z 方向梯度为零，策略在 Z 方向无任务引导。若高飞问题再次出现，应考虑此方案。
+- **注意：仅在 500k Go 且 1M tracking < 2.5/ep 时执行，避免破坏已稳定的高度控制。**
+
+## Experiment Plan（继续 Restart C）
+
+**当前状态：** 334k/500k 步（67% 完成）
+
+**立即行动：**
+1. 继续当前训练，不做任何参数变更
+2. 在约 500k 步时暂停，运行分析脚本并手动检查 termination 统计
+3. 根据 500k Go/No-Go 决策：
+
+**500k Go 路径（crash < 45% 且 fly_high < 35% 且 tracking > 1.5）：**
+- 继续训练至 1M 步
+- 1M 目标：tracking > 2.5/ep，crash < 35%，fly_high < 20%，episode_mean > 200 步
+
+**500k No-Go 路径（crash > 60% 且 fly_high > 45%）：**
+- 考虑引入 3D 距离奖励，或调整 desired_height 至 target z+1.5m = 1.75m（更接近地面目标）
+- 重新评估 capture_distance 放宽至 4.0m
+
+**监测重点（每 ~170k 步检查一次）：**
+- tracking_reward recent_mean（目标：稳定 > 1.5，目标 > 2.5 at 1M）
+- action_smoothness（危险：< 0.18/ep，当前趋势需关注）
+- entropy_loss（危险：< −0.010，当前 −0.00991 在临界）
+- policy_std（安全：> 0.40，当前 0.48 健康）
+
+## Regression Guards（保持不变）
+
+- `fly_high_termination_z` 不得降低至 < 5.0m（4.5m 在 11-01-07 造成永久退化）
+- `height_reward_weight` 不得低于 1.5（已有前车之鉴）
+- `illegal_contact_penalty` 不得低于 5.0（3.0 已确认无效）
+- `low_altitude_soft_penalty_weight` 不得归零（仅可上调）
+
+## Changelog
+
+- 2026-03-29：分析 2026-03-29_18-27-54 run（Restart C，334k 步）
+  - Restart C 所有参数确认生效（low_altitude_soft 1.5m/2.0，fly_high_termination 5.5m，tracking_weight 5.0）
+  - tracking_reward 恢复至 1.56/ep（vs Restart B 末段 0.66），best = 3.20（新本次高）
+  - policy_std = 0.48（健康，vs Restart B 末段 0.494→0.469 压缩）
+  - action_smoothness 轻微下降（0.274→0.215），需关注但尚未进入危险区
+  - entropy_loss = −0.00991，临近饱和，需确认 entropy_loss_scale=0.015 是否已生效
+  - termination 统计（crash 率/fly_high 率）缺失，需手动检查 TensorBoard
