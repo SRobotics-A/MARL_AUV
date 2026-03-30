@@ -3226,3 +3226,255 @@ python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 \
   - action_smoothness 轻微下降（0.274→0.215），需关注但尚未进入危险区
   - entropy_loss = −0.00991，临近饱和，需确认 entropy_loss_scale=0.015 是否已生效
   - termination 统计（crash 率/fly_high 率）缺失，需手动检查 TensorBoard
+
+---
+
+# Training Analysis Report — 第二次分析
+
+**Run:** 2026-03-29_18-27-54_mappo_torch_mappo
+**Date:** 2026-03-30
+**Task:** Isaac-marl-flyfollow-v0 (move_flyfollow variant)
+**Algorithm:** MAPPO
+**Identity:** Restart C — hot-start from 2026-03-28_19-37-04 best_agent.pt
+**Analysis Type:** 第二次分析（上次 334k 步，本次 1,512,200 步，增量 +1,178k 步）
+
+## Training Metrics Summary（1.51M 步全程）
+
+| 指标 | 100k-window 峰值 | 100k-window 峰值所在步段 | latest（1.5M+） | 对比 334k 分析（last） |
+|------|-----------------|--------------------------|-----------------|----------------------|
+| Total reward (mean) | **49.1** | 400k–600k | 34.1 | 43.1（↓21%）|
+| tracking_reward | **1.82** | 400k–600k | 1.27 | 1.61（↓21%）|
+| distance_reward | 17.2 | 全程稳定 | 21.0 | 18.5 |
+| height_reward | 1.65 | 全程稳定 | 1.58 | 1.70 |
+| crash (termination) | 0.34 | 700k–800k（最好） | 0.71 | 未记录 |
+| falcon_fly_high | 0.46 | 0k–100k（最好） | 0.34 | 未记录 |
+| ep_len (mean) | **179** | 500k | 165.6 | 181.6 |
+| upright_penalty | −1.57 | 200k（最好） | −1.72 | 未记录 |
+| height_penalty | −1.08 | 0k（起始） | −1.06 | 未记录 |
+| policy_std | 0.491 | 最新 | 0.491 | 0.480 |
+| value_loss | stable | — | 0.051 | 0.026 |
+| entropy_loss | −0.01031 | 最新 | −0.01031 | −0.00991 |
+| grad_norm_actor | ~0.92 | 全程恒定 | 0.949 | 未记录 |
+
+## 500k Milestone 正式判定
+
+**本次可完整评估 500k milestone，结果如下：**
+
+| 指标 | 目标 | 500k 实测值（480k–520k窗口） | 判定 |
+|------|------|------------------------------|------|
+| tracking_reward | >1.5/ep | **1.825** | **PASS** |
+| crash 率 | <65% | **54.3%** | **PASS** |
+| fly_high 率 | <30% | **49.5%** | **FAIL** |
+| episode mean | >185 步 | **177.8** | **FAIL** |
+
+**500k 综合判定：2/4 指标达标（部分通过）。**
+
+核心任务指标（tracking、crash）已达标，但高飞率（49.5% vs 目标 30%）和 episode 长度（177.8 vs 目标 185）仍不足。
+
+## Observations & Findings
+
+### 1. 全程呈现"抛物线"轨迹：峰值在 500k，之后持续退化 — Severity: HIGH (CRITICAL)
+
+**Symptom:** total_reward_mean 从 334k 时的稳步上升（42→46→49）在 500k 达到顶点（49.1），随后进入持续退化：800k 降至 39.7，900k 降至 37.6，1.5M 降至 34.1（较峰值下降 31%）。
+
+**退化时间线：**
+- 0k–500k：稳定上升阶段（42→49），tracking 1.40→1.80，crash 47%→46%
+- 500k–800k：过渡阶段，飞高率偶有改善（fly_high 最低达 46%），但 reward 开始波动
+- 800k–1M：明显退化，reward 37–39，tracking 1.40–1.44，crash 49–58%
+- 1M–1.25M：短暂反弹（reward 43–46，tracking 1.60–1.81）
+- 1.25M–1.5M：加速退化，crash 率上升至 63–71%，tracking 1.27–1.35，reward 34–38
+
+**Root Cause（多因素）：**
+1. **upright_penalty 顽固不减**（全程 −1.71，无改善迹象）：表明姿态倾斜问题长期存在，且策略无法改善。这消耗了大量奖励空间，同时可能导致 crash。
+2. **height_penalty 持续 −1.2 量级**（全程 −1.08 到 −1.44）：表明策略始终无法精确高度控制，尽管 height_reward = 2.0 已经启用。
+3. **crash 率从 800k 开始趋势性上升**（0.34→0.49→0.58→0.63→0.71）：策略学习到了更激进的追踪行为（tracking 短暂回升），但代价是更多 illegal_contact 碰撞终止。
+4. **fly_high 与 crash 呈反相关**（fly_high 下降时 crash 上升）：策略降低了飞行高度（fly_high 率从早期 0.67 降至最新 0.34），但降低后反而更容易触发地面/物体碰撞（illegal_contact）。
+
+**Evidence:** 
+- crash ≈ illegal_contact（两者 diff ≈ 0，说明 crash 终止基本等价于 illegal_contact 而非坠地）
+- fly_high 从 0k 时 0.58 降至 1.5M 时 0.34，而 crash 从 0.47 升至 0.71，两者之和基本恒定在约 1.0–1.05
+
+### 2. Crash = Illegal_contact：无人机碰撞到物体（非坠地）是主要失效模式 — Severity: HIGH
+
+**Symptom:** `Episode_Termination/crash` 与 `Episode_Termination/illegal_contact` 数值几乎完全一致（mean_diff ≈ 0.0036，max_diff = 0.67），说明 crash 由 illegal_contact（接触力 >1N）触发，而非 fly_low（坠地）。
+
+**Root Cause:** 在追踪目标小车时，无人机飞得太低或与目标小车本体发生物理接触。随着策略学会降低飞行高度以减少 fly_high 终止，却在低空遭遇了 illegal_contact。
+
+**Evidence:**
+- `falcon_fly_low` 全程 recent_mean = 0.009（几乎为零），确认不是坠地
+- `illegal_contact` 从 1.5M 附近突增，与 fly_high 下降同步，呈明显替代关系
+
+**Impact:** 这是一个"地板-天花板"双重挤压（fly_high 限制上升，illegal_contact 惩罚下降），策略陷于无法同时满足两个约束的困境。
+
+### 3. Upright_penalty 顽固，全程 −1.71，无改善 — Severity: HIGH
+
+**Symptom:** upright_penalty all-time mean = −1.71，recent mean = −1.78，best = 0.0。全程范围 −1.57 至 −1.80，无明显下降趋势。
+
+**Root Cause:** 姿态问题（机体倾斜）可能有两个来源：
+  a. 追踪目标时的主动倾斜（合理，但不应持续整个 episode）
+  b. 控制器输出的系统性偏差（不合理，应被策略修正）
+
+在 1.5M 步训练后 upright_penalty 仍未趋近 0，说明 (b) 更可能。策略可能已将倾斜作为一种稳定行为学到（如：在 x 方向始终倾斜追随目标，但未学会恢复直立）。
+
+**Evidence:** upright_penalty recent mean = −1.778，其绝对值与 tracking_reward recent_mean = 1.49 相当，即姿态惩罚大致"抵消"了追踪奖励的贡献。
+
+**Impact:** 若 upright_penalty_weight 过大，策略会优先维持直立（不追踪）而非倾斜追踪（有效但被惩罚）。反之，若过小，则姿态失控触发 illegal_contact。
+
+### 4. Height_penalty 长期存在（−1.2 量级），height_reward=2.0 仍不足以消除偏差 — Severity: MEDIUM
+
+**Symptom:** height_penalty recent_mean = −1.236，all-time mean = −1.254，无明显改善趋势。height_reward 峰值仅 2.46（理论最大值更高），说明策略始终偏离 desired_height = 2.0m。
+
+**Root Cause:** 高度误差惩罚（height_penalty）存在但策略无法完全消除。结合 illegal_contact = crash，无人机可能在 2m 以下低空（y_target 的 z ≈ 0.25m，如果无人机跟随目标高度）飞行时产生接触。
+
+**注意：** height_penalty 与 upright_penalty 合计 recent_mean = −1.24 + (−1.78) = **−3.02**，占总奖励 41.2 的 7.3%，但约等于 tracking_reward 全部贡献（1.49）的 2 倍。
+
+### 5. velocity_follow 奖励极低（0.051），策略不学习速度匹配 — Severity: MEDIUM
+
+**Symptom:** velocity_follow recent_mean = 0.051（best = 0.088），全程接近 0。velocity_follow_weight = 0.8（权重设置不低），但奖励极低说明实际速度匹配度很差。
+
+**Root Cause:** 目标小车以 0.8m/s 移动，无人机可能以更高速度"冲向"目标（超速），或在追踪区内速度方向不一致。velocity_follow_sigma = 0.8（较宽），理论上应有更多信号。
+
+**Evidence:** tracking_reward（进入 2m 范围的奖励）recent_mean = 1.49，velocity_follow = 0.051，比值 29:1。进入捕获区是有的，但捕获后未建立速度同步。
+
+**Impact:** 策略学到的是"冲入捕获区立即离开"而非"伴飞跟随"，这导致 tracking 积分无法充分累积。
+
+### 6. Policy_std 回升至 0.49，探索能力健康，但 entropy_loss 已饱和 — Severity: MEDIUM
+
+**Symptom:** policy_std recent = 0.486，last = 0.491，持续上升（early 0.422 → recent 0.486）。这是正面信号。但 entropy_loss = −0.01031（last），接近上限，且全程下降（early −0.00833 → recent −0.01017）。
+
+**Root Cause:** 策略多样性在增加（policy_std），但 entropy 在接近 max 归一化值（entropy_loss_scale × H_max）。entropy_loss_scale 可能仍为 0.01，导致 entropy reward 不足以激励更大的探索。
+
+**Evidence:** entropy_loss 从 −0.00833 压缩至 −0.01031，绝对值增加 24%。此前 Restart B 末段 −0.00675 时进入崩溃，当前 −0.01031 绝对值更大（因 scale 可能已升至 0.015？），但趋势同样单调递减。
+
+### 7. 梯度范数 actor ≈ 0.92（持续接近 clip=1.0），学习信号强但被压缩 — Severity: MEDIUM
+
+**Symptom:** grad_norm_actor early = 0.948，recent = 0.915，全程约 0.92，接近梯度裁剪上限 1.0。这意味着 actor 梯度持续被裁剪，实际学习步长小于理论值。
+
+**Root Cause:** actor 的策略梯度一直很大（任务信号强烈），但被 grad_norm_clip=1.0 压制，限制了每步的实际改进幅度。critic grad = 0.338（recent），更为正常。
+
+**Impact:** 当 actor 梯度恒定被裁剪时，学习率实际上对 actor 不生效，相当于使用的是 `lr × (1.0 / grad_norm)` 的自适应步长。如果任务确实需要大的策略更新，当前裁剪可能在拖慢收敛。
+
+## 综合评估（1.51M 步）
+
+**整体状态：** 训练进入退化阶段（script 状态: `regressing`）。峰值出现在 500k，之后经历振荡并在 1.3M 后加速退化。核心问题是"高度降低→碰撞增加"的替代效应，策略陷入局部均衡。
+
+**500k milestone 最终结论：** 部分达标（2/4），tracking 和 crash 率已到达目标，但 fly_high 和 episode 长度未到达。基于 1M 步后的持续退化，该 run 已无法实现 1M milestone（tracking > 2.5/ep，crash < 35%）。
+
+**当前 run 建议：** 停止当前 run，准备 Restart D。
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 增加 illegal_contact 高度隔离机制 — 解决地板-天花板困境
+
+**Problem:** fly_high 与 illegal_contact 形成替代效应：策略降低高度以减少 fly_high，但低空随即触发 illegal_contact。两者之和约为 1.0，策略陷于无法同时满足两个约束的局部均衡。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- Parameter: `illegal_contact_penalty_weight` → 增加安全高度要求：**min_altitude = 1.0m → 1.2m**，强制策略在更高位置追踪
+- Parameter: `desired_height = 2.0` → **2.5m**（提高目标飞行高度至目标小车上方 2.25m，减少碰撞风险）
+- Rationale: 目标小车 z ≈ 0.25m，当前 desired_height = 2.0m 已有 1.75m 隔离，但策略仍触发 illegal_contact，说明碰撞不来自垂直方向而是水平追踪时的侧面接触。提高 min_altitude 强制策略维持安全高度。
+
+**替代方案（若 desired_height 调整效果不明显）：**
+- 增加 `illegal_contact_penalty_weight`：当前应为 5.0（Restart B 已应用），可进一步提至 8.0
+- 增加碰撞软边界（collision_soft_margin）：使策略更早"感知"到近距离风险
+
+### Priority 2 (HIGH): 修复 upright_penalty 学习停滞 — 1.5M 步无改善
+
+**Problem:** upright_penalty 全程 −1.71，无改善。upright_penalty_weight 当前值（根据 MEMORY/cfg 未知确切值）可能存在：(a) 权重过大惩罚正常追踪倾斜，或 (b) 权重过小无法引导策略改善姿态，两者任一均导致停滞。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/marl_move_flyfollow_env_cfg.py`
+- 检查 `upright_penalty_weight` 当前值：
+  - 若 > 2.0：适当降低至 1.0，允许追踪时的合理倾斜
+  - 若 < 0.5：适当提高至 1.0，增强改善姿态的激励
+- 目标：upright_penalty 在 200k 步内改善至 > −1.0（允许合理倾斜但不极端）
+- Rationale: 当前值（−1.78 recent）说明策略持续以大倾斜角飞行，且 1.5M 步训练未能改善，是系统性问题而非训练不足。
+
+### Priority 3 (HIGH): 降低 grad_norm_clip 以改善 actor 学习效率
+
+**Problem:** actor 梯度范数全程约 0.92，持续被 clip=1.0 截断，实际学习步长受限。结合持续退化的状态，当前学习信号未被充分利用。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move_flyfollow/agents/skrl_mappo_cfg.yaml`
+- Parameter: `grad_norm_clip`: 1.0 → **0.5**（降低裁剪上限，减少大梯度时的截断频率，使梯度更稳定）
+- 或：学习率从当前值 × 1.5（补偿之前的有效步长损失）
+- Rationale: 若梯度持续在 0.92 附近（90%+ 利用率），降低 clip 可使每次更新更稳定（小且均匀），有助于跳出当前局部均衡。
+- **注意：** 与上次 Priority（illegal_contact 修复）配合应用，避免孤立评估效果。
+
+### Priority 4 (MEDIUM): 增加 velocity_follow 激励 — 策略目前"冲进冲出"而非"伴飞"
+
+**Problem:** velocity_follow recent_mean = 0.051（极低），策略未学习速度匹配。当前 velocity_follow_weight = 0.8，sigma = 0.8，可能梯度太弱。
+
+**Proposed Change:**
+- File: `marl_move_flyfollow_env_cfg.py`
+- Parameter: `velocity_follow_weight`: 0.8 → **1.5**（增强速度匹配激励）
+- Parameter: `velocity_follow_sigma`: 0.8 → **1.2**（放宽匹配宽容度，使更多行为能获得奖励信号）
+- Rationale: 当前策略对 velocity_follow 几乎无响应（0.051 vs tracking 1.49），原因可能是匹配条件太严（0.8m/s 误差容忍）。先放宽再收紧是更好的 curriculum 策略。
+- **前置条件：** 须与 Priority 1 和 Priority 2 同时应用，否则速度追踪可能导致更多碰撞。
+
+### Priority 5 (MEDIUM): 确认 entropy_loss_scale 并评估是否需要上调
+
+**Problem:** entropy_loss = −0.01031（saturating），全程单调递减。若 scale=0.01，则 entropy reward ≈ 0.01 × H，力度不足以对抗策略收敛压力。
+
+**Proposed Change:**
+- File: `agents/skrl_mappo_cfg.yaml` 或 `scripts/skrl/train.py`
+- 确认当前值：grep `entropy_loss_scale`
+- 若 = 0.01：升至 **0.02**（提供更强的探索激励）
+- 若已 = 0.015：升至 **0.02**
+- Rationale: policy_std 在 0.49 说明探索能力未完全崩溃，但 entropy_loss 趋势表明在 500k-1M 之间很可能出现探索不足的问题，应提前准备。
+
+## Experiment Plan（Restart D）
+
+**决策：当前 run 已进入退化，继续无收益。建议在确认退化分析后立即启动 Restart D。**
+
+**Restart D 参数变更清单（相比当前 Restart C）：**
+
+| 参数 | 当前值 | 建议值 | 优先级 |
+|------|--------|--------|--------|
+| `desired_height` | 2.0m | **2.5m** | CRITICAL |
+| `min_altitude` | 1.0m | **1.2m** | CRITICAL |
+| `illegal_contact_penalty_weight` | 5.0 | **8.0** | HIGH |
+| `upright_penalty_weight` | 检查后调整 | **目标 1.0** | HIGH |
+| `grad_norm_clip` | 1.0 | **0.5** | HIGH |
+| `velocity_follow_weight` | 0.8 | **1.5** | MEDIUM |
+| `velocity_follow_sigma` | 0.8 | **1.2** | MEDIUM |
+| `entropy_loss_scale` | 0.01或0.015 | **0.02** | MEDIUM |
+
+**Restart D 建议：**
+- Hot-start from Restart C 最佳 checkpoint（约 500k 步时的 best_agent.pt，因为那是最高点）
+- 优先应用 CRITICAL 和 HIGH 优先级变更
+- num_envs=2048，训练至 500k 步做第一个 checkpoint 评估
+
+**500k 监测指标（Restart D）：**
+- crash 率 < 40%（目标比 Restart C 的 54% 显著改善）
+- fly_high 率 < 30%（Restart C 500k 时 49.5%，需大幅改善）
+- tracking_reward > 1.8/ep
+- velocity_follow > 0.2/ep（速度匹配改善的信号）
+- upright_penalty > −1.2（姿态改善的信号）
+- episode_mean > 185 步
+
+**1M milestone 目标（Restart D）：**
+- tracking_reward > 2.5/ep
+- crash 率 < 30%
+- fly_high 率 < 20%
+- velocity_follow > 0.5/ep
+- episode_mean > 220 步
+
+## Regression Guards（更新）
+
+- `fly_high_termination_z` 不得降低至 < 5.0m（4.5m 在历史 run 造成永久退化）
+- `height_reward_weight` 不得低于 1.5（已有前车之鉴）
+- `illegal_contact_penalty` 不得低于 5.0（3.0 已确认无效）
+- `low_altitude_soft_penalty_weight` 不得归零（仅可上调）
+- `tracking_reward_weight` 不得低于 4.0（Restart C 的 5.0 已验证有效）
+
+## Changelog
+
+- 2026-03-30：第二次分析 2026-03-29_18-27-54 run（Restart C，1,512k 步）
+  - 500k milestone 正式判定：2/4 通过（tracking PASS 1.82，crash PASS 54%，fly_high FAIL 49.5%，ep_len FAIL 178）
+  - 确认全程"抛物线"退化：峰值 500k（reward=49.1，tracking=1.82），1.5M 时退化至 34.1 和 1.27（较峰值 −31%）
+  - 发现核心失效机制：fly_high 下降↔illegal_contact 上升的替代效应（两者之和 ≈ 1.0 全程恒定）
+  - upright_penalty 全程 −1.71 无改善（1.5M 步训练无效，系统性问题）
+  - velocity_follow 极低（0.051），策略无伴飞行为，仅"冲进冲出"捕获区
+  - grad_norm_actor ≈ 0.92（持续被 clip=1.0 截断），actor 学习效率受限
+  - 决策：建议停止 Restart C，启动 Restart D（8 项参数变更，hot-start from 500k best_agent.pt）
