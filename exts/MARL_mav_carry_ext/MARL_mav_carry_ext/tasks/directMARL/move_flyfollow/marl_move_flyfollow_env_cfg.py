@@ -118,14 +118,16 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 竖直姿态：w * (R_zz - 1.0) × dt，R_zz = 机体 z 轴与世界 z 轴夹角余弦
     # 完全竖直时 R_zz=1（奖励=0），翻滚时 R_zz=-1（奖励=-2×w×dt）
     # [PLAN fix-1] 降低权重
-    upright_penalty_weight = 0.5
+    # [Restart-D] 0.5→1.0：全程 upright_penalty=-1.71 零改善，需加大梯度信号
+    upright_penalty_weight = 1.0
     upright_expect_dir = (0.0, 0.0, 1.0)  # 期望机体上方向 = 世界 z 轴
 
     # 高度奖励：鼓励维持在 desired_height 附近飞行
     # [Fix-A] 恢复到与 move 任务相同的权重（0.5→2.0），提供足够的高度锚定梯度
     height_reward_weight = 2.0
     # [Fix-D] 降低期望高度，更接近地面目标（NovaCarter 高约 0.25m）
-    desired_height = 2.0   # 期望飞行高度（m）
+    # [Restart-D] 2.0→2.5m：扩大与目标小车 z=0.25m 的物理间隔，缓解高度走廊被夹问题
+    desired_height = 2.5   # 期望飞行高度（m）
 
     # 高度超限惩罚（线性）：|z - desired| > threshold 时额外惩罚
     # [Fix-E] 增强高度超限惩罚，收紧容忍偏差
@@ -136,8 +138,9 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 低空软惩罚：z < low_altitude_soft_threshold 时每步 exp 形式惩罚
     # [Restart-B] 新增 dense per-step 低空惩罚，解决 crash-reset 局部最优
     # [Restart-C] threshold 0.5→1.5m，weight 1.0→2.0：扩大覆盖范围，提供有效梯度信号
+    # [Restart-D] threshold 1.5→1.2m：随期望高度上移，收紧走廊下界
     low_altitude_soft_penalty_weight = 2.0
-    low_altitude_soft_threshold = 1.5  # 低于此高度（m）开始施加软惩罚
+    low_altitude_soft_threshold = 1.2  # 低于此高度（m）开始施加软惩罚
 
     # 高飞惩罚：超过 fly_high_threshold 后每步软惩罚，防止无人机持续高飞
     # [Fix-B] 新增：每步 exp 形式惩罚，z 越高惩罚越大
@@ -155,7 +158,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0          # 坠机惩罚（未使用，保留接口）
     collision_penalty_scale = 1.0      # 无人机碰撞惩罚（per collision pair）
     # [Restart-B] 3.0→5.0：加重终止惩罚，提高 crash-reset 行为成本
-    illegal_contact_penalty = 5.0      # 非法接触惩罚
+    # [Restart-D] 5.0→8.0：crash 率仍 54%，继续加大碰撞代价
+    illegal_contact_penalty = 8.0      # 非法接触惩罚
     fly_low_penalty = 1.0              # 飞低惩罚
     fly_high_penalty = 1.0             # 高飞终止固定惩罚（触发终止时一次性扣除）
 
