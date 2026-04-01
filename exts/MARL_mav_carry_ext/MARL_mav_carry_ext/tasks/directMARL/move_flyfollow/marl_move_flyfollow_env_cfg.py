@@ -96,7 +96,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 速度跟随奖励：鼓励无人机匹配目标速度（0.3 m/s x 向），解决"悬停局部最优"
     # exp(-||v_drone_xy - v_target_xy||²)；适合匀速追踪任务
     # [PLAN fix-2] 新增，CRITICAL
-    velocity_follow_weight = 1.5
+    # [Restart-E] 1.5→2.5：velocity_follow 被 distance_reward 300:1 淹没，大幅提权
+    velocity_follow_weight = 2.5
 
     # 动作平滑度：exp(-||Δaction||²)，鼓励连续平滑的控制输出
     action_smoothness_weight = 1.0
@@ -119,7 +120,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 完全竖直时 R_zz=1（奖励=0），翻滚时 R_zz=-1（奖励=-2×w×dt）
     # [PLAN fix-1] 降低权重
     # [Restart-D] 0.5→1.0：全程 upright_penalty=-1.71 零改善，需加大梯度信号
-    upright_penalty_weight = 1.0
+    # [Restart-E] 1.0→0.5：高飞导致姿态恶化，加重惩罚反效果，等高飞问题解决后再调
+    upright_penalty_weight = 0.5
     upright_expect_dir = (0.0, 0.0, 1.0)  # 期望机体上方向 = 世界 z 轴
 
     # 高度奖励：鼓励维持在 desired_height 附近飞行
@@ -142,6 +144,11 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     low_altitude_soft_penalty_weight = 2.0
     low_altitude_soft_threshold = 1.2  # 低于此高度（m）开始施加软惩罚
 
+    # 高度软上边界：消除 desired_height(2.5m)～fly_high_threshold(5.0m) 之间的 2.5m 无惩罚死区
+    # [Restart-E] 新增：z > height_upper_soft_threshold 时 exp 梯度惩罚，引导策略远离上界
+    height_upper_soft_weight = 1.5
+    height_upper_soft_threshold = 3.5  # 超过此高度（m）开始施加上边界软惩罚
+
     # 高飞惩罚：超过 fly_high_threshold 后每步软惩罚，防止无人机持续高飞
     # [Fix-B] 新增：每步 exp 形式惩罚，z 越高惩罚越大
     fly_high_penalty_weight = 2.0
@@ -159,7 +166,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     collision_penalty_scale = 1.0      # 无人机碰撞惩罚（per collision pair）
     # [Restart-B] 3.0→5.0：加重终止惩罚，提高 crash-reset 行为成本
     # [Restart-D] 5.0→8.0：crash 率仍 54%，继续加大碰撞代价
-    illegal_contact_penalty = 8.0      # 非法接触惩罚
+    # [Restart-E] 8.0→6.0：净 penalty 恶化 18%，权重提升代价超过频率下降收益，适当回调
+    illegal_contact_penalty = 6.0      # 非法接触惩罚
     fly_low_penalty = 1.0              # 飞低惩罚
     fly_high_penalty = 1.0             # 高飞终止固定惩罚（触发终止时一次性扣除）
 

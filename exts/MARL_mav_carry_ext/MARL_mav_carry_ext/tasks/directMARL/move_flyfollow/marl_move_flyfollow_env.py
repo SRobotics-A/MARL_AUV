@@ -220,6 +220,7 @@ class MARLMoveEnv(DirectMARLEnv):
                 "drone_out",          # 出界惩罚
                 "fly_low",            # 飞太低惩罚
                 "low_altitude_soft",  # 低空软惩罚（dense per-step，z < threshold）
+                "height_upper_soft",  # 高度软上边界惩罚（消除 desired_height～fly_high 死区）
                 "illegal_contact",    # 非法接触惩罚（碰地面等）
                 "time_penalty",       # 时间惩罚（已移除）
                 "upright_penalty",    # 姿态惩罚：防止翻滚
@@ -958,6 +959,16 @@ class MARLMoveEnv(DirectMARLEnv):
         low_alt_soft = (torch.exp(deficit_z) - 1.0).sum(dim=-1)  # (N,)
         rewards["low_altitude_soft"] = (
             -self.cfg.low_altitude_soft_penalty_weight * low_alt_soft * step_dt
+        )
+
+        # --- 9.2 高度软上边界惩罚（消除 desired_height～fly_high_threshold 无惩罚死区）---
+        # [Restart-E] 新增：z > height_upper_soft_threshold 时施加 exp 梯度，引导策略远离上界
+        excess_upper = (
+            self.drone_positions[:, :, 2] - self.cfg.height_upper_soft_threshold
+        ).clamp(min=0.0)  # (N, D)
+        height_upper_soft = (torch.exp(excess_upper) - 1.0).sum(dim=-1)  # (N,)
+        rewards["height_upper_soft"] = (
+            -self.cfg.height_upper_soft_weight * height_upper_soft * step_dt
         )
 
         # --- 9.5 高飞软惩罚（超过 fly_high_threshold 后每步惩罚，防止高飞局部最优）---

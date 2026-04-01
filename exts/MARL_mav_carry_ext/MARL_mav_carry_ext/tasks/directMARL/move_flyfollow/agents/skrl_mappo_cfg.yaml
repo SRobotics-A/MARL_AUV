@@ -73,7 +73,8 @@ agent:
 
   # ===== 梯度裁剪和截断 =====
   # [Restart-D] 1.0→0.5：actor grad_norm 长期接近 clip=1.0，梯度饱和压制学习效率
-  grad_norm_clip: 0.5     # 梯度范数截断（防止梯度爆炸）
+  # [Restart-E] 0.5→0.8：0.5 过于保守，配合 entropy_scale 0.02 导致训练不稳定
+  grad_norm_clip: 0.8     # 梯度范数截断（防止梯度爆炸）
   # [PLAN fix-5] 0.1→0.2：早期探索阶段策略需要更大的更新步长
   ratio_clip: 0.2         # PPO clip epsilon：限制策略更新幅度
   value_clip: 0.2         # Critic 价值截断（与 ratio_clip 保持一致）
