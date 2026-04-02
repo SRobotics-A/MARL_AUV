@@ -74,7 +74,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
         -2.0,
         -6.0,
     ]
-    target_spawn_z = 0.0  # z高度固定在地面上方（NovaCarter以地面为基准）
+    target_spawn_z = 0.25  # z高度固定在地面上方（NovaCarter车身高约0.25m）
 
     # NovaCarter小车USD路径
     nova_carter_usd_path: str = (
