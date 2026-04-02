@@ -3960,3 +3960,284 @@ distance_reward 稳定（24.5），说明无人机保持在目标附近，但 tr
   - velocity_follow_weight 提升（1.5→2.5）无效：绝对奖励值不足 0.2%，信号被淹没
   - policy_std 单调膨胀（0.637→0.774），价值函数失准（value_loss +40%），策略未收敛
   - 决策：若 1M 步无改善则启动 Restart F（5 项参数调整，重点强化高度双边吸引力）
+- 2026-04-02：分析 2026-04-01_12-47-38 run（Restart E，1.69M 步最终分析）— 见下方完整报告
+
+---
+
+# Training Analysis Report — Restart E 最终分析（1.69M 步）
+
+**Run:** 2026-04-01_12-47-38_mappo_torch_mappo
+**Date:** 2026-04-02
+**Task:** Isaac-marl-flyfollow-v0（Isaac-move-flyfollow-marl-v0）
+**Algorithm:** MAPPO
+**Analysis type:** Restart E 第二次分析（本次约 1.69M 步；上次 695k 步）
+
+## Training Metrics Summary
+
+| 指标 | 上次（695k） | 本次最终（1.69M） | 趋势 |
+|------|------------|----------------|------|
+| total_reward_mean (recent) | ~57 | 36.1 | -37% REGRESSING |
+| tracking_reward (recent) | ~2.5 | 1.363 | -45% |
+| velocity_follow (recent) | ~0.097 | 0.103 | +6% |
+| distance_reward (recent) | ~24.1 | 18.3 | -24% |
+| height_reward (recent) | ~1.56 | 1.632 | +5% |
+| ep_len_mean (recent) | ~213 | 199.8 | -6% |
+| fly_high (last300k) | 0.37 | 0.3216 | -13% |
+| crash (last300k) | 0.67 | 0.7215 | +8% |
+| fly_high + crash | 1.04 | **1.043** | 未改变 |
+| policy_std (last) | 0.774 | 0.647 | 下降 |
+| success_reward | 0.000 | 0.000 | 从未触发 |
+
+**Active config (Restart E):**
+- desired_height=2.5m, height_upper_soft_threshold=3.5m, weight=1.5
+- low_altitude_soft_threshold=1.2m, weight=2.0
+- fly_high_threshold=5.0m, fly_high_termination_z=5.5m
+- illegal_contact_penalty=6.0
+- upright_penalty_weight=0.5
+- velocity_follow_weight=2.5, tracking_reward_weight=5.0
+- grad_norm_clip=0.8, entropy_loss_scale=0.015（非 env.yaml 项，来自上次分析推断）
+
+## 1M 步里程碑检定结果（OFFICIAL VERDICT）
+
+| 里程碑目标 | 目标值 | 实际值（last300k） | 判定 |
+|-----------|------|--------------------|------|
+| fly_high < 25% | <0.25 | 0.322 | **FAIL** |
+| crash < 25% | <0.25 | 0.722 | **FAIL** |
+| fly_high + crash < 0.75 | <0.75 | **1.043** | **FAIL** |
+| tracking_reward > 2.5/ep | >2.5 | 1.352 | **FAIL** |
+| velocity_follow > 0.3/ep | >0.3 | 0.107 | **FAIL** |
+| episode_mean > 220 步 | >220 | 197.6 | **FAIL** |
+
+**全部 6 项里程碑均未达到。**
+
+## Observations & Findings
+
+### 发现 1：零和替代效应完全固化 — CRITICAL
+
+**Symptom:** fly_high + crash 之和在整个 1.69M 步内以惊人的精度维持在 1.04±0.01。100k 窗口数据：
+
+| 窗口 | fly_high | crash | 总和 |
+|------|---------|-------|------|
+| 0.2–0.3M | 0.487 | 0.556 | 1.043 |
+| 0.5–0.6M | 0.373 | 0.670 | 1.043 |
+| 0.8–0.9M | 0.262 | 0.770 | 1.031 |
+| 1.0–1.1M | 0.194 | 0.850 | 1.044 |
+| 1.3–1.4M | 0.280 | 0.766 | 1.047 |
+| 1.6–1.7M | 0.347 | 0.702 | 1.049 |
+
+**Root Cause:** 零和效应不是 Restart E 新出现的问题，从 Restart C（1.5M 步，sum≈1.05）到 Restart D（2M 步，sum≈1.047）到 Restart E（1.69M 步，sum≈1.043）持续三个 Restart 共计 5M+ 步保持不变。这已确认是**结构性问题**，与惩罚权重无关。
+
+**Evidence:** crash 与 illegal_contact 的相关性（mean_diff≈0.002）证实两者是同一物理事件的双重记录。"crash"= 无人机与目标或地面发生接触，非坠落。
+
+**Key insight:** height_upper_soft 的引入（Restart E 新增）有效地把 fly_high 从 0.49（Restart C 末）→ 0.32（本次 1.69M 末），但 crash 从 0.47（Restart C 末）→ 0.72（本次 1.69M 末）。height_upper_soft 梯度成功拦截了高飞，但把无人机直接推向地面，净效果为零。
+
+---
+
+### 发现 2：tracking_reward 持续衰退，1M 步后未见底 — CRITICAL
+
+**Symptom:** tracking_reward 在早期（0.2–0.9M 窗口）维持在 2.3–2.6/ep，但从 1.0M 步开始出现断崖式下跌：
+
+| 窗口 | tracking_reward |
+|------|----------------|
+| 0.8–0.9M | 2.284 |
+| 0.9–1.0M | 2.042 |
+| **1.0–1.1M** | **1.640** ← 断崖 |
+| 1.1–1.2M | 1.701 |
+| 1.6–1.7M | 1.276 |
+
+**Root Cause:** 1.0M 步正好是 crash 率达到峰值（0.850）的时间窗口，此后 crash 持续高于 0.70，episode 平均缩短 → tracking 积累时间减少 → tracking/ep 下降。这与第 695k 步分析的预测吻合：crash 主导的短 episode 挤压 tracking 积累。
+
+**Evidence:** ep_len_mean 从 1.0M 窗口的 202 步下降到 1.6M 窗口的 188 步（−7%），last 值为 152 步（−25%），与 tracking 衰退同步。
+
+---
+
+### 发现 3：velocity_follow 信号彻底失效 — HIGH
+
+**Symptom:** velocity_follow 在整个 1.69M 步内从 0.093 到 0.109/ep，**完全平坦**，无任何学习趋势。velocity_follow_weight 从 1.5→2.5 的提升（Restart E 改动）产生零效果。
+
+**Root Cause:** distance_reward/ep 平均约 18.3，velocity_follow/ep 约 0.103，信号比 = 18.3/0.103 = **178:1**。策略梯度中 velocity_follow 的贡献约为 0.6%，完全被 distance_reward 淹没。参照规则 18（velocity_follow_weight 必须 ≥ distance_reward_weight × 0.3 才能显现），当前 weight=2.5 vs 需要 ≥ 5.0×0.3=1.5——但实际值还要除以信号幅度差异，等效要求 weight ≥ 5.0 才能产生可见梯度。
+
+---
+
+### 发现 4：policy_std 从膨胀转为收缩，探索枯竭 — HIGH
+
+**Symptom:** policy_std 在 0.7–0.8M 窗口达到峰值 0.788，随后持续下降：
+
+| 窗口 | policy_std |
+|------|-----------|
+| 0.5–0.6M | 0.750 |
+| 0.7–0.8M | 0.773（峰值） |
+| 1.0–1.1M | 0.734 |
+| 1.5–1.6M | 0.681 |
+| 1.6–1.7M | 0.657 |
+| last | 0.647 |
+
+**Root Cause:** policy_std 峰值恰好出现在 tracking_reward 开始断崖（1.0M）的前 200k 步。探索扩展 → 无人机进入 crash 区域更多 → crash 率上升 → episode 变短 → 奖励减少 → policy 逐渐收缩以减少 crash。这是一个负反馈循环。
+
+**Evidence:** 在上次（695k）分析时 policy_std 仍在膨胀（0.637→0.774），本次确认在 0.774 见顶后持续回落。策略正趋向 crash-avoidance 保守模式，探索能力递减。
+
+---
+
+### 发现 5：upright_penalty 无法自我改善 — MEDIUM
+
+**Symptom:** upright_penalty 在 1.69M 步内从 −2.02（0.2M 窗口）→ −1.87（1.6M 窗口），仅改善约 7%，且趋势不稳定。
+
+**Root Cause:** 高 crash 率导致短 episode，无人机无法在足够多的步数内学习姿态控制。且 crash 主要发生在接近目标的低空动作中（aggressive approach → tilt → contact），这是任务内置的矛盾：接近目标需要加速倾斜，但 upright_penalty 要求保持竖直。
+
+---
+
+## Go/No-Go 决策
+
+### 明确判断：**NO-GO — 立即启动 Restart F**
+
+理由：
+1. **全部 6 项 1M 步里程碑均未达到**（最关键指标 fly_high+crash=1.043 vs 目标 <0.75，差距 39%）
+2. **零和替代效应持续 5M+ 步（Restart C+D+E）**，证明当前奖励结构无法通过权重调整突破
+3. **tracking_reward 在 1.0M 步后出现结构性衰退**（最终 1.276/ep vs 峰值 2.6/ep，且无反弹迹象）
+4. **policy_std 已从探索峰值（0.774）回落至 0.647**，探索能力递减，继续训练只会加速收缩
+5. **velocity_follow 1.69M 步内完全无进展**（0.093→0.109，趋势统计显著性近零）
+6. **Restart E 的核心假设（height_upper_soft 打破零和）被数据证伪**：sum 在引入后仍为 1.043
+
+继续训练 Restart E 的理由：无。所有指标均在衰退或停滞，且根因已明确（结构性零和 + velocity_follow 信号淹没）。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 引入 3D 距离奖励打破零和的结构根因
+
+**Problem:** XY-only 距离奖励在 z 方向无梯度。无人机在 z=1.2m（crash 边界）和 z=5.0m（fly_high 阈值）之间任何高度都获得相同的 distance_reward。飞高和撞地提供相同的逃避收益，只是终止代价不同。
+
+**Proposed Change:**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env.py`
+- 在 distance_reward 计算中将 XY 距离替换为 **XYZ 3D 距离**（目标高度取地面 z≈0.25m 加 desired_height=2.5m 作为期望停留点，即 3D 目标点 = [target_xy, 2.5m]）
+- 效果：z=2.5m 的无人机获得最大 distance_reward；偏离（过高或过低）均减少奖励
+- 注意：不要求无人机追 z=0.25m 的地面目标，应使用 [target_x, target_y, desired_height] 作为 3D 参考点
+- Rationale: 这是从 Restart C 分析（规则 16）反复被识别但从未实施的根本修复。在奖励结构层面提供连续的高度引导，替代所有零散的软惩罚信号。
+
+**预期效果:** 高度偏差直接影响 distance_reward（最大 reward term，占比 50%），无人机有强动机维持在 desired_height 附近。
+
+---
+
+### Priority 2 (CRITICAL): velocity_follow 信号重构（重大权重提升 + 计算检查）
+
+**Problem:** velocity_follow/ep = 0.107，distance_reward/ep = 18.3，信号比 178:1，velocity_follow_weight=2.5 完全无效（信号淹没阈值约为 weight ≥ 5.0 才能显现）。
+
+**Proposed Change:**
+- 文件：`marl_flyfollow_env_cfg.py`
+- `velocity_follow_weight`: 2.5 → **5.0**（与 tracking_reward_weight 等重，使 velocity_follow 成为同等优先级信号）
+- 文件：`marl_flyfollow_env.py`
+- 检查 velocity_follow reward 的计算公式：应确保当无人机速度 = target_speed（0.3m/s x 向）时奖励值接近权重峰值，而非 exp(−err²/σ²) 中 σ 设置过窄导致奖励近似为 0
+- 建议 velocity_follow 仅在 dist_xy < capture_distance（3.5m）范围内激活，避免远距离无意义的速度匹配信号
+
+---
+
+### Priority 3 (HIGH): 废弃 height_upper_soft，改为 height_band 正奖励
+
+**Problem:** height_upper_soft（推力向下）+ low_altitude_soft（推力向上）是双侧负梯度，策略的最优应对是在两者之间找平衡点——但这个"中间地带"奖励为零（既没有正向吸引也没有进一步惩罚）。三代 Restart 数据证明双侧负梯度产生不稳定的振荡均衡，而非稳定收敛。
+
+**Proposed Change:**
+- 文件：`marl_flyfollow_env.py`
+- 新增 `height_band_reward`：当 min_altitude < z < fly_high_threshold 时，给予持续正奖励（比如 `exp(−|z−desired_height|/σ_h)` with σ_h=0.5m），将 desired_height 做成奖励的"吸引盆"
+- `height_upper_soft_weight`: 1.5 → **0.5**（大幅减弱排斥力，改为吸引力主导）
+- `low_altitude_soft_penalty_weight`: 2.0 → **1.0**（与 height_upper_soft 对称减弱）
+- 文件：`marl_flyfollow_env_cfg.py`
+- `height_band_reward_weight`: 新增 2.0（与 height_reward_weight 同级，协同提供高度信号）
+
+**Rationale:** 规则 17（height corridor squeeze 规则）指出正确修复是提供"stable middle zone reward"，而非只调整边界惩罚。三代 Restart 均失败于只调整边界惩罚的策略。
+
+---
+
+### Priority 4 (HIGH): 降低 crash 与低空接触的物理可能性（结构性隔离）
+
+**Problem:** crash = illegal_contact（confirmed，correlation 0.9990）。无人机在低空接近地面目标时发生物理接触。即使惩罚提高到 8.0（Restart D），crash 率也只降低 27% 且立即转移到 fly_high。
+
+**Proposed Change:**
+- 文件：`marl_flyfollow_env_cfg.py`
+- `min_altitude`（硬终止高度）: 1.0 → **1.5m**（与 desired_height=2.5m 更接近，减少无人机接近地面的物理机会）
+- `low_altitude_soft_threshold`: 1.2 → **2.0m**（软惩罚覆盖从 2.0m 到 1.5m 的完整危险带，比 crash 高出 0.5m 提供足够的梯度预警距离）
+- 保持 `illegal_contact_penalty`: 6.0（不继续提高，已证明提高惩罚是无效干预）
+- 保持 `fly_high_termination_z`: 5.5m（不放松，防止惯性高飞）
+
+---
+
+### Priority 5 (MEDIUM): 恢复 policy 探索能力
+
+**Problem:** policy_std 从 0.774 降至 0.647，探索空间收缩。同时 grad_norm_actor 处于中间水平（~0.69），显示梯度健康但策略仍在收缩。
+
+**Proposed Change:**
+- 文件：SKRL agent 配置
+- `entropy_loss_scale`: 0.015 → **0.02**（如果 Restart D 的教训是 0.02 过高，那与 Restart D 不同的是本次 grad_norm_clip=0.8 而非 0.5，两者结合应更稳定）
+- `grad_norm_clip`: 0.8 → **1.0**（Restart D 将其降至 0.5 导致 policy_std 异常膨胀；本次目标是维持 std 在 0.65 附近，使用默认 1.0 更稳定）
+- 热启动策略：从本 run 的 best_agent.pt（约 900k 步，tracking_reward best 约 6.0）热启动，而非从 1.69M 步末尾检查点
+
+---
+
+## 实验计划（Restart F）
+
+**决策：NO-GO — 立即启动 Restart F**
+
+### 变更列表
+
+| # | 优先级 | 参数 / 文件 | 旧值 | 新值 | 理由 |
+|---|--------|------------|------|------|------|
+| 1 | CRITICAL | `marl_flyfollow_env.py` distance_reward 计算 | XY 距离 | XYZ 3D 距离（目标点=[target_xy, desired_height]） | 打破 z 方向无梯度的结构根因 |
+| 2 | CRITICAL | `velocity_follow_weight` | 2.5 | **5.0** | 突破 178:1 信号淹没 |
+| 3 | HIGH | 新增 `height_band_reward_weight` | - | **2.0** | 正向吸引替代双侧惩罚 |
+| 4 | HIGH | `height_upper_soft_weight` | 1.5 | **0.5** | 减弱排斥力，避免 crash 替代 |
+| 5 | HIGH | `low_altitude_soft_penalty_weight` | 2.0 | **1.0** | 与 height_upper_soft 对称减弱 |
+| 6 | HIGH | `low_altitude_soft_threshold` | 1.2m | **2.0m** | 扩展低空预警覆盖范围 |
+| 7 | HIGH | `min_altitude` | 1.0m | **1.5m** | 物理隔离，减少接触机会 |
+| 8 | MEDIUM | `entropy_loss_scale` | 0.015 | **0.02** | 恢复探索，配合 grad_norm=1.0 |
+| 9 | MEDIUM | `grad_norm_clip` | 0.8 | **1.0** | Restart D 教训：0.5 过度限制 |
+
+### 热启动点
+
+从本 run（2026-04-01_12-47-38）的 **best_agent.pt** 热启动（约 900k 步附近，tracking_reward 历史最高 6.014）。
+
+不推荐从 1.69M 步末尾启动，因策略已进入 crash-avoidance 保守模式（std=0.647 下行，tracking 持续衰退）。
+
+### 训练命令
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-flyfollow-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+### 500k 步里程碑（Restart F）
+
+| 指标 | 目标值 | 来源 |
+|------|--------|------|
+| fly_high + crash | < 0.85 | 过渡目标（最终目标 <0.75） |
+| fly_high | < 35% | 从 32.2% 维持不恶化 |
+| crash | < 50% | 从 72.2% 大幅改善 |
+| tracking_reward | > 1.8/ep | 从衰退低点 1.28 回升 |
+| velocity_follow | > 0.20/ep | 从 0.107 提升 2× |
+| distance_reward | > 18/ep | 维持当前水平（不退步） |
+| episode_mean | > 190 步 | 从 188 步稳定 |
+
+### 1M 步成功判据（Restart F）
+
+- fly_high + crash 之和 < 0.75（**核心判据，唯一不可妥协的指标**）
+- tracking_reward > 2.5/ep（回到 Restart E 前期水平）
+- velocity_follow > 0.25/ep（明显改善，证明信号可达）
+- episode_mean > 200 步
+
+### 关键监测
+
+1. **distance_reward 早期值**：3D 距离奖励可能比 XY 更小（高度偏差惩罚新增），若 early distance_reward < 15，说明 sigma 需要调整
+2. **crash 率 100k 步内响应**：min_altitude=1.5m + low_altitude_soft=2.0m 应在最初 100k 步内使 crash 降到 <60%；若无响应则说明 3D 距离奖励导致无人机俯冲到 desired_height 途中直接接触地面
+3. **velocity_follow 早期值**：weight=5.0 下 early mean 应 >0.12；若仍 <0.10，说明 sigma 参数问题，需检查 env.py 中的公式
+
+---
+
+## Changelog（续）
+
+- 2026-04-02：分析 2026-04-01_12-47-38 run（Restart E，1.69M 步最终分析）
+  - 核心发现：fly_high+crash 零和 sum=1.043 全程固化，15 个 100k 窗口均在 1.031–1.049 范围内（精度 ±1%），3 代 Restart 共 5M+ 步均未能打破
+  - 1.0M 步断崖：tracking 从 2.04（0.9M 窗口）→ 1.64（1.0M 窗口），与 crash 率峰值 0.85 同期出现，因果链明确
+  - policy_std 从峰值 0.774 回落至 0.647，探索能力递减，继续训练只会加速收缩
+  - velocity_follow 1.69M 步内信号比 178:1，weight=2.5 完全无效，需要 weight=5.0 且配合 3D 距离奖励降低 distance_reward 主导地位
+  - height_upper_soft 机制证伪：将 fly_high 从 0.49→0.32 但 crash 从 0.47→0.72，净效果为零
+  - **决策：NO-GO，立即启动 Restart F**（9 项变更，核心是 3D 距离奖励 + velocity_follow weight×2 + 高度正吸引替代双侧负惩罚）
