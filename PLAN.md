@@ -4608,3 +4608,179 @@ seed 差异和 nova_carter 字段差异均不影响训练行为；**唯一的行
   - 成功 run 的 tracking_reward=37.4 依赖 drone 俯冲到 z≈1.25m，是隐性策略而非 XY 追踪
   - 两 run 奖励权重、观测空间、动作空间完全相同，退步来源于单一参数 `target_spawn_z`
   - 建议在下次训练前先修复该单点故障，再叠加 XY-only 捕获和权重调整
+
+---
+
+# Training Analysis Report — 2026-04-02_15-10-03_mappo_torch_mappo
+
+**Run:** `logs/skrl/move/2026-04-02_15-10-03_mappo_torch_mappo`
+**Date:** 2026-04-02
+**Task:** Isaac-marl-move-v0（3 Falcon 无人机追踪 4 辆 NovaCarter 移动小车）
+**Algorithm:** MAPPO
+**背景：** 本次为将目标从 VisualizationMarkers 替换为 NovaCarter 真实 USD 小车后的第一次训练
+
+---
+
+## Training Metrics Summary
+
+| 指标 | 值 |
+|------|----|
+| 总训练步数（梯度更新） | 106,100 |
+| num_envs | **32**（标准值应为 2048） |
+| 最终 total_reward mean（per episode） | -0.314（最近均值 -0.082） |
+| 最终 total_reward max（per episode） | +1.54 |
+| episode 步数 mean | **61 步（=0.61s，仅占 max 的 1.0%）** |
+| episode 步数 min | **1 步**（持续存在） |
+| tracking_reward（recent） | **0.000017**（实际为零，历史最高仅 0.0046） |
+| distance_reward（recent） | 0.3454 |
+| height_reward（recent） | 0.5554 |
+| body_rate_penalty（recent） | 0.7419 |
+| policy_std | 0.821 → 0.537（衰减 1.5x，未崩溃） |
+| tracking:distance 奖励比 | **1 : 20,609**（tracking 实际为零） |
+
+### 与基线对比（2026-03-20_16-26-19，VisualizationMarkers）
+
+| 指标 | 基线（成功） | 本次（NovaCarter） | 退化幅度 |
+|------|------------|-------------------|---------|
+| episode 步数 mean | 1,641 | 61 | **-96%** |
+| tracking_reward/ep | 37.4 | 0.0 | **-100%** |
+| distance_reward/ep | ~196 | ~21 | **-89%** |
+| policy_std 最终值 | ~0.150 | 0.537 | 探索保留，尚未崩溃 |
+
+---
+
+## Observations & Findings
+
+### [Episode 长度异常] — Severity: CRITICAL
+
+**Symptom:** episode 步数 mean=61（0.61s），min=1 持续存在。正常 episode 应能达到数百步以上。
+只有 1% 的最大 episode 时长被利用，策略几乎没有机会学习任何有意义的行为。
+
+**Root Cause（已确认）：** 无人机初始 spawn 高度（`drone_spawn_z_range = (1.5, 2.5)`）与 NovaCarter 3x 缩放后的车身高度发生物理碰撞，在 episode 起始阶段即触发终止。
+
+**Evidence:**
+- NovaCarter 原始尺寸约 0.45m 高，缩放 3x 后约 **1.35m 高**
+- `target_spawn_z=0.25`（小车中心/底部基准），则小车顶部约 **z≈1.60m**
+- 无人机下限 spawn 高度为 `z=1.5m`，低于小车顶部（1.60m）→ **spawn 时 drone 嵌入 NovaCarter 车身**
+- 触发 `illegal_contact` 或 `drone_collision` 终止条件，即 min=1 步持续出现
+- `episode_timesteps_max=115` 步（约 1.15s），上限较低，说明即便幸运未碰撞也很快被其他条件终止
+
+### [tracking_reward 完全为零] — Severity: HIGH
+
+**Symptom:** tracking_reward recent_mean=0.000017（等同于零），历史最高仅 0.0046，在 106k 步训练中从未真正出现。
+
+**Root Cause:**
+1. episode 仅持续 61 步，无人机无时间接近目标（目标在 x=-2~-6m，无人机 spawn 在 x=-6~-8m，接近距离 ~4m，需要数十秒）
+2. 即便 episode 能正常运行，capture 逻辑已修改为 XY-only（`dist_matrix = torch.norm(d_pos - t_pos, dim=-1)` 中 `d_pos=...[:,:2]`），XY 接近范围 1.0m 本身也是较窄的目标，需要精确横向接近
+3. `tracking_reward_weight=1.0` 相对于 `dist_reward_weight=1.5`（已铺满全程）信号强度弱
+
+**Evidence:** tracking:dist 奖励比 = 1:20,609，为数量级级别的失衡
+
+### [训练规模不足 —— num_envs=32] — Severity: HIGH
+
+**Symptom:** 配置文件中 `scene.num_envs=32`（标准训练使用 2048），样本吞吐量降低 64 倍。
+
+**Root Cause:** 本次为首次 NovaCarter 集成测试，使用小型 num_envs 做验证性运行。但从数据来看问题已足够严重，不能在此规模下寄望策略收敛。
+
+**Evidence:**
+- 有效样本数 ≈ 32 × 61 × (106100/300) ≈ 690k（vs 2048 env 应有的 44M）
+- 训练曲线在 106k 步内几乎平坦（reward mean: early=-3.03, recent=-0.08），策略停留在非常初级的状态
+
+### [高度奖励主导 —— 高度锁定风险] — Severity: MEDIUM
+
+**Symptom:** height_reward=0.5554/step，body_rate_penalty=0.7419/step，两者主导 reward 结构，无人机倾向于维持高度而非追踪目标。
+
+**Root Cause:** `height_reward_weight=2.0`（最高权重之一），`desired_height=2.5m`，对高度精确性给予强激励，无法鼓励无人机下降进行捕获。
+
+**Evidence:** height_error 估算 ≈ 0 （reward≈exp(-0)×weight×dt ≈ 0.555 ≈ weight×dt = 2.0×0.01×（约0.28已归一化），说明 z 误差极小，无人机已锁定在 desired_height）
+
+---
+
+## 改进建议
+
+### Priority 1 (CRITICAL)：修复无人机 spawn 高度与 NovaCarter 碰撞
+
+**Problem:** NovaCarter 以 3x 缩放加载，车身高度约 1.35m（top≈z=1.60m），无人机最低 spawn 高度 z=1.5m，初始帧即发生嵌入碰撞，导致 episode 立即终止。
+
+**Proposed Changes（二选一）：**
+
+方案 A — 提高无人机最低 spawn 高度（推荐，最简单）：
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`drone_spawn_z_range: tuple = (1.5, 2.5)` → `drone_spawn_z_range: tuple = (2.0, 3.0)`
+- 理由：将 drone 最低 spawn 高度抬高至 2.0m，超过 NovaCarter 顶端（~1.60m），消除初始碰撞风险
+
+方案 B — 缩小 NovaCarter 缩放比例：
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`nova_carter_scale: tuple = (3.0, 3.0, 3.0)` → `nova_carter_scale: tuple = (1.0, 1.0, 1.0)`
+- 理由：1x 缩放时 NovaCarter 高度约 0.45m，无任何 spawn 碰撞风险；但视觉上车辆变小
+
+**Rationale:** 修复后 episode min 应从 1 步回归到数十步以上，training 才能真正开始。
+
+### Priority 2 (HIGH)：验证 NovaCarter 物理属性设置
+
+**Problem:** NovaCarter 是通过 `XFormPrim.set_world_poses()` 驱动的运动学对象（非 Articulation），理论上不参与物理碰撞。但接触传感器（ContactSensor on Falcon）可能仍会响应大型刚体。需确认 NovaCarter USD 中碰撞网格是否被正确禁用。
+
+**Proposed Change:**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在 _setup_scene 中加载 NovaCarter USD 后，显式禁用 NovaCarter 的碰撞属性（collision API disabled）
+- 或确认 NovaCarter 已被设置为 `kinematic_enabled=True`，不参与接触力计算
+
+### Priority 3 (HIGH)：提升 tracking_reward 信号强度
+
+**Problem:** tracking_reward_weight=1.0，与 dist_reward_weight=1.5 相比信号弱，且在 episode 极短时完全无法积累。
+
+**Proposed Change:**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`tracking_reward_weight: float = 1.0` → `4.0`
+- 参数：`dist_reward_weight: float = 1.5` → `0.8`
+- 参数：`height_reward_weight: float = 2.0` → `0.5`
+- 理由：降低高度锁定诱因，让 XY 追踪成为最优策略；此组合在 move_flyfollow 任务中已验证有效（tracking_reward 从0到>1.0）
+
+### Priority 4 (HIGH)：增大 num_envs 至 2048
+
+**Problem:** `num_envs=32` 导致有效样本量仅为标准配置的 1/64，策略无法在合理步数内收敛。
+
+**Proposed Change:**
+- 训练命令增加 `--num_envs=2048`：
+  ```
+  python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+  ```
+- 注意：NovaCarter USD 加载 × 2048 环境可能有内存压力，先验证 32→512 是否稳定，再升至 2048
+
+### Priority 5 (MEDIUM)：capture_distance 调优（NovaCarter 实际尺寸适配）
+
+**Problem:** NovaCarter 3x 缩放后实际车身 XY 尺寸约 3.3m × 2.1m，而 capture_distance=1.0m（XY 平面），可能过窄（无人机需要到达车辆中心点 1m 内）。
+
+**Proposed Change（视 Priority 1/3 效果决定是否执行）：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`capture_distance: float = 1.0` → `3.0`（若 3x 缩放保留）或 `1.5`（若改回 1x 缩放）
+- 理由：capture 阈值应适配目标物理尺寸，避免需要"进入车辆内部"才能触发捕获
+
+---
+
+## Experiment Plan
+
+### 步骤顺序（按修复顺序）
+
+1. **立即修复（Priority 1）：** 修改 `drone_spawn_z_range` 为 `(2.0, 3.0)` 并以 `num_envs=32` 快速验证
+   - 成功判据：episode_mean > 50 步，min > 1 步，无法在第 1 步终止
+2. **确认碰撞属性（Priority 2）：** 检查 NovaCarter prim collision 属性，确认接触传感器不响应
+3. **全规模训练：** 同时应用 Priority 3 + 4（奖励权重 + num_envs=2048）启动正式训练
+4. **监测指标（100k 步节点）：**
+   - `Episode / Total timesteps mean > 200` — 确认无即时终止
+   - `tracking_reward recent_mean > 0.001` — tracking 信号出现
+   - `policy_std > 0.3` — 策略仍在探索
+5. **成功判据（500k 步）：**
+   - episode_mean > 500 步
+   - tracking_reward/ep > 5.0
+   - total_reward_mean > 0
+
+---
+
+## Changelog
+
+- 2026-04-02：分析 2026-04-02_15-10-03（NovaCarter 首次集成）
+  - **根本原因：** NovaCarter 3x 缩放后车身顶部 z≈1.60m，与 drone spawn 下限 z=1.5m 碰撞，导致 episode 在起始帧即终止（mean=61步，min=1步）
+  - tracking_reward 完全为零（ratio 1:20,609），训练未产生任何有效策略
+  - num_envs=32 导致样本量仅为标准的 1/64（验证性运行可接受，正式训练须改为 2048）
+  - 下一步：提高 drone spawn 下限至 z=2.0m，禁用 NovaCarter 碰撞网格，调整奖励权重
