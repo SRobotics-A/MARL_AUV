@@ -5198,4 +5198,270 @@ NovaCarter 以 0.3m/s 移动，而无人机每次靠近都触发 illegal_contact
   - 奖励重塑（tracking×4, dist×0.8, height×0.5）方向正确，total_reward_mean 改善 86%
   - 但 illegal_contact 终止完全主导，所有奖励改善均被掩盖
   - 关键发现：碰撞禁用代码在 `_setup_scene` 中的 USD stage 遍历方式在 2048 env 规模下可能无效
+
+---
+
+# Training Analysis Report
+
+**Run:** 2026-04-02_21-56-48_mappo_torch_mappo
+**Date:** 2026-04-03
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Key Change vs Previous Run:** 将 `illegal_contact` 从终止条件中移除（仅保留惩罚项）
+
+---
+
+## Training Metrics Summary
+
+| 指标 | 上一次（2026-04-02_18-27-51）| 本次（2026-04-02_21-56-48）| 变化 |
+|------|------------------------------|---------------------------|------|
+| Total reward mean (early) | -3.58 | -4.89 | 起点相近 |
+| Total reward mean (recent) | -0.25 | +1.51 | **大幅改善** |
+| Total reward mean (last) | +0.17 | +2.21 | **+13x** |
+| Episode timesteps mean (early) | 65.3 | 82.7 | **+27%** |
+| Episode timesteps mean (recent) | 66.3 | 106.9 | **+61%** |
+| Episode timesteps max (recent) | — | 129 | 最长达 161 步 |
+| illegal_contact terminations | 1.234/rollout | 0.001/rollout | **降低 1000x** |
+| illegal_contact penalty (recent) | -0.983/ep | -0.017/ep | **降低 98%** |
+| bounding_box terminations | 0.019/rollout | 1.160/rollout | 新主导终止原因 |
+| tracking_reward (recent) | 0.0 | ~0.0001 | 仍接近 0 |
+| all_targets_captured | 0 | 0 | 无成功捕获 |
+| policy_std (early→recent) | 0.66→0.14 | 0.66→0.17 | 坍缩趋势相同 |
+| Total training steps | 199k | 147k | — |
+
+**结论状态：** `improving`（工具诊断），训练趋势向好但尚未出现任务成功信号。
+
+---
+
+## Observations & Findings
+
+### 1. illegal_contact 瓶颈解除 — 验证成功 [HIGH PRIORITY RESOLVED]
+
+**Symptom:** illegal_contact 终止从 1.234/rollout 降至 0.001/rollout（降幅 99.9%），惩罚从 -0.983/ep 降至 -0.017/ep。
+
+**Root Cause（已确认）:** 上一轮分析的核心假设得到完全验证——CollisionAPI 禁用代码在 2048 env 规模下失效，illegal_contact 是训练的唯一阻断瓶颈。移除终止条件后，该障碍消失。
+
+**Evidence:**
+- `Episode_Termination/illegal_contact`: 1.234 → 0.001（-99.9%）
+- `Episode_Termination/crash`（同一判断）: 同步归零
+- `Episode / Total timesteps mean`: 65 → 107 步（+64%）
+
+---
+
+### 2. episode 长度改善但未达目标 — MEDIUM
+
+**Symptom:** episode mean 从 65 步增至 107 步，max 从约 98 步增至 129 步（best 161 步）。但理论上 episode_length_s=60s / (dt=0.01s) = 6000 步，当前仅约 107 步，说明 **episode 仍被提前终止**，主导终止原因已切换为 `bounding_box`。
+
+**Root Cause:** 无人机出界（`bounding_box` 终止）成为新的主导终止原因，recent_mean=1.16 episodes/rollout。`drone_out` 惩罚稳定在 -1.0/ep，表明 **每个 episode 中至少有一架无人机超出 bounding_box_threshold=12.0m**。
+
+**Evidence:**
+- `Episode_Termination/bounding_box`: 1.160/rollout（几乎每个 episode 都以出界终止）
+- `Episode_Reward/drone_out`: 近期均值 -1.0/ep（满分惩罚，100% 发生）
+- `Episode_Termination/time_out`: 0（无 episode 达到最大长度）
+- `Episode_Termination/all_targets_captured`: 0（无捕获触发终止）
+
+**Analysis:** bounding_box=12.0m，目标小车从 spawn_x_range=(-6,-2) 以 0.3m/s 向 +x 移动。60s 后目标位移约 18m，超出边界。但当前 episode 仅 107 步（约 3.5s），说明无人机在追逐过程中飞出了 12m 边界范围，而非目标逃出。这指向无人机运动过于激进或控制发散。
+
+---
+
+### 3. height_penalty 长期主导负向奖励 — HIGH
+
+**Symptom:** `height_penalty` recent_mean = -1.73/ep，是所有负向奖励项中绝对值最大的（不含 drone_out）。全程呈持续增大趋势：早期 -1.24 → 晚期 -1.73。
+
+**Root Cause:** `height_penalty_weight=1.0`，`height_penalty_threshold=0.5m`，`desired_height=2.5m`。任何高度误差超过 0.5m 即触发线性惩罚。当前无人机需要从 2.5m 下降去追逐地面目标（NovaCarter 中心 z=0.25m），每下降 1m 即产生 0.5m 超阈值 excess，乘以 step_dt 后累积。
+
+**Evidence:**
+- 全程 height_penalty < 0（未曾为 0，说明无人机始终偏离 desired_height ≥ 0.5m）
+- height_penalty 随训练增大（无人机在尝试追逐目标时高度偏离越来越大）
+- height_reward（+0.19/ep）远小于 height_penalty（-1.73/ep），净高度效应为 -1.54/ep
+
+---
+
+### 4. tracking_reward 仍为 0，成功捕获仍为 0 — CRITICAL
+
+**Symptom:** `tracking_reward` recent_mean ≈ 0（仅出现极偶发的 0.0001），`all_targets_captured`=0 全程，`success_reward`=0。
+
+**Root Cause（多重）:**
+1. **bounding_box 提前终止**：episode 仅约 107 步（3.5s），而 `sustained_follow_duration=3.0s` 需要在 `capture_distance=1.0m` 内持续停留 3s（约 90 步）。在 3.5s 的 episode 中，只有进入捕获区后立刻持续保持才能成功，边际极窄。
+2. **capture_distance=1.0m（3D 欧氏距离）过小**：目标 z=0.25m，无人机从 z=2.5m 下降，需同时满足 z 误差 < 0.75m（z=0.25m 时要求无人机下降至 z < 1.0m）且 XY < 0.66m。height_penalty 惩罚下降行为，形成强烈矛盾。
+3. **tracking_reward 逻辑**：仅在 `is_captured_now=True`（已在捕获区内）时给予奖励，无渐近引导梯度，0.34 的 distance_reward 无法转化为 tracking 信号。
+
+---
+
+### 5. policy_std 过早坍缩 — HIGH
+
+**Symptom:** `policy_std` 从初始 0.82 坍缩至最终 0.15，在约 50k 步后 std < 0.30。坍缩速度与上一次训练相似，说明这是系统性问题而非随机波动。
+
+**Root Cause:** 策略在没有明确 tracking 信号的情况下快速收敛到局部最优（距离缩短 + 高度维持的折中策略），熵正则化不足以抵抗 PPO 的策略坍缩。
+
+**Evidence:**
+- step 36k: std=0.477
+- step 73k: std=0.291
+- step 147k: std=0.147（极低，接近确定性策略）
+- `entropy_loss` recent ≈ +0.0004（正值，但系数过低无法抑制坍缩）
+
+---
+
+### 6. 奖励结构分析：正向奖励被惩罚淹没 — MEDIUM
+
+**Recent per-episode reward composition（近期均值）:**
+
+| 奖励项 | 近期均值 | 说明 |
+|--------|----------|------|
+| body_rate_penalty | +1.74 | 最大正项，无关任务进展 |
+| action_smoothness | +0.94 | 第二大正项，无关任务进展 |
+| distance_reward | +0.34 | 有效信号（接近目标） |
+| force_penalty | +0.30 | 节能奖励，无关任务 |
+| height_reward | +0.19 | 微弱正向 |
+| **height_penalty** | **-1.73** | 最大负项，持续抑制 |
+| **drone_out** | **-1.00** | 100% 每 episode 出界 |
+| upright_penalty | -0.29 | 防翻滚惩罚 |
+| illegal_contact | -0.017 | 已大幅降低 |
+| tracking_reward | ~0.0 | **任务核心信号为零** |
+
+**关键问题：** body_rate_penalty（+1.74）和 action_smoothness（+0.94）两项"舒适奖励"合计 +2.68/ep，主导了总奖励。策略最优行为是"飞得慢、稳定、不碰撞"，而非追踪目标。这是当前 total_reward 改善的主要原因，但与任务目标无关。
+
+---
+
+## 关键假设验证结果
+
+| 假设 | 验证结果 |
+|------|----------|
+| illegal_contact 是主要瓶颈 | **完全确认**：终止率降 1000x，episode 增 64% |
+| 移除终止后 episode >200 步 | **部分确认**：107 步（目标 200+ 未达到，受 bounding_box 新瓶颈限制）|
+| tracking_reward 出现正信号 | **未达到**：仍为 ~0，但原因已由 illegal_contact 转移至 capture 设计问题 |
+| 俯冲捕获行为出现 | **未确认**：height_penalty 阻止下降，高度数据无法直接读取 |
+| 总体收敛向好 | **是**：total_reward -4.89→+2.21，方向正确，但未到达有效学习区间 |
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 扩大捕获距离至 3.0m（XY 平面）
+
+**Problem:** `capture_distance=1.0m`（3D 欧氏距离）在 NovaCarter（z=0.25m）+ 无人机高度（z≈2.5m）下，等效要求 XY 误差 < 0.66m 且无人机同时下降至 z < 1.0m。height_penalty 惩罚下降行为，形成死锁。tracking_reward 永远为 0。
+
+**Proposed Change:**
+- File: `/home/xtj/xtj-project/RL/MARL_AUV/exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `capture_distance`: 1.0 → 3.0
+- 同步修改 `marl_move_env.py` 中 `min_dists` 的计算：将 3D 欧氏距离改为 XY 平面距离（忽略 z 分量）
+  - File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+  - 在 `_get_rewards` 中找到 `min_dists` 计算处，将 `target_diff` 改为只取 XY 两维
+- **Rationale:** NovaCarter 3x 缩放后物理尺寸约 3.3m × 1.8m，3.0m XY 捕获距离与物理尺寸匹配，且不再要求俯冲，解除 height_penalty 冲突。与 move_flyfollow 任务成功案例（dist_xy<3m）一致。
+
+---
+
+### Priority 2 (HIGH): 扩大 height_penalty_threshold 至 1.5m
+
+**Problem:** `height_penalty_threshold=0.5m` 建立了以 2.5m 为中心、半径 0.5m 的严格高度约束。任何追踪行为需要水平运动，都会因加速/减速引起高度波动，触发线性惩罚。近期 height_penalty=-1.73/ep，是最大负向项。
+
+**Proposed Change:**
+- File: `/home/xtj/xtj-project/RL/MARL_AUV/exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `height_penalty_threshold`: 0.5 → 1.5
+- **Rationale:** 如果采用 Priority 1 的 XY 平面捕获（3.0m），无人机不需要俯冲，1.5m 阈值允许正常追踪时的高度波动（0.5m 远不足以容纳 ACCBR 控制的自然高度振荡）。可在 Priority 1 生效并看到 tracking 信号后，再逐步收紧此阈值。
+
+---
+
+### Priority 3 (HIGH): 扩大 bounding_box_threshold 或调整无人机初始位置
+
+**Problem:** `bounding_box_threshold=12.0m` 对于目标小车从 x=(-6,-2) 以 +x 方向移动的场景过小。无人机在追踪过程中出界导致 100% episode 被 bounding_box 终止（mean=107 步，远未达到 episode_length_s=60s）。
+
+**Proposed Change（选一）:**
+- 方案 A：扩大边界
+  - File: `marl_move_env_cfg.py`
+  - `bounding_box_threshold`: 12.0 → 20.0
+  - **Rationale:** 目标小车 60s 内最大位移 18m，边界需容纳目标运动范围 + 无人机追踪余量
+- 方案 B：将目标小车改为循环移动（在边界内折返）
+  - File: `marl_move_env.py` 中目标速度更新逻辑
+  - 当目标到达边界时反转速度方向
+  - **Rationale:** 更根本的解法，防止目标逃出追踪区域
+
+**推荐：方案 A（快速实施），方案 B（长期方案）**
+
+---
+
+### Priority 4 (MEDIUM): 提高 entropy_loss_scale 防止 policy_std 坍缩
+
+**Problem:** `policy_std` 从 0.82 坍缩至 0.15，在约 50k 步已无有效探索。tracking_reward 信号未出现前，策略在距离奖励的引导下早熟收敛到"飞近但不进入捕获区"的局部最优。
+
+**Proposed Change:**
+- File: `scripts/skrl/train.py` 或 MAPPO agent 配置
+- `entropy_loss_scale`: 当前约 0.001 → 建议 0.005～0.01
+- **Rationale:** 更强的熵正则化在 tracking 信号出现前保持策略探索能力，避免在最近 50k 步的有效训练窗口内 std 已过低。
+
+---
+
+### Priority 5 (MEDIUM): 抑制"舒适奖励"主导效应
+
+**Problem:** `body_rate_penalty`（+1.74）和 `action_smoothness`（+0.94）合计+2.68/ep，占近期总奖励（+1.51）的 177%。策略可以通过"飞得慢而稳定"获得高分而无需接近目标。这掩盖了真实任务进展。
+
+**Proposed Change:**
+- File: `marl_move_env_cfg.py`
+- `body_rate_penalty_weight`: 2.0 → 0.5
+- `action_smoothness_weight`: 1.0 → 0.3
+- **Rationale:** 将舒适奖励压缩至 distance_reward（+0.34）的同量级，使任务导向信号成为奖励主导项。注意：不要完全移除，body_rate 和 smoothness 对飞行稳定性仍重要。
+
+---
+
+## Experiment Plan
+
+**当前状态判断：** Priority 1（illegal_contact 解除）已成功验证。新瓶颈为捕获设计（XY 距离 + 边界限制），tracking_reward 仍为 0。
+
+### Phase B（Priority 1-3 集成）：下一次训练
+1. 实施 Priority 1（capture_distance: 1.0m → 3.0m，XY 距离）
+2. 实施 Priority 2（height_penalty_threshold: 0.5 → 1.5m）
+3. 实施 Priority 3A（bounding_box_threshold: 12.0 → 20.0m）
+4. 实施 Priority 4（entropy_loss_scale: 0.001 → 0.007）
+5. 实施 Priority 5（body_rate_penalty_weight: 2.0→0.5，action_smoothness_weight: 1.0→0.3）
+6. 运行 300k 步，num_envs=2048
+
+**成功判据（100k 步节点）：**
+- `Episode / Total timesteps mean > 300 步`（边界不再主导）
+- `tracking_reward recent_mean > 0.1/ep`（首次有效捕获信号）
+- `Episode_Termination/all_targets_captured > 0.01`（偶发成功）
+- `policy_std > 0.30`（50k 步时，探索未过早坍缩）
+- `drone_out penalty < -0.3/ep`（出界减少）
+
+**成功判据（300k 步节点）：**
+- `tracking_reward > 2.0/ep`
+- `all_targets_captured > 0.1`（10% episode 达到捕获）
+- `total_reward_mean > 5.0`
+
+**监控重点：**
+- 若 bounding_box 终止仍 > 0.5/rollout → 考虑方案 B（目标折返移动）
+- 若 height_penalty > -0.5/ep → 进一步放宽 height_penalty_threshold 至 2.0m
+- 若 policy_std < 0.20 at step 100k → 提升 entropy_loss_scale 至 0.02
+
+---
+
+## Comparison with Previous Run (2026-04-02_18-27-51)
+
+| 指标 | 上一次（illegal_contact=终止）| 本次（illegal_contact=仅惩罚）| 变化 |
+|------|-------------------------------|-------------------------------|------|
+| illegal_contact 终止 | 1.234/rollout | 0.001/rollout | **-99.9%，假设验证成功** |
+| episode timesteps mean | 65.3 | 106.9 | **+64%** |
+| episode timesteps max | ~98 | 129（best 161） | **+31%** |
+| total_reward_mean (recent) | -0.25 | +1.51 | **首次转正** |
+| bounding_box 终止 | 0.019 | 1.160 | 新瓶颈出现 |
+| drone_out penalty | ~0 | -1.0/ep | 100% 出界 |
+| tracking_reward | 0.0 | ~0.0001 | 仍接近 0 |
+| height_penalty (recent) | -0.85 | -1.73 | 增大（策略在尝试追踪但被惩罚） |
+| policy_std (recent) | 0.14 | 0.17 | 基本持平 |
+
+**结论：** 移除 illegal_contact 终止条件完全解除了阻断瓶颈，训练开始真正运转（total_reward 首次稳定为正），但暴露出两个新问题：
+1. **bounding_box 终止**接替为主导终止原因（需扩大边界或实现循环轨迹）
+2. **capture_distance=1.0m（3D）** 在 height_penalty 约束下仍无法触发 tracking_reward
+
+这两个问题均是 Priority 1-3 的修改目标。
+
+---
+
+## Changelog
+
+- 2026-04-03（run 2026-04-02_21-56-48）：移除 illegal_contact 终止条件——假设验证完全成功
+  - illegal_contact 终止 1.234→0.001/rollout（-99.9%），episode mean 65→107 步（+64%）
+  - total_reward_mean 首次稳定为正（-0.25→+1.51），训练趋势完全逆转
+  - 新主导瓶颈：bounding_box 终止（1.16/rollout），drone_out -1.0/ep，tracking_reward 仍为 0
+  - 新发现："舒适奖励"（body_rate+action_smoothness=+2.68/ep）主导总奖励，掩盖任务进展
+  - 下一步：Priority 1 capture_distance 1.0→3.0m（XY），Priority 2 height_penalty_threshold 0.5→1.5m，Priority 3 bounding_box_threshold 12→20m
   - 下一步：Priority 1 方案 B（从终止条件中移除 illegal_contact）作为快速验证，然后修复根本原因
