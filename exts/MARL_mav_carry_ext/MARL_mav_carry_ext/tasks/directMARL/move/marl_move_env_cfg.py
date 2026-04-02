@@ -62,7 +62,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     target_values = [4.0, 3.0, 2.0, 1.0]  # 对应的价值
     target_velocity = 0.3  # 物块移动速度 (m/s)
     target_size = (0.5, 0.5, 0.5)  # 物块尺寸 (m)
-    capture_distance = 1.0  # 捕获距离阈值 (m)
+    capture_distance = 3.0  # 捕获距离阈值 (m，XY平面)，扩大适配NovaCarter 3x实际尺寸
     sustained_follow_duration = 3.0  # 持续跟随秒数
     # 物块初始位置（地面一侧，y方向分开）
     # Spread: Targets wider apart
@@ -104,10 +104,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
-    action_smoothness_weight = 1.0
+    action_smoothness_weight = 0.3  # 降低：避免"舒适奖励"主导策略
 
     # Body Rate Penalty: w * exp(-||body_rates||) * step_dt — 新增
-    body_rate_penalty_weight = 2.0
+    body_rate_penalty_weight = 0.5  # 降低：避免"舒适奖励"主导策略
 
     # Time Penalty: fixed penalty per step to encourage speed
     time_penalty = 0.0
@@ -127,7 +127,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
-    height_penalty_threshold = 0.5  # Meters
+    height_penalty_threshold = 1.5  # Meters，扩大允许范围以支持俯冲捕获策略
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
@@ -197,7 +197,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 终止条件阈值
     drone_collision_threshold = 0.6
-    bounding_box_threshold = 12.0  # 缩小边界以避免多环境干扰 (spacing=20.0)
+    bounding_box_threshold = 20.0  # 扩大：小车0.3m/s×60s=18m，原12m太小
 
     # contact sensor
     contact_sensor_threshold = 1.0  # 增加接触阈值，避免过度敏感
