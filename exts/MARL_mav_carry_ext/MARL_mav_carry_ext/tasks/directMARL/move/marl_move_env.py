@@ -373,6 +373,24 @@ class MARLMoveEnv(DirectMARLEnv):
             except Exception as exc:
                 print(f"[move] Failed to read USD target pose for {prim_path}: {exc}")
 
+        # ── 禁用 NovaCarter 碰撞几何体 ─────────────────────────────────────────
+        # XFormPrim 运动学驱动不参与物理，但 USD 内嵌 CollisionAPI 仍会触发 ContactSensor
+        # 遍历所有 env 下的 nova_carter prim 树，将所有 CollisionAPI 禁用
+        import omni.usd
+        _stage = omni.usd.get_context().get_stage()
+        for env_id in range(self.num_envs):
+            env_base = f"/World/envs/env_{env_id}"
+            env_r = f"{env_base}/World" if prim_utils.is_prim_path_valid(f"{env_base}/World") else env_base
+            for name in target_prim_names[: self.cfg.num_targets]:
+                root_prim = _stage.GetPrimAtPath(f"{env_r}/{name}")
+                if not root_prim.IsValid():
+                    continue
+                for desc in [root_prim] + list(root_prim.GetAllDescendants()):
+                    col_api = UsdPhysics.CollisionAPI(desc)
+                    if col_api:
+                        col_api.GetCollisionEnabledAttr().Set(False)
+        print(f"[move] Disabled collision geometry on NovaCarter prims across {self.num_envs} envs.")
+
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         for agent in self.cfg.possible_agents:
             self.prev_actions[agent][:] = self.actions[agent]
