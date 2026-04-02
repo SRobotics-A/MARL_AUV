@@ -224,18 +224,6 @@ class MARLMoveEnv(DirectMARLEnv):
         self._norm_vel_scale = 5.0
         self._norm_dist_scale = self.cfg.bounding_box_threshold * 2
 
-        # ===== NovaCarter XFormPrimView（仿真已启动，此处可安全初始化） =====
-        from omni.isaac.core.prims import XFormPrimView
-
-        self.target_views = []
-        for i in range(self.num_targets):
-            view = XFormPrimView(
-                prim_paths_expr=f"/World/envs/env_.*/target_{i}",
-                name=f"nova_carter_target_{i}",
-            )
-            view.initialize()
-            self.target_views.append(view)
-
         # debug vis
         self.set_debug_vis(cfg.debug_vis)
 
@@ -260,20 +248,20 @@ class MARLMoveEnv(DirectMARLEnv):
             self.contact_sensors.append(contact)
             self.scene.sensors[f"contact_forces_{i}"] = contact
 
-        # ===== 创建4个移动小车目标（NovaCarter，纯视觉XForm，不注册物理对象） =====
-        y_positions = self.cfg.target_spawn_y_positions
-        for i in range(self.cfg.num_targets):
-            spawn_cfg = sim_utils.UsdFileCfg(
-                usd_path=self.cfg.nova_carter_usd_path,
-                scale=self.cfg.nova_carter_scale,
-            )
-            spawn_cfg.func(
-                prim_path=f"/World/envs/env_0/target_{i}",
-                cfg=spawn_cfg,
-                translation=(0.0, y_positions[i], self.cfg.target_spawn_z),
-                orientation=(1.0, 0.0, 0.0, 0.0),
-            )
-        self.targets = []  # XFormPrimViews 将在 __init__ 仿真启动后赋值到 self.target_views
+        # ===== 创建NovaCarter小车目标（VisualizationMarkers，Isaac Lab原生API） =====
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        carter_marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/nova_carter_targets",
+            markers={
+                "carter": sim_utils.UsdFileCfg(
+                    usd_path=self.cfg.nova_carter_usd_path,
+                    scale=self.cfg.nova_carter_scale,
+                ),
+            },
+        )
+        self.target_markers = VisualizationMarkers(carter_marker_cfg)
+        self.targets = []  # 不再使用，保留空列表以兼容其他引用
 
         # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -434,9 +422,16 @@ class MARLMoveEnv(DirectMARLEnv):
 
         self.target_positions += self.target_velocities * dt
 
-        for i, view in enumerate(self.target_views):
-            world_pos = self.target_positions[:, i] + self.scene.env_origins  # (N, 3)
-            view.set_world_poses(positions=world_pos, orientations=self._target_quat)
+        # 更新NovaCarter可视化位置（VisualizationMarkers批量更新）
+        world_pos = self.target_positions + self.scene.env_origins.unsqueeze(1)  # (N, T, 3)
+        all_translations = world_pos.reshape(-1, 3)  # (N*T, 3)
+        all_orientations = self._target_quat.unsqueeze(1).expand(-1, self.num_targets, -1).reshape(-1, 4)
+        marker_indices = torch.zeros(self.num_envs * self.num_targets, dtype=torch.long, device=self.device)
+        self.target_markers.visualize(
+            translations=all_translations,
+            orientations=all_orientations,
+            marker_indices=marker_indices,
+        )
 
     def _normalize_observation(self, obs: torch.Tensor) -> torch.Tensor:
         """No manual normalization — relying on skrl's RunningStandardScaler."""
