@@ -224,6 +224,18 @@ class MARLMoveEnv(DirectMARLEnv):
         self._norm_vel_scale = 5.0
         self._norm_dist_scale = self.cfg.bounding_box_threshold * 2
 
+        # ===== NovaCarter XFormPrimView（仿真已启动，此处可安全初始化） =====
+        from omni.isaac.core.prims import XFormPrimView
+
+        self.target_views = []
+        for i in range(self.num_targets):
+            view = XFormPrimView(
+                prim_paths_expr=f"/World/envs/env_.*/target_{i}",
+                name=f"nova_carter_target_{i}",
+            )
+            view.initialize()
+            self.target_views.append(view)
+
         # debug vis
         self.set_debug_vis(cfg.debug_vis)
 
@@ -248,33 +260,20 @@ class MARLMoveEnv(DirectMARLEnv):
             self.contact_sensors.append(contact)
             self.scene.sensors[f"contact_forces_{i}"] = contact
 
-        # ===== 创建4个移动小车目标（NovaCarter，禁用Articulation作为运动学刚体加载） =====
-        from isaaclab.assets import RigidObjectCfg
-
+        # ===== 创建4个移动小车目标（NovaCarter，纯视觉XForm，不注册物理对象） =====
         y_positions = self.cfg.target_spawn_y_positions
-        self.targets = []
         for i in range(self.cfg.num_targets):
-            target_cfg = RigidObjectCfg(
-                prim_path=f"/World/envs/env_.*/target_{i}",
-                spawn=sim_utils.UsdFileCfg(
-                    usd_path=self.cfg.nova_carter_usd_path,
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        kinematic_enabled=True,
-                        disable_gravity=True,
-                    ),
-                    articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                        articulation_enabled=False,
-                    ),
-                    scale=self.cfg.nova_carter_scale,
-                ),
-                init_state=RigidObjectCfg.InitialStateCfg(
-                    pos=(0.0, y_positions[i], self.cfg.target_spawn_z),
-                    rot=(1.0, 0.0, 0.0, 0.0),
-                ),
+            spawn_cfg = sim_utils.UsdFileCfg(
+                usd_path=self.cfg.nova_carter_usd_path,
+                scale=self.cfg.nova_carter_scale,
             )
-            target = RigidObject(target_cfg)
-            self.scene.rigid_objects[f"target_{i}"] = target
-            self.targets.append(target)
+            spawn_cfg.func(
+                prim_path=f"/World/envs/env_0/target_{i}",
+                cfg=spawn_cfg,
+                translation=(0.0, y_positions[i], self.cfg.target_spawn_z),
+                orientation=(1.0, 0.0, 0.0, 0.0),
+            )
+        self.targets = []  # XFormPrimViews 将在 __init__ 仿真启动后赋值到 self.target_views
 
         # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -435,15 +434,9 @@ class MARLMoveEnv(DirectMARLEnv):
 
         self.target_positions += self.target_velocities * dt
 
-        for i, target in enumerate(self.targets):
-            target_poses = torch.cat(
-                [
-                    self.target_positions[:, i] + self.scene.env_origins,
-                    self._target_quat,
-                ],
-                dim=-1,
-            )
-            target.write_root_pose_to_sim(target_poses)
+        for i, view in enumerate(self.target_views):
+            world_pos = self.target_positions[:, i] + self.scene.env_origins  # (N, 3)
+            view.set_world_poses(positions=world_pos, orientations=self._target_quat)
 
     def _normalize_observation(self, obs: torch.Tensor) -> torch.Tensor:
         """No manual normalization — relying on skrl's RunningStandardScaler."""
