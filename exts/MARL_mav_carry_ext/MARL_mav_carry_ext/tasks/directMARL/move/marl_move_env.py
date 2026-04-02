@@ -377,6 +377,7 @@ class MARLMoveEnv(DirectMARLEnv):
         # XFormPrim 运动学驱动不参与物理，但 USD 内嵌 CollisionAPI 仍会触发 ContactSensor
         # 遍历所有 env 下的 nova_carter prim 树，将所有 CollisionAPI 禁用
         import omni.usd
+        from pxr import Usd
         _stage = omni.usd.get_context().get_stage()
         for env_id in range(self.num_envs):
             env_base = f"/World/envs/env_{env_id}"
@@ -385,7 +386,7 @@ class MARLMoveEnv(DirectMARLEnv):
                 root_prim = _stage.GetPrimAtPath(f"{env_r}/{name}")
                 if not root_prim.IsValid():
                     continue
-                for desc in [root_prim] + list(root_prim.GetAllDescendants()):
+                for desc in Usd.PrimRange(root_prim):
                     col_api = UsdPhysics.CollisionAPI(desc)
                     if col_api:
                         col_api.GetCollisionEnabledAttr().Set(False)
