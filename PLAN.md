@@ -4988,3 +4988,214 @@ NovaCarter 以 0.3m/s 移动，而无人机每次靠近都触发 illegal_contact
   - tracking_reward 全程为零，height_penalty 持续增大（-0.31 → -0.62），俯冲捕获路线与高度约束直接冲突
   - 核心矛盾：任务要求接近 NovaCarter（capture），但接近行为会触发 illegal_contact 终止
   - 下一步：**禁用 NovaCarter 碰撞几何体**（Priority 1 方案 A 或 C）是解锁训练的前提，其他所有改进在此之前无效
+
+---
+
+# Training Analysis Report
+
+**Run:** 2026-04-02_18-27-51_mappo_torch_mappo
+**Date:** 2026-04-02
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Total steps logged:** ~199,100
+**num_envs:** 2048（推断，production run）
+
+---
+
+## Training Metrics Summary
+
+| 指标 | 早期均值 | 近期均值 | 最终值 |
+|------|---------|---------|--------|
+| total_reward_mean | -3.584 | -0.496 | -0.135 |
+| total_reward_max | -1.504 | 0.691 | 1.084 |
+| tracking_reward | ~0.000002 | ~0.000005 | 0.0 |
+| success_reward | 0.0 | 0.0 | 0.0 |
+| illegal_contact（终止次数/rollout） | 1.150 | 1.234 | 1.190 |
+| episode timesteps mean | 65.3 | 65.7 | 64.0 |
+| episode timesteps min | 3.6 | 2.2 | 3.0 |
+| policy_std | 0.749 | 0.351 | 0.302 |
+| height_penalty | -1.064 | -0.842 | -0.797 |
+
+**本次修复内容：**
+1. `drone_spawn_z_range` (1.5, 2.5) → (2.0, 3.0)（避开 NovaCarter 3x 车顶 ≈1.6m）
+2. 禁用 NovaCarter 碰撞几何体（`Usd.PrimRange` + `CollisionAPI.Set(False)`）
+3. `tracking_reward_weight` 1.0 → 4.0，`dist_reward_weight` 1.5 → 0.8，`height_reward_weight` 2.0 → 0.5
+
+---
+
+## Observations & Findings
+
+### 1. illegal_contact 未消除 — CRITICAL
+
+**Symptom:** `Episode_Termination/illegal_contact` 全程稳定在 1.15～1.23/rollout。早期 1.150、近期 1.234、最终 1.190。与上一次训练（2026-04-02_17-08-54，早期 0.736 → 近期 1.254）相比，**不仅未改善，而且起点更高，整个训练期间都保持高位**。
+
+**Root Cause（诊断）：** 碰撞几何体禁用代码（`_setup_scene` 中的 `Usd.PrimRange` + `CollisionAPI.GetCollisionEnabledAttr().Set(False)`）**在运行时未生效或仅部分生效**。
+
+可能原因：
+- `omni.usd.get_context().get_stage()` 在 `_setup_scene` 时调用，但 NovaCarter USD prim 尚未完全加载进 stage（异步加载问题）
+- `prim_utils.is_prim_path_valid(f"{env_base}/World")` 路径判断导致 `env_r` 指向错误路径，部分环境未找到 nova_carter prim
+- `col_api` 的 `if col_api:` 判断：空 API 对象在 Python 中可能是 truthy，导致实际上只有顶层 prim 被禁用，子网格（collision mesh）保持激活
+- Isaac Lab 在 `_setup_scene` 后会重新初始化物理引擎，覆盖手动设置的 CollisionAPI 状态
+
+**Evidence:**
+- `illegal_contact` 终止次数全程 1.15+，从未降至接近 0
+- 上一次训练中观察到 illegal_contact 随训练步数单调增加（策略学会靠近 → 接触频率增加），本次训练同样呈上升趋势（1.150 → 1.234）
+- `episode timesteps min` 持续在 2-4 步，表明仍有大量环境在第一个控制周期内即触发终止
+
+**结论：** 碰撞禁用失败。`illegal_contact` 仍是主要终止来源（占比 >99%，`time_out=0.0`，其他终止均接近 0）。
+
+---
+
+### 2. tracking_reward 仍为零 — CRITICAL
+
+**Symptom:** `tracking_reward` 全程为 0.0，best 仅出现过一次 0.021（相当于偶发噪声）。`success_reward` 全程 0.0。
+
+**Root Cause:** 直接后果来自 Finding 1。illegal_contact 终止在 65 步内清场所有环境，策略无法存活足够长时间接近目标。even 若 NovaCarter 碰撞禁用生效，`capture_distance=1.0m`（代码 line 65）仍是 3D 欧式距离阈值，无人机需从 z≈2.5m 下降至 z≈1.25m 才能使 3D 距离 < 1.0m（目标 z=0.25m）。这要求同时满足：(1) XY 误差 < 约 0.75m，(2) 高度下降 > 1.5m——是高难度两步策略，在 65 步（约 2 秒）内无法完成。
+
+**Evidence:**
+- `height_penalty`（early=-1.064，recent=-0.842）：无人机在尝试下降，高度惩罚持续存在，但仍未能触发 tracking
+- `height_reward` 稳定在 0.14（接近常数），表明 desired_height=2.5m 附近有稳定吸引子，下降行为受到抑制
+
+---
+
+### 3. episode 长度无改善 — HIGH
+
+**Symptom:** `timesteps_mean` 全程 65-68 步（约 2 秒），与上一次训练（86.6 步）相比反而略有下降。`timesteps_max` 从早期 115 下降至近期 108，整体趋势下降。
+
+**Root Cause:** episode 长度由 illegal_contact 终止驱动。碰撞禁用失败 + 策略在奖励信号引导下逐渐学会靠近目标 → 每次靠近都触发终止 → episode 越来越短，与上一次训练模式完全一致。
+
+**Evidence:**
+- `bounding_box` 终止从 0.107 降至 0.019（改善，无人机不再冲出边界）
+- `drone_out` 惩罚从 -0.090 降至 -0.016（改善）
+- 但 `illegal_contact` 终止完全掩盖了这些改善
+
+---
+
+### 4. 奖励总体趋势：有微弱正向信号 — MEDIUM
+
+**Symptom:** `total_reward_mean` 从 -3.584 改善至 -0.496（改善 86%），`total_reward_max` 从 -1.504 改善至 +0.691（最终 1.084）。
+
+**Root Cause（正向）：** `height_reward_weight` 从 2.0 降至 0.5 减小了高度锁定惩罚强度；`bounding_box` 和 `drone_out` 减少说明策略在学习保持在有效区域内；`body_rate_penalty` 从 0.634 上升至 0.957（接近最大值 1.131），说明姿态控制在改善。
+
+**注意：** total_reward 改善主要来自惩罚减少（height_reward 权重降低、边界违反减少），不是正向奖励信号增加。这是一种被动改善，不代表策略在学习追踪行为。
+
+---
+
+### 5. policy_std 快速坍缩 — HIGH
+
+**Symptom:** `policy_std` 从 0.749 坍缩至 0.302（坍缩 60%），且呈单调下降趋势，尚未稳定。按当前速率，再训练 100k 步后 std 将低于 0.2。
+
+**Root Cause:** 策略在 illegal_contact 主导的短 episode 中无法获得有效奖励，PPO 倾向于压缩探索以最小化方差惩罚。`entropy_loss` 从 -0.00113 上升至 -0.00034（绝对值减小），表明熵正则化也在失效。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 确认并修复 NovaCarter 碰撞禁用失败
+
+**Problem:** 碰撞禁用代码在 `_setup_scene` 中存在，但训练数据表明 NovaCarter 碰撞几何体在运行时仍然激活。
+
+**Proposed Changes:**
+
+**方案 A（推荐）：改用 Isaac Lab API 在资产加载阶段禁用碰撞**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在 `_setup_scene` 中，NovaCarter 的 `ArticulationCfg` 或 `RigidObjectCfg` 上设置 `collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False)`，而非事后遍历 USD stage 修改 prim 属性
+
+**方案 B（最快验证）：从终止条件中临时移除 illegal_contact**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- Line 901-907：从 `terminations` OR 中移除 `self.illegal_contact`
+- 仅保留作为惩罚项（-1.0/接触）而不终止 episode
+- **Rationale:** 最快验证假设——如果移除终止后 episode 长度显著增加（>200 步），则 100% 确认 illegal_contact 是瓶颈；同时训练可以继续推进
+
+**方案 C（保险策略）：提升 contact_sensor_threshold**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `contact_sensor_threshold`: 1.0 → 50.0（N）
+- **Rationale:** NovaCarter 即使碰撞几何体未完全禁用，50N 阈值可过滤非物理接触；真实碰撞（无人机撞地面、建筑）仍会被捕获
+
+**推荐执行顺序：** 先方案 B（快速验证，1 次训练），确认是 illegal_contact 瓶颈后再实施方案 A 做根本修复。
+
+---
+
+### Priority 2 (HIGH): capture_distance 从 1.0m 扩大到 3.0m（XY 平面）
+
+**Problem:** 当前 `capture_distance=1.0m`（3D 欧式距离），无人机需从 z=2.5m 下降至 z≈1.25m，同时 XY 误差 < 0.75m，是二维同步精确控制要求。NovaCarter 物理尺寸（3x 缩放）约 3.3m × 1.8m，1.0m 捕获距离远小于目标物理尺寸。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `capture_distance`: 1.0 → 3.0
+- 同时将 `min_dists` 的计算改为 XY 平面距离（已在 `_get_rewards` 中使用 `target_min_dist` 变量，需确认计算方式）
+- **Rationale:** 3.0m XY 捕获距离与 NovaCarter 物理尺寸匹配，不再要求无人机精确俯冲到 z=1.25m，大幅降低策略难度。与 move_flyfollow 任务成功案例对齐（dist_xy < 3m）。
+
+---
+
+### Priority 3 (MEDIUM): height_penalty_threshold 从 0.5m 扩大到 1.5m
+
+**Problem:** `height_penalty_threshold=0.5m` 在 `desired_height=2.5m` 附近建立强约束带，使无人机无法自由调整高度。即使 illegal_contact 修复后，无人机从 2.5m 下降去追踪目标也会立即触发高度惩罚。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `height_penalty_threshold`: 0.5 → 1.5
+- **Rationale:** 如果采用 Priority 2 的 3.0m XY 捕获，无人机不需要俯冲，此项可维持 0.5m。但如果保留 1.0m 捕获距离，则必须扩大此阈值。两项修改应配套实施。
+
+---
+
+### Priority 4 (MEDIUM): 添加 entropy 正则化系数防止 policy_std 过早坍缩
+
+**Problem:** `policy_std` 在 200k 步内从 0.75 坍缩至 0.30，探索能力丧失过早。在 illegal_contact 修复后重新训练时，可能在 tracking_reward 出现之前 std 就已过低。
+
+**Proposed Change:**
+- File: 训练脚本配置（`scripts/skrl/train.py` 或 MAPPO agent 配置）
+- 提高 `entropy_loss_scale`（当前约 0.001），建议设为 0.005～0.01
+- **Rationale:** 更强的熵正则化使策略在没有明确奖励信号时保持探索，避免在局部最优（悬停）定型。
+
+---
+
+## Experiment Plan
+
+**核心前提：** Priority 1 必须先于其他所有修改验证。
+
+### Phase A（Priority 1 验证）：100k 步快速验证
+1. 实施 Priority 1 方案 B（从终止条件中移除 illegal_contact）
+2. 运行 100k 步，num_envs=2048
+3. 验证指标（50k 步节点）：
+   - `Episode_Termination/illegal_contact < 0.1`（应接近 0）
+   - `Episode / Total timesteps mean > 200 步`（关键改善）
+   - `tracking_reward recent_mean > 0.001`（首次信号出现）
+4. 如果 Phase A 成功 → 继续 Phase B
+
+### Phase B（Priority 2+3 集成）：500k 步主训练
+1. 实施 Priority 2（capture_distance 1.0 → 3.0m，XY 距离）
+2. 实施 Priority 3（height_penalty_threshold 0.5 → 1.5m，如保留俯冲策略）
+3. 实施 Priority 4（entropy_loss_scale 提高）
+4. 运行 500k 步
+5. 成功判据（500k 步）：
+   - `tracking_reward/ep > 5.0`
+   - `Episode_Termination/all_targets_captured > 0.01`（偶发成功）
+   - `policy_std > 0.35`（探索未坍缩）
+   - `Episode / Total timesteps mean > 300 步`
+
+---
+
+## Comparison with Previous Run (2026-04-02_17-08-54)
+
+| 指标 | 上一次（碰撞禁用前） | 本次（碰撞禁用后） | 变化 |
+|------|---------------------|-------------------|------|
+| illegal_contact early | 0.736/rollout | 1.150/rollout | 恶化 |
+| illegal_contact recent | 1.254/rollout | 1.234/rollout | 持平（仍高） |
+| episode timesteps mean | 86.6 → 57.4（恶化） | 65.3 → 65.7（稳定） | 稍好 |
+| total_reward_mean | -7.75 → -1.77 | -3.58 → -0.50 | 改善 |
+| tracking_reward | 0.0（best=0.001） | 0.0（best=0.021） | 微弱正向 |
+| bounding_box 终止 | N/A | 0.107 → 0.019 | 改善（出界减少） |
+
+**结论：** spawn 碰撞（z_range 修复）有效（bounding_box 终止减少），但碰撞几何体禁用代码未能消除 illegal_contact。本次训练的 illegal_contact 起点（1.150）甚至高于上一次（0.736），可能因为 2048 个环境中禁用代码遍历失败比例更高，或 USD stage 加载顺序问题在大规模环境下更严重。
+
+---
+
+## Changelog
+
+- 2026-04-02（run 2026-04-02_18-27-51）：碰撞几何体禁用尝试失败 — illegal_contact 仍为 1.15-1.23/rollout，确认为训练阻断瓶颈
+  - spawn z_range (1.5,2.5)→(2.0,3.0) 有效，bounding_box 终止从 0.107 降至 0.019
+  - 奖励重塑（tracking×4, dist×0.8, height×0.5）方向正确，total_reward_mean 改善 86%
+  - 但 illegal_contact 终止完全主导，所有奖励改善均被掩盖
+  - 关键发现：碰撞禁用代码在 `_setup_scene` 中的 USD stage 遍历方式在 2048 env 规模下可能无效
+  - 下一步：Priority 1 方案 B（从终止条件中移除 illegal_contact）作为快速验证，然后修复根本原因
