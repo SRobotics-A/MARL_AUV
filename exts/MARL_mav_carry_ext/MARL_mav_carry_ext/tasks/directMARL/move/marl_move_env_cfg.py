@@ -87,20 +87,20 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # Spread: Drones further apart
     drone_spawn_x_range = (-8.0, -6.0)
     drone_spawn_y_range = (-3.0, 3.0)
-    drone_spawn_z_range = (1.5, 2.5)
+    drone_spawn_z_range = (2.0, 3.0)  # 抬高避开 NovaCarter 3x 缩放后车顶(≈1.6m)
 
     # === Reward Weights (Exponential Decay Style, matches hover/hover_flycart) ===
     # 所有正奖励乘 step_dt，指数衰减上界为 1.0
 
     # Distance Reward: w * exp(-dist * scale) * step_dt
-    dist_reward_weight = 1.5
+    dist_reward_weight = 0.8  # 降低：避免高度锁定时dist_reward主导
     dist_reward_scale = 0.5  # 衰减速率减小，扩大吸引范围
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
     success_reward_weight = 0.0
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
-    tracking_reward_weight = 1.0
+    tracking_reward_weight = 4.0  # 增大：强化跟随信号
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
@@ -123,7 +123,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
-    height_reward_weight = 2.0  # Increased from 0.5 to 2.0
+    height_reward_weight = 0.5  # 降低：避免高度锁定压制俯冲捕获策略
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
