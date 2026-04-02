@@ -248,13 +248,13 @@ class MARLMoveEnv(DirectMARLEnv):
             self.contact_sensors.append(contact)
             self.scene.sensors[f"contact_forces_{i}"] = contact
 
-        # ===== 创建4个移动小车目标（NovaCarter，运动学模式） =====
-        from isaaclab.assets import ArticulationCfg
+        # ===== 创建4个移动小车目标（NovaCarter，禁用Articulation作为运动学刚体加载） =====
+        from isaaclab.assets import RigidObjectCfg
 
         y_positions = self.cfg.target_spawn_y_positions
         self.targets = []
         for i in range(self.cfg.num_targets):
-            target_cfg = ArticulationCfg(
+            target_cfg = RigidObjectCfg(
                 prim_path=f"/World/envs/env_.*/target_{i}",
                 spawn=sim_utils.UsdFileCfg(
                     usd_path=self.cfg.nova_carter_usd_path,
@@ -262,16 +262,18 @@ class MARLMoveEnv(DirectMARLEnv):
                         kinematic_enabled=True,
                         disable_gravity=True,
                     ),
+                    articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                        articulation_enabled=False,
+                    ),
                     scale=self.cfg.nova_carter_scale,
                 ),
-                init_state=ArticulationCfg.InitialStateCfg(
+                init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(0.0, y_positions[i], self.cfg.target_spawn_z),
                     rot=(1.0, 0.0, 0.0, 0.0),
                 ),
-                actuators={},  # 运动学模式，不驱动任何关节
             )
-            target = Articulation(target_cfg)
-            self.scene.articulations[f"target_{i}"] = target
+            target = RigidObject(target_cfg)
+            self.scene.rigid_objects[f"target_{i}"] = target
             self.targets.append(target)
 
         # add ground plane
@@ -971,10 +973,6 @@ class MARLMoveEnv(DirectMARLEnv):
 
         # Reset velocities
         flat_vel[target_indices_flat] = 0.0
-
-        # 重置Articulation关节状态
-        for target in self.targets:
-            target.reset(env_ids)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         pass
