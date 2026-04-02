@@ -875,7 +875,7 @@ class MARLMoveEnv(DirectMARLEnv):
             | (self.target_positions[:, :, 0] < -self.cfg.bounding_box_threshold)
             | (self.target_positions[:, :, 1] > self.cfg.bounding_box_threshold)
             | (self.target_positions[:, :, 1] < -self.cfg.bounding_box_threshold)
-            | (self.target_positions[:, :, 2] < 0.05)
+            | (self.target_positions[:, :, 2] < -0.5)  # NovaCarter 在地面 z≈0，只在意外入地时触发
         ).any(dim=-1)
 
         # 组合终止条件
