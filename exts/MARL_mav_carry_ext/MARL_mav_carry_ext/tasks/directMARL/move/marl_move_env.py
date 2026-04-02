@@ -900,7 +900,7 @@ class MARLMoveEnv(DirectMARLEnv):
         # 组合终止条件
         terminations = (
             self.falcon_fly_low
-            | self.illegal_contact
+            # illegal_contact 仅作惩罚，不终止 episode（NovaCarter CollisionAPI 禁用失败的临时规避）
             | self.drone_collision
             | self.body_pos_outside
             | self.targets_out_of_bounds
