@@ -74,7 +74,14 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
         -2.0,
         -6.0,
     ]
-    target_spawn_z = 0.25  # z高度固定在地面上方
+    target_spawn_z = 0.0  # z高度固定在地面上方（NovaCarter以地面为基准）
+
+    # NovaCarter小车USD路径
+    nova_carter_usd_path: str = (
+        "/media/xtj/1CC8D044C8D01DB8/RL-download/isaac-sim/v5.1.0/Assets/Isaac/5.1/"
+        "Isaac/Robots/NVIDIA/NovaCarter/Variants/nova_carter_sim_optimized.usd"
+    )
+    nova_carter_scale: tuple = (3.0, 3.0, 3.0)  # 与move_flyfollow.usda中一致
 
     # 无人机初始位置（地图另一侧）
     # Spread: Drones further apart

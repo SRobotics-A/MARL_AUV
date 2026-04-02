@@ -248,33 +248,29 @@ class MARLMoveEnv(DirectMARLEnv):
             self.contact_sensors.append(contact)
             self.scene.sensors[f"contact_forces_{i}"] = contact
 
-        # ===== 创建4个移动物块（目标） =====
-        from isaaclab.assets import RigidObjectCfg
+        # ===== 创建4个移动小车目标（NovaCarter，运动学模式） =====
+        from isaaclab.assets import ArticulationCfg
 
+        y_positions = self.cfg.target_spawn_y_positions
         self.targets = []
-        for i, color_name in enumerate(self.cfg.target_colors):
-            color_rgb = self.cfg.target_color_rgb[color_name]
-            target_cfg = RigidObjectCfg(
+        for i in range(self.cfg.num_targets):
+            target_cfg = ArticulationCfg(
                 prim_path=f"/World/envs/env_.*/target_{i}",
-                spawn=sim_utils.CuboidCfg(
-                    size=self.cfg.target_size,
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=self.cfg.nova_carter_usd_path,
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         kinematic_enabled=True,
                         disable_gravity=True,
                     ),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=color_rgb
-                    ),
+                    scale=self.cfg.nova_carter_scale,
                 ),
-                init_state=RigidObjectCfg.InitialStateCfg(
-                    pos=(0.0, 0.0, self.cfg.target_spawn_z),
+                init_state=ArticulationCfg.InitialStateCfg(
+                    pos=(0.0, y_positions[i], self.cfg.target_spawn_z),
                     rot=(1.0, 0.0, 0.0, 0.0),
                 ),
             )
-            target = RigidObject(target_cfg)
-            self.scene.rigid_objects[f"target_{i}"] = target
+            target = Articulation(target_cfg)
+            self.scene.articulations[f"target_{i}"] = target
             self.targets.append(target)
 
         # add ground plane
@@ -946,7 +942,7 @@ class MARLMoveEnv(DirectMARLEnv):
         self.all_targets_captured[env_ids] = False
 
     def _reset_targets(self, env_ids):
-        """重置移动物块的位置和状态"""
+        """重置移动小车目标的位置和状态"""
         target_indices_flat = (
             env_ids.view(-1, 1) * self.num_targets
             + torch.arange(self.num_targets, device=self.device).view(1, -1)
@@ -974,6 +970,10 @@ class MARLMoveEnv(DirectMARLEnv):
 
         # Reset velocities
         flat_vel[target_indices_flat] = 0.0
+
+        # 重置Articulation关节状态
+        for target in self.targets:
+            target.reset(env_ids)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         pass
