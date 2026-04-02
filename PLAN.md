@@ -4784,3 +4784,207 @@ seed 差异和 nova_carter 字段差异均不影响训练行为；**唯一的行
   - tracking_reward 完全为零（ratio 1:20,609），训练未产生任何有效策略
   - num_envs=32 导致样本量仅为标准的 1/64（验证性运行可接受，正式训练须改为 2048）
   - 下一步：提高 drone spawn 下限至 z=2.0m，禁用 NovaCarter 碰撞网格，调整奖励权重
+
+---
+
+# Training Analysis Report — 2026-04-02_17-08-54_mappo_torch_mappo
+
+**Run:** 2026-04-02_17-08-54_mappo_torch_mappo
+**Date:** 2026-04-02
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Total Steps:** ~58k（57,900 最终步）
+**num_envs:** 32
+
+---
+
+## Training Metrics Summary
+
+| 指标 | 早期 | 近期均值 | 最终值 |
+|------|------|----------|--------|
+| Total reward (mean) | -7.75 | -2.05 | -1.93 |
+| Episode timesteps (mean) | 86.6 步 | 58.6 步 | 61.2 步 |
+| Episode timesteps (min) | 1 步 | 1.8 步 | 1 步 |
+| tracking_reward | 0.0 | ~0.000012 | 0.0 |
+| height_reward | 0.137 | 0.138 | 0.138 |
+| height_penalty | — | -0.617 | -0.600 |
+| illegal_contact (终止次数/rollout) | 0.736 | 1.250 | 1.170 |
+| policy_std | 0.797 | 0.648 | 0.635 |
+
+**关键结论：** 本次训练完全被 `illegal_contact` 终止条件主导。episode 长度从早期 86 步下降到近期 57 步，并呈持续恶化趋势，说明策略正在主动学习靠近 NovaCarter——但每次靠近都触发接触传感器终止。tracking_reward 全程为零，训练未产生有效跟随策略。
+
+---
+
+## Observations & Findings
+
+### [NovaCarter 碰撞几何体未禁用] — Severity: CRITICAL
+
+**症状：**
+- `Episode_Termination/illegal_contact` 全程主导：早期 0.736/rollout → 近期 1.254/rollout（恶化趋势）
+- `Episode_Reward/illegal_contact` 近期均值 = -0.974（接近每个 episode 都被惩罚一次）
+- episode 长度持续缩短（86 → 57 步）——策略变得更"激进"，更快靠近目标，但越靠近越快终止
+- `timesteps_min` 始终为 1，说明仍有 spawn 阶段即终止的情况
+
+**根本原因：**
+NovaCarter USD 资产（`nova_carter_sim_optimized.usd`）内嵌了完整的物理碰撞几何体（PhysicsCollisionAPI）。虽然小车以 `XFormPrim` 方式绑定（运动学驱动，不参与物理模拟），但其碰撞网格仍在物理引擎中保持激活，Isaac Lab 的接触传感器会检测到 Falcon 机身与 NovaCarter 几何体之间的接触力。
+
+`contact_sensor_threshold=1.0N` 已在上一轮分析中提高，但仍不足以排除 NovaCarter 碰撞几何体产生的接触力读数。
+
+**证据：**
+- 捕获机制使用 XY 平面 2D 距离（`dist_matrix = torch.norm(d_pos - t_pos, dim=-1)` 中 `[:, :, :2]`），无人机必须水平靠近目标 → 必然与 NovaCarter 几何体接触
+- `drone_spawn_z_range=(2.0, 3.0)` 已修复 spawn 碰撞，但运动靠近阶段的接触问题未解决
+- `illegal_contact` 与 `crash` 标签数值完全相同，说明 crash 即 illegal_contact（同一路径）
+
+**核心矛盾：** 当前任务要求无人机接近 NovaCarter（capture_distance=1.0m XY），但接近行为会触发 NovaCarter 碰撞几何体接触，导致 illegal_contact 终止。训练目标与终止条件直接冲突。
+
+---
+
+### [height_penalty 持续增大，策略被阻止下降] — Severity: HIGH
+
+**症状：**
+- `height_penalty` 近期均值 = -0.617，从早期 -0.310 持续增大
+- `height_reward_weight=0.5` + `desired_height=2.5m` 仍在将无人机锁定在 2.5m 高度
+- 俯冲捕获策略（需下降至 z≈1.25m 以靠近 z=0.25m 目标）与 height_penalty 产生对抗
+
+**根本原因：**
+俯冲捕获需要无人机从 z=2.5m 下降到 z≈1.0~1.5m，但 `height_penalty_threshold=0.5m` 意味着偏离 2.5m 超过 0.5m（即 z<2.0m）就开始受罚。目标高度 z=0.25m，要实现 capture_distance=1.0m（3D），无人机需降至 z≈1.0m——此时 height_error=1.5m，height_penalty=-1.5×weight。
+
+**证据：**
+- height_penalty 趋势上升（早期 -0.31 → 近期 -0.62），说明策略试图下降但被反复惩罚
+
+---
+
+### [tracking_reward 信号密度极低] — Severity: HIGH
+
+**症状：**
+- tracking_reward 全程为零（best=0.001，仅出现 1 次）
+- capture_distance=1.0m（XY 平面），无人机需精确进入 1m 范围内
+- 30k 步内未出现任何捕获信号
+
+**根本原因：**
+NovaCarter 以 0.3m/s 移动，而无人机每次靠近都触发 illegal_contact 终止——策略无法"探索"到成功捕获状态，奖励信号稀疏问题比 move_flyfollow 任务更严重。
+
+---
+
+### [策略探索衰减] — Severity: MEDIUM
+
+**症状：**
+- `policy_std` 从 0.820 降至 0.635（衰减 22.6%，58k 步）
+- 探索正在收敛，但收敛到的是"快速靠近然后被 illegal_contact 终止"的局部策略
+
+**根本原因：**
+策略通过 distance_reward 学会靠近目标，但 illegal_contact 使该策略代价极高。在无法学到捕获成功的条件下，策略将陷入"中距离悬停"局部最优。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL)：禁用 NovaCarter 碰撞几何体
+
+**Problem:** NovaCarter USD 中的碰撞几何体被 Falcon 接触传感器检测，导致无人机任何接近行为都触发 illegal_contact 终止。这是阻断训练的根本原因。
+
+**Proposed Change（方案 A — 推荐）：在 `_setup_scene` 中动态禁用 NovaCarter 碰撞 API**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在绑定 NovaCarter XFormPrim 后（约 line 365），添加：
+  ```python
+  from pxr import UsdPhysics, Usd
+  import omni.usd
+  stage = omni.usd.get_context().get_stage()
+  for prim in stage.Traverse():
+      path_str = str(prim.GetPath())
+      if "nova_carter" in path_str.lower():
+          # 禁用碰撞 API
+          if prim.HasAPI(UsdPhysics.CollisionAPI):
+              UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
+  ```
+- 理由：NovaCarter 作为运动学目标，不需要物理碰撞；禁用后接触传感器不再检测到它
+
+**方案 B（备选）：大幅提高 contact_sensor_threshold**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`contact_sensor_threshold: float = 1.0` → `50.0`
+- 理由：如果 NovaCarter 碰撞力通常 < 50N（轻微接触），可通过提高阈值过滤。但此方案治标不治本，且可能掩盖真实碰撞信号。
+
+**方案 C（最彻底）：将 illegal_contact 从终止条件中移除（仅保留惩罚）**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`，line 882-888
+- 从 `terminations` 中移除 `self.illegal_contact`
+- 理由：对 NovaCarter 接触不应终止 episode，只应给予小惩罚，让策略自行学会保持距离
+
+**推荐执行顺序：** 优先方案 A（根治），若 USD API 调用困难则用方案 C（最快）。
+
+---
+
+### Priority 2 (HIGH)：修改捕获策略——从俯冲捕获改为水平跟随
+
+**Problem:** 当前设计要求无人机俯冲至 z≈1.25m 以实现 3D 距离 < 1.0m，但：
+1. height_penalty 惩罚此行为
+2. 下降途中必然经过 NovaCarter 碰撞体（车顶 z≈1.6m）
+
+修改为 XY 平面跟随 + 保持安全高度是更合理的任务定义。
+
+**Proposed Change：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`capture_distance: float = 1.0` → `3.0`（XY 平面距离阈值，适配 NovaCarter 3x 缩放后 ~3.3m 车长）
+- 参数：`desired_height: float = 2.5` → `2.5`（保持不变，无人机在 2.5m 高度平飞跟随）
+- 同步修改：`height_penalty_threshold: float = 0.5` → `1.5`（允许 ±1.5m 偏差，为下降提供空间）
+- 理由：扩大 capture_distance 使策略可以在 desired_height 处直接捕获，无需俯冲；阈值 3.0m 与 NovaCarter 物理尺寸相符
+
+---
+
+### Priority 3 (HIGH)：num_envs=32 严重不足，必须升至 2048
+
+**Problem:** num_envs=32 仅为标准配置 1/64。58k 训练步实际等效于标准配置约 900 步，完全无法用于正式训练评估。
+
+**Proposed Change：**
+- 训练命令：`python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"`
+- 注意：先以 Priority 1 修复验证（num_envs=32 快跑 20k 步确认 illegal_contact=0），再升至 2048
+
+---
+
+### Priority 4 (MEDIUM)：height_penalty 与俯冲捕获目标对抗——调整高度约束
+
+**Problem:** 如果保留俯冲捕获设计（3D distance），则 height_penalty_threshold=0.5m 会持续惩罚必要的下降行为。
+
+**Proposed Change（若维持俯冲捕获路线）：**
+- 文件：`marl_move_env_cfg.py`
+- 参数：`height_penalty_weight: float = 1.0` → `0.0`（彻底取消 height_penalty，仅用 height_reward 提供软引导）
+- 参数：`height_reward_weight: float = 0.5` → `0.2`（进一步降低高度锁定吸引力）
+- 理由：俯冲捕获策略要求高度可变，height_penalty 与任务目标冲突
+
+**注意：** 若采用 Priority 2 的水平跟随方案，此项可跳过（height_penalty 对 2.5m 平飞无影响）。
+
+---
+
+## Experiment Plan
+
+### 阶段一：根治 illegal_contact（验证）
+
+1. 应用 Priority 1（方案 A 或 C），num_envs=32，运行 20k 步
+2. 验证指标：
+   - `Episode_Termination/illegal_contact` 趋向 0
+   - `Episode / Total timesteps (mean)` > 200 步
+   - `Episode / Total timesteps (min)` > 10 步（无 spawn 即终止）
+
+### 阶段二：正式训练
+
+1. 同时应用 Priority 1 + Priority 2 + Priority 3（capture_distance=3.0m，num_envs=2048）
+2. 运行 500k 步
+3. 监测指标（每 100k 步节点）：
+   - `tracking_reward recent_mean > 0.1` — 捕获信号出现
+   - `Episode / Total timesteps mean > 300 步` — 策略存活
+   - `policy_std > 0.4` — 策略仍在探索
+4. 成功判据（500k 步）：
+   - `tracking_reward/ep > 5.0`
+   - `total_reward_mean > 0`
+   - `Episode_Termination/illegal_contact 均值 < 0.1`
+
+---
+
+## Changelog
+
+- 2026-04-02（run 2026-04-02_17-08-54）：spawn 碰撞修复（z: 1.5→2.0m）+ 奖励权重调整后的第二次训练
+  - **根本原因诊断：** NovaCarter USD 碰撞几何体激活，Falcon 接触传感器在无人机靠近目标时持续触发 illegal_contact 终止（early=0.736/rollout → late=1.254/rollout，恶化趋势）
+  - spawn 碰撞（min=1 步）已改善但未完全消除（仍有偶发 min=1）
+  - episode 长度从 86 → 57 步（策略学会靠近，但每次靠近都被终止）
+  - tracking_reward 全程为零，height_penalty 持续增大（-0.31 → -0.62），俯冲捕获路线与高度约束直接冲突
+  - 核心矛盾：任务要求接近 NovaCarter（capture），但接近行为会触发 illegal_contact 终止
+  - 下一步：**禁用 NovaCarter 碰撞几何体**（Priority 1 方案 A 或 C）是解锁训练的前提，其他所有改进在此之前无效
