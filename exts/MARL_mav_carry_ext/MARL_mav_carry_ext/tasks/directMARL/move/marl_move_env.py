@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
@@ -17,9 +18,12 @@ from MARL_mav_carry_ext.tasks.managerbased.mdp_llc.utils import (
 )
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, RigidObject
+import isaacsim.core.utils.prims as prim_utils
+from isaacsim.core.prims import XFormPrim
+from isaaclab.assets import Articulation
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.sensors import ContactSensor
+from isaaclab.sim import schemas as sim_schemas
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import CircularBuffer
 from isaaclab.utils.math import (
@@ -27,6 +31,7 @@ from isaaclab.utils.math import (
     matrix_from_quat,
     quat_rotate,
 )
+from pxr import UsdPhysics
 
 from .marl_move_env_cfg import MARLMoveEnvCfg
 
@@ -228,48 +233,145 @@ class MARLMoveEnv(DirectMARLEnv):
         self.set_debug_vis(cfg.debug_vis)
 
     def _setup_scene(self):
-        """Setup scene with independent Articulations per drone (IsaacLab-HARL pattern)."""
+        """从 move.usda 加载完整场景（对齐 move_flyfollow 范式）。
 
-        # ===== 创建3个独立的Articulation对象 =====
+        USD 内含：Rivermark 室外环境 + 3架 Falcon 无人机（falcon1/2/3）+ 4辆 NovaCarter 目标小车。
+        步骤：
+          1. 加载地面平面（物理碰撞）
+          2. spawn_from_usd → clone_environments（USD 场景复制到所有并行 env）
+          3. resolve_agent_prim_path 定位各 Falcon prim → 绑定 Articulation（spawn=None）
+          4. 激活接触传感器 API
+          5. 绑定 NovaCarter 小车为 XFormPrim（运动学，直接写位置）
+        """
+        # ── 1. 地面平面 ──────────────────────────────────────────────────────
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+
+        # ── 2. 加载 move USD 场景 ─────────────────────────────────────────────
+        scene_usd_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets/data/AMR/move/move.usda"
+        )
+        scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
+        sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
+
+        # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
+        self.scene.clone_environments(copy_from_source=False)
+
+        # ── 4. 确定 env_0 的实际根路径 ───────────────────────────────────────
+        env_root_base = "/World/envs/env_0"
+        env_root = env_root_base
+        if prim_utils.is_prim_path_valid(f"{env_root_base}/World"):
+            env_root = f"{env_root_base}/World"
+
+        def resolve_agent_prim_path(agent_name: str) -> str:
+            """定位 env_0 中指定 agent 的带 ArticulationRootAPI 的 prim 路径。"""
+            roots = [env_root]
+            if prim_utils.is_prim_path_valid(f"{env_root}/World"):
+                roots.append(f"{env_root}/World")
+
+            for root in roots:
+                for candidate in [
+                    f"{root}/{agent_name}/Robot",
+                    f"{root}/{agent_name}/Falcon",
+                    f"{root}/{agent_name}",
+                ]:
+                    if prim_utils.is_prim_path_valid(candidate):
+                        return candidate
+
+                # instanceable prim 处理
+                outer_path = f"{root}/{agent_name}"
+                if prim_utils.is_prim_path_valid(outer_path):
+                    import omni.usd
+                    _stage = omni.usd.get_context().get_stage()
+                    _prim = _stage.GetPrimAtPath(outer_path)
+                    if _prim.IsValid() and _prim.IsInstance():
+                        proto = _prim.GetPrototype()
+                        if proto:
+                            for child in proto.GetAllChildren():
+                                if child.HasAPI(UsdPhysics.ArticulationRootAPI):
+                                    return f"{outer_path}/{child.GetName()}"
+
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: p.GetName() == agent_name
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: agent_name in p.GetName()
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+
+            prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/{agent_name}(/.*)?")
+            if prim is not None:
+                return prim.GetPath().pathString
+            raise RuntimeError(f"Could not resolve prim path for agent '{agent_name}' under {env_root_base}.")
+
+        # ── 5. 绑定 Falcon 无人机 Articulation（spawn=None）─────────────────
         self.robots = []
         self.contact_sensors = []
+        self._usd_root_state_rel = torch.zeros(
+            len(self.cfg.possible_agents), 7, device=self.device
+        )
+        for i, agent in enumerate(self.cfg.possible_agents):
+            env0_prim = resolve_agent_prim_path(agent)
+            env_prim_pattern = env0_prim.replace(env_root_base, "/World/envs/env_.*", 1)
 
-        for i in range(3):
-            robot_cfg = getattr(self.cfg, f"robot_{i}")
-
-            # Disable payload/ropes if present in the USD
-            # The spawn function will be called by Articulation constructor via scene replication
+            robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_prim_pattern)
+            robot_cfg.spawn = None
             robot = Articulation(robot_cfg)
             self.robots.append(robot)
             self.scene.articulations[f"robot_{i}"] = robot
 
-            contact_cfg = getattr(self.cfg, f"contact_forces_{i}")
+            # 激活接触传感器 API
+            for env_id in range(self.num_envs):
+                env_prim = env0_prim.replace("/env_0", f"/env_{env_id}", 1)
+                sim_schemas.activate_contact_sensors(env_prim, threshold=self.cfg.contact_sensor_threshold)
+
+            contact_cfg = self.cfg.contact_forces.replace(
+                prim_path=f"{env_prim_pattern}/.*"
+            )
             contact = ContactSensor(contact_cfg)
             self.contact_sensors.append(contact)
             self.scene.sensors[f"contact_forces_{i}"] = contact
 
-        # ===== 创建NovaCarter小车目标（VisualizationMarkers，Isaac Lab原生API） =====
-        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+            # 缓存 USD 初始位姿（相对 env_origin），reset 时恢复
+            try:
+                xfm = XFormPrim(env0_prim)
+                pos, ori = xfm.get_world_poses()
+                self._usd_root_state_rel[i, :3] = pos[0] - self.scene.env_origins[0]
+                self._usd_root_state_rel[i, 3:7] = ori[0]
+            except Exception as exc:
+                print(f"[move] Failed to read USD pose for {env0_prim}: {exc}")
 
-        carter_marker_cfg = VisualizationMarkersCfg(
-            prim_path="/Visuals/nova_carter_targets",
-            markers={
-                "carter": sim_utils.UsdFileCfg(
-                    usd_path=self.cfg.nova_carter_usd_path,
-                    scale=self.cfg.nova_carter_scale,
-                ),
-            },
-        )
-        self.target_markers = VisualizationMarkers(carter_marker_cfg)
-        self.targets = []  # 不再使用，保留空列表以兼容其他引用
+        if self.robots:
+            self.scene.articulations["robot"] = self.robots[0]
 
-        # add ground plane
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # clone and replicate
-        self.scene.clone_environments(copy_from_source=False)
-        # add lights
+        # ── 6. 补充环境光照 ───────────────────────────────────────────────────
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+        # ── 7. 绑定 NovaCarter 小车为 XFormPrim ──────────────────────────────
+        # 小车不参与物理仿真，每步通过 set_world_poses 直接驱动位置
+        self._target_prims: list[XFormPrim] = []
+        self._usd_target_positions_rel = torch.zeros(self.cfg.num_targets, 3, device=self.device)
+        self._usd_target_orientations = torch.zeros(self.cfg.num_targets, 4, device=self.device)
+        target_prim_names = [
+            "nova_carter_sim_optimized",
+            "nova_carter_sim_optimized_01",
+            "nova_carter_sim_optimized_02",
+            "nova_carter_sim_optimized_03",
+        ]
+        for idx, name in enumerate(target_prim_names[: self.cfg.num_targets]):
+            prim_path = f"{env_root}/{name}"
+            xfm = XFormPrim(prim_path)
+            self._target_prims.append(xfm)
+            try:
+                pos, ori = xfm.get_world_poses()
+                self._usd_target_positions_rel[idx] = pos[0] - self.scene.env_origins[0]
+                self._usd_target_orientations[idx] = ori[0]
+            except Exception as exc:
+                print(f"[move] Failed to read USD target pose for {prim_path}: {exc}")
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         for agent in self.cfg.possible_agents:
@@ -422,16 +524,12 @@ class MARLMoveEnv(DirectMARLEnv):
 
         self.target_positions += self.target_velocities * dt
 
-        # 更新NovaCarter可视化位置（VisualizationMarkers批量更新）
-        world_pos = self.target_positions + self.scene.env_origins.unsqueeze(1)  # (N, T, 3)
-        all_translations = world_pos.reshape(-1, 3)  # (N*T, 3)
-        all_orientations = self._target_quat.unsqueeze(1).expand(-1, self.num_targets, -1).reshape(-1, 4)
-        marker_indices = torch.zeros(self.num_envs * self.num_targets, dtype=torch.long, device=self.device)
-        self.target_markers.visualize(
-            translations=all_translations,
-            orientations=all_orientations,
-            marker_indices=marker_indices,
-        )
+        # 仅更新 env_0 的可视化（XFormPrim 只有 env_0 下有 prim）
+        positions_world = self.target_positions + self.scene.env_origins.unsqueeze(1)
+        for i, prim in enumerate(self._target_prims):
+            pos = positions_world[0:1, i, :]
+            ori = self._usd_target_orientations[i].unsqueeze(0)
+            prim.set_world_poses(positions=pos, orientations=ori)
 
     def _normalize_observation(self, obs: torch.Tensor) -> torch.Tensor:
         """No manual normalization — relying on skrl's RunningStandardScaler."""
@@ -933,34 +1031,26 @@ class MARLMoveEnv(DirectMARLEnv):
         self.all_targets_captured[env_ids] = False
 
     def _reset_targets(self, env_ids):
-        """重置移动小车目标的位置和状态"""
-        target_indices_flat = (
-            env_ids.view(-1, 1) * self.num_targets
-            + torch.arange(self.num_targets, device=self.device).view(1, -1)
-        ).flatten()
+        """重置目标小车位置：使用 USD 中缓存的初始位姿作为起始点。"""
+        if env_ids.numel() == 0:
+            return
 
-        flat_pos = self.target_positions.view(-1, 3)
-        flat_vel = self.target_velocities.view(-1, 3)
+        # 以 USD 初始位置为基准（相对坐标），广播到所有被重置的 env
+        rel = self._usd_target_positions_rel.unsqueeze(0).repeat(env_ids.numel(), 1, 1)
+        self.target_positions[env_ids] = rel
 
-        # Reset capture state
+        # 重置速度和捕获状态
+        self.target_velocities[env_ids] = 0.0
         self.target_captured[env_ids] = False
         self.target_captured_by[env_ids] = -1
 
-        # Reset positions
-        for i in range(self.num_targets):
-            current_indices = env_ids * self.num_targets + i
-
-            r = torch.empty(len(env_ids), device=self.device)
-            val_x = r.uniform_(*self.cfg.target_spawn_x_range)
-            val_y = self.cfg.target_spawn_y_positions[i]
-            val_z = self.cfg.target_spawn_z
-
-            flat_pos[current_indices, 0] = val_x
-            flat_pos[current_indices, 1] = val_y
-            flat_pos[current_indices, 2] = val_z
-
-        # Reset velocities
-        flat_vel[target_indices_flat] = 0.0
+        # 更新 env_0 可视化
+        if 0 in env_ids.tolist():
+            positions_world = self.target_positions[0:1] + self.scene.env_origins[0:1].unsqueeze(1)
+            for i, prim in enumerate(self._target_prims):
+                pos = positions_world[:, i, :]
+                ori = self._usd_target_orientations[i].unsqueeze(0)
+                prim.set_world_poses(positions=pos, orientations=ori)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         pass

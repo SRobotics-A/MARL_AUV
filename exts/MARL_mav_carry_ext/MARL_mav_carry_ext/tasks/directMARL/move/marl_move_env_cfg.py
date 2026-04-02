@@ -176,41 +176,16 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
         gravity=(0.0, 0.0, -9.8066),
     )
 
-    # === 独立的无人机配置（每个Agent一个Articulation） ===
-    # 基础位置偏移用于三角编队初始化
-    robot_0: ArticulationCfg = FALCON_CFG.replace(
-        prim_path="/World/envs/env_.*/Falcon1"
+    # === 无人机 Articulation 配置（spawn=None 模式，从 USD 绑定）===
+    # prim_path 在 _setup_scene 中会被 resolve_agent_prim_path 动态覆盖
+    robot_cfg: ArticulationCfg = FALCON_CFG.replace(
+        prim_path="/World/envs/env_.*/falcon1"
     )
-    robot_0.spawn.activate_contact_sensors = True
-    robot_0.init_state.pos = (0.0, 2.0, 2.5)
+    robot_cfg.spawn.activate_contact_sensors = True
 
-    robot_1: ArticulationCfg = FALCON_CFG.replace(
-        prim_path="/World/envs/env_.*/Falcon2"
-    )
-    robot_1.spawn.activate_contact_sensors = True
-    robot_1.init_state.pos = (0.0, 0.0, 2.5)
-
-    robot_2: ArticulationCfg = FALCON_CFG.replace(
-        prim_path="/World/envs/env_.*/Falcon3"
-    )
-    robot_2.spawn.activate_contact_sensors = True
-    robot_2.init_state.pos = (0.0, -2.0, 2.5)
-
-    # === 独立的接触传感器（每个Agent一个） ===
-    contact_forces_0: ContactSensorCfg = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/Falcon1/.*",
-        update_period=0.0,
-        history_length=3,
-        debug_vis=False,
-    )
-    contact_forces_1: ContactSensorCfg = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/Falcon2/.*",
-        update_period=0.0,
-        history_length=3,
-        debug_vis=False,
-    )
-    contact_forces_2: ContactSensorCfg = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/Falcon3/.*",
+    # === 接触传感器（prim_path 在 _setup_scene 中动态填充）===
+    contact_forces: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/falcon1/.*",
         update_period=0.0,
         history_length=3,
         debug_vis=False,
