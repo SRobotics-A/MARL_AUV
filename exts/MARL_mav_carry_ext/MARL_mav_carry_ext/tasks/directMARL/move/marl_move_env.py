@@ -268,6 +268,7 @@ class MARLMoveEnv(DirectMARLEnv):
                     pos=(0.0, y_positions[i], self.cfg.target_spawn_z),
                     rot=(1.0, 0.0, 0.0, 0.0),
                 ),
+                actuators={},  # 运动学模式，不驱动任何关节
             )
             target = Articulation(target_cfg)
             self.scene.articulations[f"target_{i}"] = target
