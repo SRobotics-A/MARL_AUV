@@ -4449,3 +4449,162 @@ python3 scripts/skrl/train.py \
   - 高度锁定局部最优（height_error=0.0003m，drone 完全静止）
   - 前一 run（2026-03-20）的 tracking/ep = 37.4 已验证该任务可学习，本次退步原因很可能是超参数或代码修改引入了 bug（target_spawn_z=0.0 vs 0.25，以及可能的 num_envs 较小导致梯度噪声大）
   - **决策：依优先级顺序执行上述修复，特别是 XY-only 捕获距离修复是前提条件**
+
+---
+
+## Training Analysis Report — Move Task 成功 run 逆向工程 + 新 run 退步根因分析
+
+**Run（成功对照）：** `2026-03-20_16-26-19_mappo_torch_mappo`
+**Run（失败分析）：** `2026-04-02_11-47-43_mappo_torch_mappo`
+**Date：** 2026-04-02
+**Task：** Isaac-marl-move-v0
+**Algorithm：** MAPPO
+
+---
+
+### 训练指标对比
+
+| 指标 | 成功 run（2026-03-20） | 失败 run（2026-04-02） | 差异倍率 |
+|------|----------------------|----------------------|---------|
+| total_reward_mean（最终） | 901.0 | 0.263 | **3425x** |
+| tracking_reward（/ep） | 37.4 | 0.00125 | **29,900x** |
+| distance_reward（/ep） | 196.0 | 0.0296 | **6,600x** |
+| height_reward（/ep） | 26.5 | 0.020 | 1325x |
+| episode 平均步数 | 1641 步（~27s） | **1.0 步** | **1641x** |
+| policy_std（最终） | 0.150 | 0.0030 | **50x** |
+| status | improving | stalled | — |
+
+---
+
+### 核心发现 — CRITICAL：训练根本未能启动（episode 长度 = 1 步）
+
+**症状：** `timesteps_mean = 1.0 / timesteps_max = 1.0 / timesteps_min = 1.0`
+每个 episode 在第 1 步即触发终止，全程 313k 步没有任何一个 episode 超过 1 步。
+
+**根本原因（已定位到代码行级别）：**
+
+`marl_move_env.py` 第 780 行的终止条件：
+```python
+| (self.target_positions[:, :, 2] < 0.05)
+```
+
+这一行检查目标的 z 坐标是否低于 0.05m。
+
+新 run 的 `target_spawn_z = 0.0`（来自 `env.yaml` 第 628 行），目标在 z=0 生成。
+第 1 步 `_get_dones()` 被调用时，`target_positions[:,:,2] = 0.0 < 0.05`，
+`targets_out_of_bounds = True`，立即触发 `terminations = True`，episode 在第 1 步结束。
+
+成功 run 的 `target_spawn_z = 0.25`（来自 `env.yaml` 第 623 行），高于 0.05 阈值，因此不触发即时终止。
+
+**两 run 配置 diff（完整）：**
+
+```
+79c79
+< seed: 0
+---
+> seed: 42
+
+117a118,122
+> nova_carter_usd_path: /media/.../nova_carter_sim_optimized.usd
+> nova_carter_scale: [3.0, 3.0, 3.0]
+
+623c628
+< target_spawn_z: 0.25
+---
+> target_spawn_z: 0.0       ← 唯一的行为性差异，直接导致即时终止
+```
+
+seed 差异和 nova_carter 字段差异均不影响训练行为；**唯一的行为性差异是 `target_spawn_z: 0.25 → 0.0`**。
+
+---
+
+### 成功 run 关键参数配置（已验证有效）
+
+| 参数 | 值 | 说明 |
+|------|----|----|
+| `target_spawn_z` | **0.25** | 必须 > 0.05，否则触发即时终止 |
+| `capture_distance` | 1.0m | 注意：仍为 3D 距离，存在已知高度陷阱 |
+| `dist_reward_weight` | 1.5 | 主距离奖励权重 |
+| `tracking_reward_weight` | 1.0 | 当 tracking_reward=37.4 时 1.0 已足够（3D 捕获在此 run 中可能偶发有效） |
+| `height_reward_weight` | 2.0 | 成功 run 中高度锁定到 2.5m（height_reward/ep=26.5） |
+| `episode_length_s` | 60s | 允许 1641 步长 episode |
+| `num_envs`（推断） | 512 | 两 run 相同 |
+| `policy_std` 收敛值 | 0.150 | 正常水平（未崩溃） |
+
+**成功 run 的局限（已知但未修复）：**
+- tracking_reward=37.4/ep 虽然存在，但该 run 可能通过 z 偏高的目标（target_spawn_z=0.25）偶发触发 3D capture（无人机俯冲到 ~1.5m 时与 z=0.25 目标的 3D 距离可以 < 1.0m）。这不代表真正的 XY 跟踪能力，属于有缺陷的成功。
+
+---
+
+### 为何成功 run 能产生 tracking_reward？
+
+当 `target_spawn_z=0.25` 时，无人机从 z=2.5m 俯冲到约 z=1.25m 时，
+与目标（z=0.25）的垂直距离 = 1.0m，刚好等于 `capture_distance=1.0m`。
+因此成功 run 的捕获依赖无人机**同时降低高度**，这在 height_reward 的存在下是反直觉的，
+说明该 run 的 policy 习得了一种 "降低高度接近目标" 的策略，但代价是高度奖励受损。
+
+---
+
+## 改进建议
+
+### Priority 1 (CRITICAL)：立即修复 target_spawn_z
+
+**问题：** `target_spawn_z=0.0` 导致第 1 步即终止，训练完全无法进行。
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`target_spawn_z: float = 0.0` → `target_spawn_z: float = 0.25`
+- 或：修改终止条件阈值（第 780 行）从 `z < 0.05` 改为 `z < -0.1`（允许目标在地面）
+
+**注意：** 如果目标代表地面车辆，`target_spawn_z=0.0` 是语义上正确的设计意图，
+但 `z < 0.05` 的终止条件是针对**无人机飞太低**的逻辑被误用到了目标检测上，
+应将目标的 z 下界检查改为 `z < -0.5`（允许地面高度），保留仅对 drone 的低空终止。
+
+### Priority 2 (HIGH)：修复地空捕获距离（历史遗留问题）
+
+**问题：** `capture_distance=1.0m` 使用 3D 欧式距离，无人机悬停在 2.5m 时永远无法捕获 z=0.25m 的目标。
+成功 run 之所以有效，是因为 drone 需要俯冲到 z≈1.25m 才能触发捕获，这是隐性策略而非显式设计。
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 参数：在计算 `capture_distance` 时，只使用 XY 平面距离（`min_dists_xy`），与 z 无关。
+- 将 `target_spawn_z` 保持为 0.0（地面语义），`desired_height` 保持为 2.5m，只让 XY 距离决定捕获。
+- 同步将 `capture_distance: 1.0 → 3.0`（XY 距离阈值适当放宽以允许学习启动）
+
+### Priority 3 (HIGH)：调整奖励权重以支持地空场景
+
+一旦 XY-only 捕获生效，重新调整权重：
+- `tracking_reward_weight`: 1.0 → 4.0（地空跟踪需要更强的 tracking 信号）
+- `dist_reward_weight`: 1.5 → 0.8（降低距离奖励的主导性）
+- `height_reward_weight`: 2.0 → 0.5（避免高度锁定阻碍追踪）
+
+### Priority 4 (MEDIUM)：增大 num_envs
+
+- `num_envs`: 512 → 2048
+- 训练命令：`python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"`
+
+---
+
+### 实验计划（按优先级顺序）
+
+1. **Step 1（立即执行）：** 修复 `target_spawn_z=0.25` 或修改终止条件 z 阈值，验证 episode 长度恢复正常（>100 步）
+2. **Step 2：** 同步实施 XY-only 捕获距离修复 + `capture_distance=3.0m`
+3. **Step 3：** 调整三项奖励权重（tracking×4.0, dist×0.8, height×0.5）
+4. **Step 4：** 以 num_envs=2048 重新训练
+5. **监测指标（100k 步节点）：**
+   - episode 步数 mean > 200（确认无即时终止）
+   - tracking_reward 是否可达（> 0）
+   - policy_std 衰减速度（不应崩溃到 0.005 以下）
+
+**成功判据（300k 步）：**
+- episode 步数 mean > 500
+- tracking_reward/ep > 5.0
+- policy_std > 0.05
+
+---
+
+### Changelog（续）
+
+- 2026-04-02：逆向工程分析 move 任务成功 run（2026-03-20）与失败 run（2026-04-02_11-47-43）差异
+  - **根本原因已定位：** `target_spawn_z: 0.25 → 0.0` 触发终止条件 `z < 0.05`，导致 episode=1 步，训练从未启动
+  - 成功 run 的 tracking_reward=37.4 依赖 drone 俯冲到 z≈1.25m，是隐性策略而非 XY 追踪
+  - 两 run 奖励权重、观测空间、动作空间完全相同，退步来源于单一参数 `target_spawn_z`
+  - 建议在下次训练前先修复该单点故障，再叠加 XY-only 捕获和权重调整
