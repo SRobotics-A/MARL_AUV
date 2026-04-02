@@ -4241,3 +4241,211 @@ python3 scripts/skrl/train.py \
   - velocity_follow 1.69M 步内信号比 178:1，weight=2.5 完全无效，需要 weight=5.0 且配合 3D 距离奖励降低 distance_reward 主导地位
   - height_upper_soft 机制证伪：将 fly_high 从 0.49→0.32 但 crash 从 0.47→0.72，净效果为零
   - **决策：NO-GO，立即启动 Restart F**（9 项变更，核心是 3D 距离奖励 + velocity_follow weight×2 + 高度正吸引替代双侧负惩罚）
+
+---
+
+## Training Analysis Report — Move Task 首跑
+
+**Run:** `2026-04-02_11-47-43_mappo_torch_mappo`
+**Date:** 2026-04-02
+**Task:** Isaac-marl-move-v0（move 任务，非 move_flyfollow）
+**Algorithm:** MAPPO
+**Total Steps:** 278,700
+**num_envs:** 512
+**Status:** STALLED — 探索完全崩溃
+
+---
+
+### 训练指标摘要
+
+| 指标 | Early | Recent/Last | 趋势 |
+|------|-------|-------------|------|
+| total_reward_mean (per step) | 0.239 | 0.264 | +10%，近乎停滞 |
+| distance_reward (per step) | 0.02958 | 0.02962 | 几乎不变 |
+| tracking_reward (per step) | 0.001246 | 0.001260 | 微小上升，接近零 |
+| height_reward (per step) | 0.019997 | 0.019994 | 固化 |
+| body_rate_penalty (per step) | 0.014819 | 0.019974 | 上升（drone悬停化）|
+| policy_std | 0.8155 | **0.0035** | **230x 崩溃** |
+| value_loss | 2.569 | 0.005 | 极度收敛（过拟合）|
+| episode_timesteps_mean | 1.0 | 1.0 | 日志为逐步记录 |
+
+> **注：** `episode_timesteps = 1.0` 是日志记录模式问题，该 run 的 Episode_Reward 记录的是**每步**（step_dt=0.01s）的瞬时值，而非 episode 累计值（前一 run `2026-03-20` 记录的是 episode 累计值，episode 平均长度 1641 步）。
+
+---
+
+### 性能对比：与上一 run（2026-03-20_16-26-19）
+
+将新 run 的每步值 × 1641（prev run 平均 episode 长度）归一化后对比：
+
+| 指标 | 新 run（归一化/ep） | 前一 run（/ep） | 比率 |
+|------|-----------------|----------------|------|
+| distance_reward | 48.6 | 196.0 | **25%** |
+| tracking_reward | 2.1 | 37.4 | **6%** |
+| height_reward | 32.8 | 26.5 | 124% |
+| body_rate_penalty | 32.8 | 28.0 | 117% |
+| policy_std (last) | 0.0035 | 0.150 | **2.3%** |
+
+结论：新 run 的任务核心性能（tracking/distance）大幅低于前一 run，处于早期训练水平。
+
+---
+
+### 奖励项分布（占 total reward 比例，per step）
+
+| 奖励项 | 值 | 占比 |
+|--------|-----|------|
+| distance_reward | 0.02962 | 11.2% |
+| height_reward | 0.01999 | 7.6% |
+| body_rate_penalty | 0.01997 | 7.6% |
+| action_smoothness | 0.00999 | 3.8% |
+| force_penalty | 0.00419 | 1.6% |
+| velocity_penalty | 0.00289 | 1.1% |
+| **tracking_reward** | **0.00126** | **0.5%** |
+| 其余（upright/collision等，未分项） | ~0.175 | ~67% |
+
+**关键发现：** tracking_reward 仅占 0.5%，distance_reward : tracking_reward = 22:1。policy 完全没有动力进入 1m 捕获区，只需在 ~3.24m 处保持接近即可获得大部分 distance 奖励。
+
+---
+
+### 发现与诊断
+
+#### 问题 1 — 探索完全崩溃 [CRITICAL]
+
+**症状：** policy_std 从 0.8155 → 0.0035（230 倍崩溃），仅用 278k 步，policy 已接近全确定性。
+
+**根因：** 
+- 在 move 任务中，稳定悬停在 desired_height=2.5m 就能持续获得 height_reward（满分 0.02/step）和 body_rate_penalty（满分 0.02/step）。这两项合计占可观测正奖励的 ~15%，构成强力的"不动"吸引子。
+- distance_reward 在 3.24m 处已有收益，policy 学会了保持这个距离。无需进一步接近（进入 1m 捕获区），所以没有梯度推动 policy 探索。
+- entropy 系数过小，无法对抗上述吸引力。
+
+**证据：** height_error=0.0003m（drone 锁定在 2.5m），body_rate_norm≈0.0013rad/s（近乎静止），distance 3.24m 全程不变。
+
+#### 问题 2 — tracking_reward 信号不可达 [HIGH]
+
+**症状：** tracking_reward = 0.00126/step（inner value=0.126），对应的 `is_captured * exp(-dist)` 极小，意味着几乎没有目标被捕获（capture_distance=1.0m），或捕获时间极短。
+
+**根因：** capture_distance=1.0m 相对于无人机初始位置（drone_spawn_x∈[-8,-6]，target_spawn_x∈[-6,-2]）来说是个非常小的目标。无人机从 ~3.24m 处进入 1m 捕获圈需要额外接近，而当前奖励体系中接近 1m 的边际收益远小于 distance_reward 已提供的连续引导，形成"最后一公里"缺失。
+
+**证据：** tracking_reward/distance_reward = 0.043（约 1/22），前一 run 为 37.4/196=0.19（约 1/5）。
+
+#### 问题 3 — 高度锁定局部最优 [HIGH]
+
+**症状：** height_error=0.0003m，drone 精确锁定在 desired_height=2.5m，没有高度波动。
+
+**根因：** height_reward_weight=2.0 给出了强烈的高度保持激励，加上 height_penalty（超过 0.5m 阈值才惩罚）构成"高度保持即满分"的局面。drone 在垂直方向学到了完美悬停，但代价是丧失了水平接近的探索能量。
+
+**证据：** height_reward 从 early 到 last 几乎无变化（0.019997→0.019994），body_rate_penalty 从 early 0.014819 上升到 0.019974（drone 越来越"安静"）。
+
+#### 问题 4 — 与 move_flyfollow 任务的关键差异 [MEDIUM]
+
+| 维度 | move 任务 | move_flyfollow 任务 |
+|------|-----------|---------------------|
+| 目标类型 | 4 个 NovaCarter 小车（地面移动） | 移动目标点（空中） |
+| capture_distance | 1.0m（小） | 3.0m（大） |
+| 目标高度 | z=0.0m（地面） | 与无人机同高 |
+| 成功条件 | 3 个目标同时被 follow 3s | 追上 1 个目标保持 |
+| 高度控制目标 | desired_height=2.5m（悬停） | 跟随目标高度 |
+| 多目标博弈 | 存在（3 drone vs 4 target 分配） | 简化（1对1） |
+
+**关键差异影响：** move 任务的目标在地面（z=0），而无人机悬停在 2.5m，水平距离计算正确但 3D 距离约为 2.6-4m，capture_distance=1m 意味着无人机必须几乎俯冲到地面附近才能触发捕获。这在物理上不合理，且会与高度保持奖励产生根本冲突。
+
+**注意：** 目标使用 VisualizationMarkers（非物理 Articulation），因此无人机不能实际与目标碰撞，捕获判定纯靠距离。
+
+---
+
+### 改进建议
+
+#### Priority 1 (CRITICAL)：解决探索崩溃
+
+**问题：** policy_std 在 278k 步内崩溃 230 倍，后续训练无意义。
+
+**方案 A — 熵正则化强化：**
+- File: SKRL agent config（train.py 或 agent yaml）
+- Parameter: `entropy_loss_scale` → 从当前值提高到 0.01~0.05
+- 证据：entropy_loss 为正（系数在推熵增大）但仍不够强
+
+**方案 B — 重启训练并提高初始 policy_std：**
+- 从最早期 checkpoint（agent_5000.pt）重启，避免当前完全确定性策略
+- 或增加 MAPPO 的 initial_log_std 参数
+
+#### Priority 2 (HIGH)：修复 capture_distance 物理不一致性
+
+**问题：** 目标在地面（z=0），无人机悬停在 z=2.5m，3D 欧氏距离 ≥2.5m，而 capture_distance=1.0m 永远不可能触发（除非无人机坠到地面）。
+
+**两种修复路径：**
+
+**路径 A — 只用 XY 平面距离判断捕获（推荐）：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 修改 `dist_matrix` 计算（line ~561-562）：将 `[:, :, :2]` 的 2D 距离用于捕获判定
+- 修改 tracking_reward 中的 `min_dists` 也改为 XY 平面距离
+- 同步修改 `_get_dones` 中的 `is_captured_now` 逻辑（若有的话）
+- Rationale：无人机从空中跟随地面目标，垂直高度差不应阻止捕获判定
+
+**路径 B — 增大 capture_distance：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `capture_distance = 1.0` → `3.0`（考虑到 2.5m 高度差）
+- 风险：3D 捕获可能导致无人机在错误高度"捕获"目标
+
+#### Priority 3 (HIGH)：tracking_reward 信号强化
+
+**问题：** tracking_reward : distance_reward = 1:22，policy 无动力进入捕获区。
+
+**建议：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `tracking_reward_weight = 1.0` → `4.0`（与 move_flyfollow 历史修复类似）
+- Parameter: `dist_reward_weight = 1.5` → `0.8`（降低 distance 主导地位）
+- Rationale：仿照 move_flyfollow 中 sigma/tracking_weight 修复经验，必须让 tracking 成为主要奖励信号
+
+#### Priority 4 (MEDIUM)：高度锁定局部最优打破
+
+**问题：** height_reward_weight=2.0 产生强高度保持激励，与水平追踪形成竞争。
+
+**建议：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `height_reward_weight = 2.0` → `0.5`（降低高度奖励权重）
+- 保留 `height_penalty_weight` 作为软约束防止飞得太高/太低
+- Rationale：无人机的主要任务是水平追踪，高度维持只需保证安全范围，不需要精确锁高
+
+#### Priority 5 (MEDIUM)：num_envs 从 512 提高到 2048
+
+**问题：** 当前 num_envs=512，与前一 run 相同但训练速度偏慢。
+
+- 提高到 2048（与 move_flyfollow 训练设置一致）可以 4x 加速采样效率
+- 对探索崩溃有一定缓解作用（更多样化的初始状态覆盖）
+
+---
+
+### 实验计划（Restart A for move task）
+
+**执行顺序：**
+
+1. **修复 capture_distance 物理一致性**（Priority 2，路径A）：将捕获判定改为 XY 平面距离
+2. **调整奖励权重**（Priority 3+4）：
+   - `tracking_reward_weight`: 1.0 → 4.0
+   - `dist_reward_weight`: 1.5 → 0.8
+   - `height_reward_weight`: 2.0 → 0.5
+3. **提高 num_envs**：512 → 2048
+4. **重新训练：**
+   ```
+   python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+   ```
+5. **监测指标（100k 步节点）：**
+   - policy_std 衰减速度是否 < 5x（不崩溃）
+   - tracking_reward per step > 0.003（前 run 的 2.4x）
+   - distance_reward per step：检查是否减小（确认 XY-only 的影响）
+   - episode 终止原因分布：fly_low / collision / timeout 各自比例
+
+**成功判据（300k 步）：**
+- policy_std > 0.05（未完全崩溃）
+- tracking_reward (norm/ep) > 10（前 run 的 37.4 的 27%）
+- 至少有 target_captured 事件在日志中出现
+
+---
+
+### Changelog（续）
+
+- 2026-04-02：分析 move 任务首跑 `2026-04-02_11-47-43`（278k 步）
+  - 核心发现：policy_std 230x 崩溃（最严重的探索崩溃，超过 move_flyfollow 历史所有 run）
+  - capture_distance=1.0m + 目标在地面（z=0）+ 无人机悬停在 2.5m = 捕获在物理上不可能触发，tracking_reward 仅为 distance 的 1/22
+  - 高度锁定局部最优（height_error=0.0003m，drone 完全静止）
+  - 前一 run（2026-03-20）的 tracking/ep = 37.4 已验证该任务可学习，本次退步原因很可能是超参数或代码修改引入了 bug（target_spawn_z=0.0 vs 0.25，以及可能的 num_envs 较小导致梯度噪声大）
+  - **决策：依优先级顺序执行上述修复，特别是 XY-only 捕获距离修复是前提条件**
