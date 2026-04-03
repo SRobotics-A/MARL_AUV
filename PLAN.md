@@ -5953,3 +5953,210 @@ python3 scripts/skrl/train.py \
   - **all_targets_captured = 0**：未出现任何捕获，episode 太短（max=3.15s，需要 3s hold）
   - **根本问题确认**：bounding_box=20m 对折返目标 ±8m 过大，需缩小至 12m + 添加超调软惩罚
   - 下一步：Priority 1 缩小 bounding_box 至 12m + overshoot_penalty，Priority 2 调整 drone_spawn，Priority 3 降低 upright_penalty_weight
+
+---
+
+# Training Analysis Report — Run 8
+
+**Run:** 2026-04-03_12-24-40_mappo_torch_mappo
+**Date:** 2026-04-03
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Steps completed:** ~255,500 / 400,000 (63.9%)
+
+## Training Metrics Summary
+
+| Metric | Run 7 (61k steps) | Run 8 (255k steps) |
+|---|---|---|
+| total_reward_mean (recent) | -3.5 | +12.8 |
+| total_reward_mean (best) | ~+5.0 | +24.8 |
+| episode_length_mean (recent) | 115 | 222 |
+| episode_length_mean (peak) | 177 (step 28k) | **291 (step 223k)** |
+| bounding_box termination (recent) | 1.10 | 0.95 |
+| bounding_box termination (first 20%) | 1.10 | 1.14 |
+| tracking_reward (recent) | 0.61 | 4.01 |
+| drone_out penalty (recent) | -1.0 | -0.93 |
+| crash termination (recent) | 0.01 | 0.03~0.32 (spiky) |
+| policy_std (recent) | 0.82 | 0.83 |
+| all_targets_captured | 0 | **0** |
+| success_reward | 0 | **0** |
+
+## Observations & Findings
+
+### Episode Length — MAJOR IMPROVEMENT — Severity: POSITIVE
+
+**Symptom:** Run 7 peaked at 177 steps (step 28k) and declined to 115. Run 8 reached 291 steps at step 223k — a 64% improvement over run 7 peak. Recent mean is 222 steps vs run 7 late value of 115.
+
+**Root Cause (positive):** bounding_box=12m + drone_spawn_x_range=(-4,-2) together prevented the early OOB that caused run 7's peak-and-decay. Drones start farther from boundary, giving the policy time to learn approach behavior before hitting the wall.
+
+**Evidence:** ep_len trend: 81→127 (early surge) → 98 (small dip) → steady climb 100-140 (steps 80-140k) → strong second phase 188-290 (steps 155-246k). No collapse pattern visible.
+
+### bounding_box Termination — PARTIAL IMPROVEMENT — Severity: HIGH
+
+**Symptom:** bounding_box_threshold=12m was applied. First-20% mean: 1.137 → last-20% mean: 0.949. Reduction of ~16%. Still ~1.0/rollout — nearly every episode still ends by drone exiting bounds.
+
+**Root Cause:** The bounding_box trigger itself is much less severe (0.95 vs 1.10+), but drones are still crossing the 12m boundary. The boundary_soft penalty (mean -0.28/ep) is present but not strong enough to prevent the boundary crossing. Drones learn to approach aggressively (good for tracking reward) but overshoot the boundary.
+
+**Evidence:** drone_out penalty improved from -1.24 to -0.93/ep (first vs last 20%), confirming fewer OOB events, but not eliminated. boundary_soft_penalty oscillates -0.13 to -0.44 without a clear decreasing trend — the soft signal is not being effectively learned.
+
+### tracking_reward — BREAKTHROUGH — Severity: POSITIVE
+
+**Symptom:** tracking_reward rose from 0.07 (step 100) → 4.01 (recent mean), best=5.05. This is a 6x improvement over run 7 (0.61 recent, 0.70 peak) and confirms drones are actively following targets at close range.
+
+**Root Cause (positive):** capture_distance=3.0m XY + reduced bounding_box_threshold + closer drone spawn = more time within capture range per episode. tracking_reward_weight=4.0 provides strong incentive that compounds with episode length improvement.
+
+**Evidence:** tracking trend is monotonically increasing throughout: 1.29 (step 12k) → 2.03 (step 87k) → 3.74 (step 174k) → 4.29 (step 236k). Distance reward shows same trend: 1.83→4.75→5.45.
+
+### success_reward = 0 — CRITICAL BOTTLENECK — Severity: CRITICAL
+
+**Symptom:** all_targets_captured=0 and success_reward=0 throughout 255k steps. No capture success event has ever occurred.
+
+**Root Cause:** The capture success condition likely requires sustained hold (drone within capture_distance for >1s). bounding_box termination cuts episodes short — even though tracking_reward is high (drones are near targets), an OOB event terminates the episode before the hold timer can complete. With bounding_box triggering ~1.0/rollout and episode_length_mean=222 steps (~2.47s at dt=0.01s), the episode window is too short relative to hold duration.
+
+**Additional factor:** crash/fly_low terminations have become non-trivial in later training (step 248k: crash=0.27, fly_low=0.27 per rollout vs early values near 0). This spike at the end of the run suggests the policy is becoming increasingly aggressive, pushing altitude limits.
+
+**Evidence:** success_reward=0.0000 all 2555 logging points. all_targets_captured=0.0000 all logged. Max episode_length_mean=290 steps ≈ 3.23s, which may be close to the hold requirement — **one more tier of improvement in episode length could unlock first captures**.
+
+### crash / fly_low — EMERGING ISSUE — Severity: HIGH
+
+**Symptom:** crash_term + fly_low_term were near 0 until step 130k, then grew: step 136k (crash=0.46, fly_low=0.40) — a large spike. After that, oscillated but remained elevated: last value crash=0.32, fly_low=0.09 at step 255k.
+
+**Root Cause:** As tracking improves and drones learn to follow more aggressively, they descend too low (fly_low) or collide with the NovaCarter body (crash). The height_penalty_threshold=1.5m allows altitude variation, but the lower bound may be too accessible when drones push for XY capture. fly_low and crash co-occurring suggests descent-then-contact.
+
+**Evidence:** illegal_contact penalty had a severe spike of -52.26 at step 201k (vs normal ~-0.1 to -0.7). This single catastrophic event suggests that at high tracking skill, drones get very close to NovaCarter and register contact force. Occasional spikes like this inject large negative signal that destabilizes training temporarily — consistent with the ep_len oscillation seen in the later phase.
+
+### boundary_soft — INEFFECTIVE as Designed — Severity: MEDIUM
+
+**Symptom:** boundary_soft penalty is consistently -0.13 to -0.44/ep with no decreasing trend. It does not appear to be teaching drones to slow down near the boundary.
+
+**Root Cause:** The soft threshold at 9m applies a fixed-weight penalty, but relative to the tracking_reward gain (4.0/ep), the -0.28/ep soft penalty is insufficient to change behavior. Drones learn to accept the boundary penalty as a "cost of doing business" for aggressive pursuit. The signal-to-cost ratio favors crossing the soft zone.
+
+**Evidence:** boundary_soft oscillation throughout: -0.157 (early) → -0.283 (recent). No clear downward trend. bounding_box_threshold=12m triggers 0.95/rollout despite the 9m soft zone — the 3m gap (9→12m) is not enough warning distance.
+
+### upright_penalty — GROWING AS BEFORE — Severity: MEDIUM
+
+**Symptom:** upright_penalty grows from -0.002 (step 100) to -1.125 (step 249k), matching the run 7 pattern (-0.40→-1.65). upright_penalty_weight was reduced from 1.0 to 0.3, but the actual per-episode penalty is even higher than run 7 at comparable steps.
+
+**Root Cause:** Reducing weight from 1.0 to 0.3 means the raw tilt angle must be even larger than before to produce the observed penalty level. Drones are tilting ~3.3x more aggressively than in run 7. This is consistent with the larger tracking_reward gain — better tracking comes from faster, more aggressive XY pursuit which requires steeper tilt. weight=0.3 is not a solution; threshold-based penalty is the correct approach.
+
+**Evidence:** At step 173k, upright=-0.907/ep at weight=0.3 vs run 7 final -1.65/ep at weight=1.0. Normalized by weight: this run has tilt level = 0.907/0.3 = 3.02 "raw units" vs run 7 at 1.65/1.0 = 1.65 "raw units" — meaning run 8 drones are tilting 1.83x more in actual angle.
+
+### Policy Stability — VALIDATED — Severity: POSITIVE
+
+**Symptom:** policy_std stable at 0.827-0.857 throughout all 255k steps. No collapse.
+
+**Root Cause (positive):** entropy_loss_scale=0.005 validated again. Compare to run 6 which collapsed 0.815→0.323 in 400k steps.
+
+**Evidence:** policy_std recent_mean=0.828, std=0.018. Gradient norm actor stable 0.63-0.92.
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): Reduce crash/fly_low by raising minimum altitude floor or contact threshold
+
+**Problem:** crash + fly_low terminations are rising to 0.27+0.09/rollout at end of run. Aggressive tracking behavior causes descent and NovaCarter contact. The catastrophic illegal_contact spike (-52.26 at step 201k) injects destabilizing signal.
+
+**Proposed Changes:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `height_penalty_threshold = 1.5` → `1.0` (tighten altitude band to discourage descent below 1.5m)
+- Additionally: raise `contact_sensor_threshold` from 1.0N → 5.0N (filter micro-contacts during close approach, avoid catastrophic negative spikes)
+- Rationale: fly_low is co-occurring with crash — the drone is descending toward the NovaCarter and touching it. Tightening the height band penalizes descent earlier. Contact threshold increase prevents occasional large -52 penalty spikes.
+
+**Alternative (preferred):** Implement a minimum_altitude hard floor = 1.2m in the termination condition (separate from height_penalty). This cleanly separates "altitude safety" from "follow behavior."
+
+### Priority 2 (CRITICAL): Strengthen overshoot prevention to eliminate bounding_box=12m terminations
+
+**Problem:** bounding_box termination still ~0.95/rollout despite 12m threshold + 9m soft boundary. The soft penalty (-0.28/ep) is too weak relative to tracking reward gain. Drones accept the penalty as a cost of aggressive pursuit. This prevents episodes from lasting long enough for first capture.
+
+**Proposed Changes:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `boundary_soft_penalty_weight = 0.5` → `2.0` (4x increase to make the soft penalty comparable in magnitude to the tracking benefit)
+- Parameter: `boundary_soft_threshold = 9.0` → `8.0` (trigger soft penalty at the bounce boundary itself — when drones go past 8m they should immediately feel strong pushback)
+- Rationale: At 8m+, the target is reversing — following it beyond 8m is actually wrong behavior. Aligning the soft threshold with the target bounce point (8m) makes the penalty semantically correct: "you've gone further than the target ever goes."
+
+**Expected effect:** bounding_box termination should drop from 0.95 to <0.3/rollout. With episodes no longer cut short at 12m, episode_length_mean should exceed 350+ steps, enabling the first sustained captures.
+
+### Priority 3 (HIGH): Replace linear upright_penalty with threshold-based penalty
+
+**Problem:** upright_penalty grows monotonically as training improves, from -0.002 to -1.125/ep even with weight=0.3. Normalized tilt is 1.83x higher than run 7. The penalty is penalizing effective tracking behavior (moderate tilt for XY acceleration) rather than dangerous tipping.
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- Replace: `upright_penalty = -weight * (1.0 - z_body_axis)` (linear in tilt angle)
+- With: `upright_penalty = -weight * relu(cos(35°) - z_body_axis)` where `cos(35°) ≈ 0.819`
+  - This is 0 for tilt ≤ 35° and linearly increasing beyond 35°
+- `upright_penalty_weight = 0.3` → `1.0` (restore to reasonable weight since threshold protects from over-penalizing)
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Add parameter: `upright_tilt_threshold_deg = 35.0`
+- Rationale: Falcon needs ~20-25° tilt for 1.5 m/s lateral acceleration. 35° threshold gives room for active tracking without penalty, while still punishing dangerous tip-over (>35°).
+
+### Priority 4 (MEDIUM): Increase training budget and monitor for first capture
+
+**Problem:** success_reward=0 throughout 255k steps. Analysis suggests the policy is close — max episode_length=291 steps ≈ 3.2s, and tracking_reward is healthy at 4.0/ep. With bounding_box fix from Priority 2, episodes should grow to 350+ steps (3.9s), which may be sufficient for first captures if hold_duration ≤ 3s.
+
+**Proposed Change:**
+- Keep all current reward weights except as modified by Priority 1-3
+- Extend training to 600k steps (from current 400k budget)
+- Add explicit logging: monitor `Episode_Termination/all_targets_captured` and `Episode_Reward/success_reward` for first non-zero event
+- Rationale: The policy is genuinely improving — total_reward went from -1.5 to +12.8. This is not a stalled run. With structural fixes (Priority 1-2), first captures may appear within 50-100k more steps.
+
+## Experiment Plan
+
+**Run 9 — 核心修改（基于 Run 8 分析）：**
+
+1. **CRITICAL — 软边界加强（防止超调出界）：**
+   - `boundary_soft_threshold`: 9.0 → 8.0
+   - `boundary_soft_penalty_weight`: 0.5 → 2.0
+
+2. **CRITICAL — 抑制俯冲/碰撞（fly_low/crash 上升）：**
+   - `height_penalty_threshold`: 1.5 → 1.0（更早惩罚下降，防止贴地）
+   - `contact_sensor_threshold` 或等效：考虑提高至 5.0N 过滤微接触尖峰
+
+3. **HIGH — upright_penalty 改为阈值式：**
+   - `marl_move_env.py`：引入 `cos(35°) ≈ 0.819` 阈值，低于该值才触发惩罚
+   - `upright_penalty_weight`: 0.3 → 1.0（配合阈值恢复权重）
+
+4. **保留所有 Run 8 有效修改：**
+   - `bounding_box_threshold = 12.0`
+   - `drone_spawn_x_range = (-4, -2)`
+   - 折返轨迹 ±8m
+   - `entropy_loss_scale = 0.005`
+   - `tracking_reward_weight = 4.0`
+   - `capture_distance = 3.0m XY`
+
+5. **训练命令：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+6. **监控指标（前 100k steps）：**
+   - bounding_box: 应从 0.95 降至 <0.3/rollout
+   - crash + fly_low: 应从 0.32+0.09 降至 <0.05/rollout
+   - episode_length_mean: 应超过 350 steps
+   - all_targets_captured: 首次出现 >0 是关键里程碑
+   - illegal_contact spike：不应再出现 >-5/ep 的尖峰
+
+**成功标准（Run 9）：**
+- bounding_box < 0.3/rollout
+- crash + fly_low < 0.05/rollout
+- episode_length_mean > 350 steps
+- all_targets_captured > 0（首次捕获）
+- tracking_reward_mean > 5.0/ep
+
+---
+
+## Changelog（续）
+
+- 2026-04-03（run 2026-04-03_12-24-40，255k steps，Run 8）：bounding_box=12m + drone_spawn=(-4,-2) + boundary_soft=9m/0.5 + upright=0.3
+  - **episode 长度大幅改善**：run 7 peak 177 → run 8 peak **291 steps**（+64%），recent mean 222 vs run 7 late 115
+  - **tracking_reward 突破**：0.61 (run 7 recent) → **4.01 (run 8 recent)**，best=5.05，单调上升曲线
+  - **total_reward 显著改善**：recent mean +12.8 vs run 7 late -3.5
+  - **bounding_box 部分改善**：1.14 → 0.95/rollout（-16%），仍为主要终止原因
+  - **boundary_soft 无效**：-0.28/ep 稳定但无下降趋势，相对 tracking gain 太弱
+  - **crash + fly_low 新增问题**：步骤 248k 时 crash=0.27, fly_low=0.09，追踪改善导致俯冲行为
+  - **illegal_contact 尖峰**：步骤 201k 出现 -52.26/ep 灾难性尖峰（正常值 -0.1~-0.7）
+  - **upright_penalty 仍增长**：-0.002 → -1.125/ep（weight=0.3），标准化后倾斜量比 run 7 高 1.83x
+  - **success = 0**：all_targets_captured 全程 0，episode 太短（max=3.23s）不够完成 hold
+  - **policy_std 稳定 0.83**：entropy=0.005 再次验证
+  - **下一步优先级**：Priority 1 强化 boundary_soft（0.5→2.0，阈值 9→8m）+ 修复俯冲/碰撞（height_threshold 1.5→1.0）；Priority 3 upright 阈值化
