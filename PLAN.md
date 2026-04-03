@@ -5464,4 +5464,264 @@ NovaCarter 以 0.3m/s 移动，而无人机每次靠近都触发 illegal_contact
   - 新主导瓶颈：bounding_box 终止（1.16/rollout），drone_out -1.0/ep，tracking_reward 仍为 0
   - 新发现："舒适奖励"（body_rate+action_smoothness=+2.68/ep）主导总奖励，掩盖任务进展
   - 下一步：Priority 1 capture_distance 1.0→3.0m（XY），Priority 2 height_penalty_threshold 0.5→1.5m，Priority 3 bounding_box_threshold 12→20m
+
+---
+
+# Training Analysis Report — 2026-04-03_00-20-04_mappo_torch_mappo（Run 6）
+
+**Run:** 2026-04-03_00-20-04_mappo_torch_mappo
+**Date:** 2026-04-03
+**Task:** Isaac-marl-move-v0（3 Falcon + 4 NovaCarter）
+**Algorithm:** MAPPO
+**Steps:** 400,000（num_envs=32）
+
+## 本次参数变更（相比 Run 5）
+
+| 参数 | Run 5（2026-04-02_21-56-48） | Run 6（本次） |
+|------|------------------------------|---------------|
+| capture_distance | 1.0m (3D) | 3.0m (XY平面) |
+| bounding_box_threshold | 12.0m | 20.0m |
+| height_penalty_threshold | 0.5m | 1.5m |
+| body_rate_penalty_weight | 2.0 | 0.5 |
+| action_smoothness_weight | 1.0 | 0.3 |
+| illegal_contact（终止） | 已移除 | 已移除（延续） |
+
+---
+
+## Training Metrics Summary
+
+| 指标 | 早期（0–80k步） | 近期（320k–400k步） | 最终值 |
+|------|----------------|---------------------|--------|
+| total_reward_mean | -39.14 | -0.009 | -0.798 |
+| total_reward_max | — | +2.79（recent mean） | +1.60 |
+| distance_reward | 1.48/ep | 2.14/ep | 2.37/ep |
+| tracking_reward | 0.46/ep | 1.78/ep | 2.00/ep |
+| height_reward | 0.14/ep | 0.19/ep | 0.20/ep |
+| upright_penalty | -0.84/ep | -1.90/ep | -1.82/ep |
+| height_penalty | -13.30/ep | -2.10/ep | -2.93/ep |
+| drone_out | -1.29/ep | -1.00/ep | -1.00/ep |
+| body_rate_penalty | — | +0.35/ep | +0.38/ep |
+| action_smoothness | — | +0.25/ep | +0.28/ep |
+| bounding_box 终止 | 1.09/rollout | 1.12/rollout | 1.00 |
+| episode 步数 mean | 160.1 | 131.5 | 129.3 |
+| policy_std | 0.815 | 0.331 | 0.323 |
+| success_reward | 0.0 | 0.0 | 0.0 |
+| all_targets_captured | 0.0 | 0.0 | 0.0 |
+| entropy_loss_scale | 0.001 | 0.001 | 0.001 |
+
+---
+
+## 问题逐项回答
+
+### Q1. tracking_reward 是否出现正信号？
+
+**是的，tracking_reward 首次出现并稳定增长，这是本次最重要的突破。**
+
+- Run 5（capture_distance=1.0m 3D）：tracking_reward 整个运行期间约为 0
+- Run 6（capture_distance=3.0m XY）：
+  - 0–40k 步：early_mean = 0.46/ep，nonzero_frac = 0.978
+  - 200k–240k 步：1.23/ep
+  - 360k–400k 步：1.78/ep（持续上升，best = 2.15/ep）
+
+**结论：** 将 capture_distance 改为 XY 平面 3.0m 的假设完全验证成功。tracking_reward 从结构上变为可达，且学习曲线在整个 400k 步内持续上升，尚未见顶。
+
+### Q2. bounding_box 终止是否消除？
+
+**否。bounding_box 依然是主导终止原因，几乎未改变。**
+
+- Run 5：bounding_box 终止 1.16/rollout（100% 出界）
+- Run 6：bounding_box 终止 early=1.09/rollout → recent=1.12/rollout（基本恒定）
+
+bounding_box_threshold 已从 12m 扩大到 20m，但终止率无改善。原因分析见"问题诊断"章节。
+
+### Q3. episode 长度是否增长？
+
+**出现反转：episode 长度从初期 160 步下降至近期 130 步，呈持续下降趋势。**
+
+- 0–40k 步：mean=160.1 步
+- 80k–120k 步：mean=119.5 步（最低点）
+- 280k–320k 步：mean=127.0 步（轻微回升）
+- 360k–400k 步：mean=132.1 步
+
+这与 bounding_box 终止持续主导直接相关（见 Priority 1）。
+
+### Q4. 是否出现 all_targets_captured？
+
+**否。success_reward 和 all_targets_captured 整个 400k 步内均为 0.0。**
+
+此任务成功（所有 3 架无人机同时捕获对应目标）的门槛极高，在当前配置下尚未达到。
+
+### Q5. 奖励结构是否健康？
+
+**基本健康，但两个主导惩罚项需要关注。**
+
+近期（last 20%）各分量均值：
+
+| 分量 | 值 | 角色 |
+|------|-----|------|
+| distance_reward | +2.14 | 正向，主导正奖励 |
+| tracking_reward | +1.72 | 正向，稳定增长 |
+| body_rate_penalty | +0.35 | 正向（舒适奖励，已降低） |
+| action_smoothness | +0.25 | 正向（舒适奖励，已降低） |
+| force_penalty | +0.29 | 正向 |
+| height_reward | +0.19 | 正向 |
+| **upright_penalty** | **-1.85** | **负向，第一大净负项** |
+| **height_penalty** | **-2.22** | **负向，第二大净负项** |
+| drone_out | -1.00 | 负向，恒定 |
+
+正向合计：+4.84/ep，负向合计：-5.07/ep。整体 total_reward_mean 接近 0（-0.009）。
+"舒适奖励"（body_rate+action_smoothness=+0.60/ep）经降权后已不再主导，占正向总和比例降至 12%，目标达成。
+
+---
+
+## Observations & Findings
+
+### [Bounding Box 终止持续主导] — Severity: CRITICAL
+
+**Symptom:** bounding_box 终止从 run 5 的 1.16/rollout 到 run 6 的 1.09–1.12/rollout，扩大边界（12→20m）几乎无效。
+
+**Root Cause:** bounding_box 终止的根本原因不是边界太小，而是无人机策略正在主动跟随目标 NovaCarter 小车——而小车以 0.3m/s 沿 +x 方向持续运动，不折返。即使边界扩大，在 60s 的 episode 内小车仍会跑出 18m，无人机跟随同样会出界。
+
+**Evidence:** 
+- `Episode_Termination/targets_out_of_bounds` 全程为 0（目标本身未触发出界，说明目标还在边界内）
+- `drone_out` 惩罚始终为 -1.00/ep（100% 的 episode 都有无人机出界）
+- bounding_box 终止 1.09–1.12/rollout 完全稳定，无法通过扩大边界解决
+- `episode_timesteps_min` 最低降到 1（存在极短 episode，但 min 均值 36 步，说明有异常重置）
+
+**关键推断：** 策略已学会追踪目标（tracking_reward 上升），但追踪行为导致无人机跟随目标出界。边界扩大不能解决这一结构性问题，需要让目标在有界范围内循环运动，或扩大边界至 50m+。
+
+### [Upright Penalty 持续增大] — Severity: HIGH
+
+**Symptom:** upright_penalty 从 early=-0.84/ep 持续增大到 recent=-1.90/ep，是唯一随训练变差的主要指标。
+
+**Root Cause:** 追踪运动目标需要无人机施加横向加速度，这必然引入机体倾斜（roll/pitch）。upright_penalty_weight=2.0 惩罚所有倾斜，与高速追踪任务从物理上冲突。随着策略学会更积极地追踪，倾斜增加，惩罚增大。
+
+**Evidence:**
+- 计算方式：`(z_axis_body_dot - 1.0) * weight * step_dt`，追踪时 z_axis_body < 1.0（倾斜），惩罚单调增大
+- upright_penalty: -0.84 → -1.09 → -1.60 → -1.67 → -1.75 → -1.77 → -1.85 → -1.80 → -1.80 → -1.90（10个阶段持续增大）
+- 这与 tracking_reward 同步增大，证实两者正相关
+
+**危险性：** 如果 upright_penalty 的增速超过 tracking_reward 的增速，策略会被迫退回静态悬停（倾斜最小但无法追踪）。当前 tracking_reward 增速仍更快，但差距在收窄。
+
+### [Height Penalty 持续存在] — Severity: HIGH
+
+**Symptom:** height_penalty 虽从 early=-13.30 大幅降低到 recent=-2.22/ep，但仍是第二大负向项，且近期呈轻微反弹（260k步后从 -1.65 重新升至 -2.22）。
+
+**Root Cause:** NovaCarter z=0.25m，desired_height=2.5m，垂直距离 2.25m。即使 height_penalty_threshold 扩大到 1.5m，任何俯冲接近策略都会产生偏离（altitude 从 2.5m 降到 ~1.0m 时偏离 = 1.5m，恰好触发阈值边缘）。近期反弹可能源于策略在尝试更激进的高度调整。
+
+**Evidence:**
+- height_penalty 趋势：-13.30 → -11.53 → -4.16 → -1.69 → -1.65 → -1.71 → -1.69 → -2.12 → -2.33 → -2.10
+- 改善主要发生在 0–160k 步（策略学会避免极端高度偏差），之后进入平台且略有反弹
+
+### [Policy Std 单调下降] — Severity: MEDIUM
+
+**Symptom:** policy_std 从 0.815 单调下降到 0.323，下降幅度 60%，趋势尚未收敛。
+
+**Evidence:**
+- 0–40k: 0.815 → 80k: 0.706 → 160k: 0.616 → 240k: 0.485 → 320k: 0.392 → 400k: 0.323
+- entropy_loss_scale=0.001（config agent.yaml），极低的熵系数无法抵抗 std 收缩
+- 梯度范数 actor 近期=0.998（接近梯度截断上限），说明策略在强力更新
+- value_loss 近期=0.005（极小，价值网络已收敛）——但这不是好兆头，说明 critic 可能也在收敛到一个局部最优
+
+**危险性：** 如果 std 继续下降到 0.1 以下，策略将丧失探索能力，tracking_reward 的增长会停止，很可能在当前水平（~1.78/ep）附近过早收敛而非继续上升。
+
+### [Episode 长度下降] — Severity: MEDIUM
+
+**Symptom:** episode_timesteps_mean 从初期 160 步下降到 130 步，最大值（max=161 步）低于初期最大值（早期 best=172 步）。
+
+**Root Cause:** bounding_box 终止主导，策略学会追踪（向目标运动）后更快地跟随出界，导致 episode 更短。这是"成功的策略反而缩短了 episode"的悖论。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 实现目标循环运动，彻底解决出界问题
+
+**Problem:** 目标 NovaCarter 沿 +x 方向以 0.3m/s 持续运动不折返，无论边界多大都会出界。这是 bounding_box 终止持续为 100% 的根本原因。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 修改 NovaCarter 位置更新逻辑：当目标接近边界（距边界 5m 内）时折返，实现来回运动（正弦波或锯齿波轨迹）
+- 或直接将目标速度改为圆周运动（半径 8m 圆圈），确保目标始终在 bounding_box 内
+- **备选（最快验证）：** 将 `bounding_box_threshold` 进一步扩大到 50m，并将 episode_length_s 减小到 20s，消除追踪途中出界问题
+- Rationale: 策略已学会追踪，但追踪行为本身导致出界——这是任务设计而非策略问题
+
+**预期效果：** bounding_box 终止从 1.12/rollout 降至 <0.05/rollout，episode 长度从 130 步增长到 300+ 步，tracking_reward 有空间继续增长。
+
+### Priority 2 (HIGH): 降低 upright_penalty 权重
+
+**Problem:** upright_penalty_weight=2.0 与高速追踪物理冲突，随 tracking 改善而持续增大（-0.84→-1.90/ep），有可能逆转训练进展。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `upright_penalty_weight = 2.0` → `1.0`（或完全移除，改为仅在倾斜超过阈值时惩罚）
+- Rationale: Falcon 的几何控制器（DFBC）已提供姿态稳定，不需要额外的 upright 惩罚来保证飞行安全。该项惩罚在悬停任务中有意义，但在追踪任务中物理上要求倾斜。
+
+**更优替代方案（推荐）：** 将持续惩罚改为阈值惩罚：
+- 仅当 `z_axis_body < cos(30°) ≈ 0.866` 时惩罚（倾斜超过 30 度才惩罚）
+- 正常追踪时倾斜约 10–20 度，不触发惩罚
+
+**预期效果：** 解除 tracking 改善与 upright_penalty 增大之间的对抗，预计总奖励可增加 +1.0–1.5/ep。
+
+### Priority 3 (HIGH): 增大 entropy_loss_scale，防止过早收敛
+
+**Problem:** policy_std 从 0.815 下降到 0.323（-60%），entropy_loss_scale=0.001 无法抵抗收敛。若继续下降，tracking_reward 增长将停止。
+
+**Proposed Change:**
+- File: `logs/skrl/move/[run]/params/agent.yaml`（实际修改位置：SKRL training config）
+- 寻找 MAPPO 配置文件：`scripts/skrl/` 或 `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/`
+- Parameter: `entropy_loss_scale: 0.001` → `0.005`
+- Rationale: tracking_reward 仍在上升（1.78/ep，尚未饱和），需要维持 policy_std > 0.4 以保持探索。0.005 是上一次 flyfollow 任务成功防止 std collapse 的验证值。
+
+**注意：** 避免超过 0.01（会导致策略更新被熵正则主导，影响收敛速度）。
+
+### Priority 4 (MEDIUM): 考虑移除 height_penalty 或改用更宽松的设计
+
+**Problem:** height_penalty 是当前第二大净负项（-2.22/ep），且近期出现反弹，说明策略在尝试高度调整被持续惩罚。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Option A：** `height_penalty_threshold = 1.5` → `2.0`（允许更大高度偏差）
+- **Option B：** `height_penalty_weight = 1.0` → `0.3`（降低惩罚强度）
+- **Option C（推荐）：** 将 height_penalty 改为仅在 z<0.5m 或 z>5.0m 时触发（安全边界而非精确高度控制），等同于将 desired_height 约束完全交给 height_reward，而非双重约束
+- Rationale: move 任务的核心是 XY 平面追踪，高度控制已有 height_reward 提供正向信号，height_penalty 的双重约束产生冗余惩罚，会抑制追踪时的自然高度调整。
+
+**注意：** 不要完全移除高度约束，NovaCarter 高度 ~0.75m（3x scale），无人机不能贴地飞行。
+
+---
+
+## Experiment Plan
+
+**下一步实验（Run 7）优先级排序：**
+
+1. **必做（Priority 1）：** 修改目标运动模式，使 NovaCarter 在边界内循环（折返或圆周）
+   - 验证指标：bounding_box 终止 <0.1/rollout，episode mean > 200 步
+2. **同步修改（Priority 2+3）：** upright_penalty_weight 2.0→1.0，entropy_loss_scale 0.001→0.005
+3. **观察 50k 步后：** 若 tracking_reward 仍在上升且 policy_std > 0.5，说明改变有效
+4. **200k 步 checkpoint：** 比对 tracking_reward 和 all_targets_captured
+5. **成功标准：**
+   - bounding_box 终止 <0.1/rollout
+   - episode mean > 200 步
+   - tracking_reward > 3.0/ep（当前 1.78/ep）
+   - all_targets_captured > 0 case（第一次捕获成功）
+   - policy_std 在 200k 步时仍 > 0.4
+
+**训练命令（num_envs 建议提升到 2048 进行正式训练）：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+---
+
+## Changelog
+
+- 2026-04-03（run 2026-04-03_00-20-04）：capture_distance 3.0m XY + bounding_box 20m + height_penalty_threshold 1.5m + comfort rewards 降权
+  - **tracking_reward 首次出现正信号**：0→1.78/ep，持续上升 400k 步未见顶
+  - total_reward_mean 从 -39.14 上升至 -0.009（接近 0）
+  - **bounding_box 终止仍 100%**：20m 边界仍不足，目标循环运动是根本解法
+  - upright_penalty 持续增大（-0.84→-1.90），追踪与倾斜惩罚对抗
+  - policy_std 0.815→0.323，entropy 不足，需提升 entropy_loss_scale 0.001→0.005
+  - 下一步：Priority 1 实现目标循环运动，Priority 2 upright_penalty_weight 2.0→1.0
   - 下一步：Priority 1 方案 B（从终止条件中移除 illegal_contact）作为快速验证，然后修复根本原因
