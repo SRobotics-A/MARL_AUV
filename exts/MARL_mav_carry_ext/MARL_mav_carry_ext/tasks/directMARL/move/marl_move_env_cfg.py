@@ -61,6 +61,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     target_colors = ["red", "yellow", "green", "blue"]
     target_values = [4.0, 3.0, 2.0, 1.0]  # 对应的价值
     target_velocity = 0.3  # 物块移动速度 (m/s)
+    target_bounce_x_min = -8.0  # 折返边界：最小 x（相对 env_origin）
+    target_bounce_x_max = 8.0  # 折返边界：最大 x（相对 env_origin）
     target_size = (0.5, 0.5, 0.5)  # 物块尺寸 (m)
     capture_distance = 3.0  # 捕获距离阈值 (m，XY平面)，扩大适配NovaCarter 3x实际尺寸
     sustained_follow_duration = 3.0  # 持续跟随秒数
@@ -119,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 2.0
+    upright_penalty_weight = 1.0  # 降低：追踪机动时倾斜不可避免
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt

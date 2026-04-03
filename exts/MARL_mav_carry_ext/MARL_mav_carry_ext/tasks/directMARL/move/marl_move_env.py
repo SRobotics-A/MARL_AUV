@@ -151,6 +151,10 @@ class MARLMoveEnv(DirectMARLEnv):
         self.target_velocities = torch.zeros(
             self.num_envs, self.num_targets, 3, device=self.device
         )
+        # 折返方向：+1 向 +x 运动，-1 向 -x 运动
+        self.target_directions = torch.ones(
+            self.num_envs, self.num_targets, device=self.device
+        )
         self.target_captured = torch.zeros(
             self.num_envs, self.num_targets, dtype=torch.bool, device=self.device
         )
@@ -535,9 +539,17 @@ class MARLMoveEnv(DirectMARLEnv):
                 body_ids=self._falcon_rotor_idx,
             )
 
-        # ===== 更新移动物块位置 =====
+        # ===== 更新移动物块位置（折返轨迹）=====
         dt = self.physics_dt * self.cfg.decimation
-        self.target_velocities[:, :, 0] = self.cfg.target_velocity
+
+        # 检查是否到达折返边界，翻转方向
+        x_pos = self.target_positions[:, :, 0]
+        hit_max = x_pos >= self.cfg.target_bounce_x_max
+        hit_min = x_pos <= self.cfg.target_bounce_x_min
+        self.target_directions = torch.where(hit_max, -torch.ones_like(self.target_directions), self.target_directions)
+        self.target_directions = torch.where(hit_min, torch.ones_like(self.target_directions), self.target_directions)
+
+        self.target_velocities[:, :, 0] = self.target_directions * self.cfg.target_velocity
         self.target_velocities[:, :, 1] = 0.0
         self.target_velocities[:, :, 2] = 0.0
 
@@ -1058,8 +1070,9 @@ class MARLMoveEnv(DirectMARLEnv):
         rel = self._usd_target_positions_rel.unsqueeze(0).repeat(env_ids.numel(), 1, 1)
         self.target_positions[env_ids] = rel
 
-        # 重置速度和捕获状态
+        # 重置速度、方向和捕获状态
         self.target_velocities[env_ids] = 0.0
+        self.target_directions[env_ids] = 1.0  # 重置为 +x 方向
         self.target_captured[env_ids] = False
         self.target_captured_by[env_ids] = -1
 
