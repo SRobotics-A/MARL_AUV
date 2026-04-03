@@ -196,6 +196,7 @@ class MARLMoveEnv(DirectMARLEnv):
                 "time_penalty",
                 "upright_penalty",
                 "height_penalty",
+                "boundary_soft",
             ]
         }
 
@@ -831,6 +832,12 @@ class MARLMoveEnv(DirectMARLEnv):
         rewards["drone_out"] = (
             -out_of_bounds.float() * self.cfg.drone_out_of_bounds_penalty
         )
+
+        # --- 8b. Soft Boundary Penalty（引导无人机在硬边界前减速）---
+        xy_dist = self.drone_positions[:, :, :2].abs()  # (N, D, 2)
+        soft_excess = (xy_dist - self.cfg.boundary_soft_threshold).clamp(min=0.0)  # (N, D, 2)
+        soft_penalty = soft_excess.sum(dim=(1, 2))  # (N,)
+        rewards["boundary_soft"] = -self.cfg.boundary_soft_penalty_weight * soft_penalty * step_dt
 
         # --- 9. Fly Low Penalty ---
         fly_low = (self.drone_positions[:, :, 2] < 0.1).any(dim=-1)

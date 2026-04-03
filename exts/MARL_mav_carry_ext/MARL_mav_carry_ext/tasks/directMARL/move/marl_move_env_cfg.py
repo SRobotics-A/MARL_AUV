@@ -87,7 +87,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 无人机初始位置（地图另一侧）
     # Spread: Drones further apart
-    drone_spawn_x_range = (-8.0, -6.0)
+    drone_spawn_x_range = (-4.0, -2.0)  # 靠近中心，远离±12m边界
     drone_spawn_y_range = (-3.0, 3.0)
     drone_spawn_z_range = (2.0, 3.0)  # 抬高避开 NovaCarter 3x 缩放后车顶(≈1.6m)
 
@@ -121,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 1.0  # 降低：追踪机动时倾斜不可避免
+    upright_penalty_weight = 0.3  # 进一步降低：追踪机动时倾斜不可避免
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
@@ -199,7 +199,9 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 终止条件阈值
     drone_collision_threshold = 0.6
-    bounding_box_threshold = 20.0  # 扩大：小车0.3m/s×60s=18m，原12m太小
+    bounding_box_threshold = 12.0  # 目标折返±8m + 4m安全余量
+    boundary_soft_threshold = 9.0  # 软惩罚触发边界（超过此距离开始线性惩罚）
+    boundary_soft_penalty_weight = 0.5  # 软惩罚权重
 
     # contact sensor
     contact_sensor_threshold = 1.0  # 增加接触阈值，避免过度敏感
