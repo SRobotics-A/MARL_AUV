@@ -5725,3 +5725,231 @@ python3 scripts/skrl/train.py \
   - policy_std 0.815→0.323，entropy 不足，需提升 entropy_loss_scale 0.001→0.005
   - 下一步：Priority 1 实现目标循环运动，Priority 2 upright_penalty_weight 2.0→1.0
   - 下一步：Priority 1 方案 B（从终止条件中移除 illegal_contact）作为快速验证，然后修复根本原因
+
+---
+
+# Training Analysis Report — 2026-04-03_08-51-58
+
+**Run:** 2026-04-03_08-51-58_mappo_torch_mappo
+**Date:** 2026-04-03
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO (SKRL)
+**Training progress:** 61,800 logged steps / 400,000 budget (15.4%)
+
+**本次修改（相对上一次 2026-04-03_00-20-04）：**
+1. NovaCarter 折返轨迹：x 在 [-8m, +8m] 之间来回（target_bounce_x_min=-8, target_bounce_x_max=8）
+2. upright_penalty_weight: 2.0 → 1.0
+3. entropy_loss_scale: 0.001 → 0.005
+
+---
+
+## Training Metrics Summary
+
+| Metric | Early (~step 600) | Peak | Recent (~last 20) | Last |
+|--------|------------------|------|-------------------|------|
+| total_reward_mean | -45.96 | -27.57 | -5.57 | -3.51 |
+| distance_reward/ep | 0.58 | 1.53 | 1.09 | 1.31 |
+| tracking_reward/ep | 0.11 | 0.70 | 0.50 | 0.61 |
+| height_penalty/ep | -11.3 | — | -1.47 | -1.05 |
+| upright_penalty/ep | -0.40 | — | -1.61 | -1.65 |
+| height_reward/ep | 0.14 | 0.16 | 0.14 | 0.14 |
+| illegal_contact/ep | -2.43 | — | -0.17 | -0.05 |
+| episode_length (mean steps) | 151.8 | 177.1 (step 28k) | 112.6 | 118.5 |
+| bounding_box termination | 0.91 | — | 1.10 | 1.10 |
+| all_targets_captured | 0.0 | 0.0 | 0.0 | 0.0 |
+| time_out | 0.0 | 0.0 | 0.0 | 0.0 |
+| policy_std | 0.818 | 0.824 | 0.816 | 0.820 |
+
+---
+
+## Observations & Findings
+
+### [Positive] 高度控制大幅改善 — Severity: 良好信号
+
+**Symptom:** height_penalty 从 early -11 ~ -14/ep 降至 late -0.5 ~ -1.1/ep，改善幅度超过 10 单位/ep。
+
+**Evidence:** 上一次（00-20-04）height_penalty recent=-2.31/ep，本次 recent=-1.47/ep，即使经过更多步骤依然持续改善。high 和 low altitude termination 均接近 0。
+
+**Interpretation:** 无人机已学会维持 desired_height=2.5m ±1.5m 的高度带，这是高度控制的核心进展。
+
+---
+
+### [Positive] 违法接触和无人机碰撞基本消除 — Severity: 良好信号
+
+**Symptom:**
+- illegal_contact: early -2.43/ep → recent -0.17/ep → last -0.05/ep
+- drones_collide termination: early 0.12/rollout → recent 0.0/rollout
+
+**Evidence:** illegal_contact 惩罚持续减小，drones_collide 终止从 0.12 降为 0.00，表明上一次修复（从终止条件移除 illegal_contact）有效。
+
+---
+
+### [Positive] policy_std 稳定 — Severity: 良好信号
+
+**Symptom:** policy_std 全程稳定在 0.815~0.824，无 collapse 迹象。
+
+**Evidence:** entropy_loss_scale 0.001→0.005 的修改成功防止了标准差崩塌（上一次 std 从 0.815→0.323）。本次全程 std>0.81。
+
+---
+
+### [Critical] bounding_box 终止未因折返轨迹改善 — Severity: CRITICAL
+
+**Symptom:** bounding_box 终止率 early 0.91/rollout → recent 1.10/rollout，与上一次（00-20-04）的 1.11 几乎完全相同。折返轨迹修改未能减少 bounding_box 终止。
+
+**Root Cause:** bounding_box 触发的是**无人机**出界（`drone_positions.abs() > 20m`），而非目标出界（targets_out_of_bounds=0.0 始终为零，折返有效）。drones 在追踪目标时越过 ±20m 边界：
+- 目标折返于 ±8m 处
+- bounding_box = 20m，仅留 12m 余量
+- 无人机在追踪加速时超调（overshoot）超过 12m
+
+**Evidence:**
+- targets_out_of_bounds = 0.0 全程（折返确实生效）
+- bounding_box termination = 1.10/rollout（无改善）
+- episode_length max=210 steps 而理论 max=4000 steps（60s / 0.015s），说明所有 episode 均在 3s 内因 bounding_box 提前终止
+- time_out=0.0（无任何 episode 完成全程 60s）
+
+**Deeper mechanism:** 折返轨迹修复了"目标出界"问题，但暴露了更深的问题：无人机追踪目标时本身就飞出了 20m 边界。这与目标是否折返无关——只要目标在 ±8m 运动，无人机就会在 ±20m 附近被截断。
+
+---
+
+### [High] episode 长度先升后降，形成退化弧线 — Severity: HIGH
+
+**Symptom:** episode_length_mean 从 early 151.8 → peak 177.1（step 28k）→ late 115（step 61k），在达到峰值后明显退化。
+
+**Root Cause:** 正向反馈回路导致的退化：
+1. 初期：策略学会追踪 → tracking_reward 上升 → 无人机飞得更积极
+2. 中期：积极追踪 → 更频繁地超调出 20m 边界 → bounding_box 触发更早
+3. 后期：episode 变短 → tracking_reward 积累时间减少 → tracking_reward 下降
+
+**Evidence:**
+- ep_len peak (step 25k-32k): 164.1 mean
+- ep_len late (step 55k+): 119.8 mean（-27% 退化）
+- tracking_reward peak: 0.70 → late: 0.47（同步退化）
+
+---
+
+### [High] upright_penalty 随 episode 推进持续加重 — Severity: HIGH
+
+**Symptom:** upright_penalty/ep 从 early -0.40 → late -1.65，即使 weight 从 2.0 降至 1.0，每 episode 的实际惩罚仍增加了 4 倍。
+
+**Root Cause:** 策略为了实现更快的 XY 追踪而增大倾斜角（推进方向倾斜），导致实际倾斜量增大。weight 降低减弱了惩罚梯度，但未改变物理行为。
+
+**Evidence:** upright_penalty 在 step 27k-42k（ep_len 达到峰值时）快速从 -0.6 增加到 -1.6，与 ep_len 退化的时间点高度吻合，说明"倾斜换速度"的行为与随后的 OOB 退化强相关。
+
+---
+
+### [Medium] all_targets_captured 持续为 0 — Severity: MEDIUM
+
+**Symptom:** 整个训练过程中未出现任何一次目标捕获（all_targets_captured=0.0），capture_distance=3.0m，sustained_follow_duration=3.0s 条件从未满足。
+
+**Root Cause:** bounding_box 在 3s hold 完成前就触发了 episode 终止。即使无人机接近目标，也因追踪动作使其飞过边界而被截断。
+
+**Evidence:** 最长 episode 仅 210 steps = 3.15s，而捕获需要 3.0s 持续接近 + 后续动作，实际可用时间极度压缩。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 大幅降低 bounding_box_threshold 或缩小折返范围
+
+**Problem:** bounding_box=20m 对于折返目标 ±8m 是过大的。注释说"小车0.3m/s×60s=18m"——但有了折返后目标最多移动 8m，该注释已经过时。bounding_box 可以安全地缩小到 12m（仍给无人机 4m 追踪余量），这样不会改变无人机体验但会提前截断超调。
+
+**实际建议（优先 A）：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `bounding_box_threshold = 20.0` → `12.0`（目标最远 8m + 4m 安全余量）
+- Rationale: 这不会增加 bounding_box 触发率（已经 >1.0/rollout），而是将触发点移近，使无人机在 OOB 之前看到更多有效的追踪 reward signal，学会不超调。同时更新注释以说明折返设计后的正确阈值计算。
+
+**补充建议（必做，配合 Priority 1 A）：**
+- 添加**软惩罚**：当 drone x/y 绝对值超过 9m（目标范围 8m + 1m 预警）时施加线性递增惩罚，引导无人机减速而不是直接终止
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在 `_get_rewards()` 中加入 `overshoot_penalty = -w * relu(max(|pos_x|, |pos_y|) - 9.0)`，weight ~0.5
+
+**预期效果:** bounding_box 触发前无人机有更强的减速信号，overshoot 减少，episode 长度恢复到 170+ steps。
+
+---
+
+### Priority 2 (HIGH): 更新 bounding_box_threshold 注释，缩减 drone_spawn_x_range
+
+**Problem:** drone_spawn_x_range = (-8.0, -6.0) 说明无人机初始位置在 -8m 附近，非常接近目标的折返边界和新建议的 bounding_box=12m。无人机一开始就处于高风险区域，需要立刻移向中心。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `drone_spawn_x_range = (-8.0, -6.0)` → `(-4.0, -2.0)`（更靠近中心，减少初始 OOB 风险）
+- Rationale: 与目标 spawn_x_range = (-6.0, -2.0) 对齐，无人机初始距目标更近，更快进入有效追踪范围。
+
+---
+
+### Priority 3 (HIGH): 为 upright_penalty 引入倾斜阈值，而非线性惩罚
+
+**Problem:** upright_penalty_weight=1.0 的线性惩罚随追踪学习而持续加重（-0.40→-1.65/ep），与追踪行为形成对抗。Falcon 在追踪时物理上需要倾斜（推力方向）。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 将 upright_penalty 改为阈值式：仅当倾斜超过 35° 时触发（`z_body_axis < cos(35°) ≈ 0.819`），正常追踪（≤35°倾斜）不受惩罚
+- 或：`upright_penalty_weight = 1.0` → `0.3`（进一步降低权重，给追踪更大空间）
+- Rationale: 当前惩罚在 step 42k-61k 内翻了 4 倍，是对"追踪导致倾斜"的惩罚而非对"危险翻滚"的惩罚。阈值设计可以区分两种情况。
+
+---
+
+### Priority 4 (MEDIUM): 继续当前训练，观察 total_reward 趋势
+
+**Problem:** 训练仅完成 15.4%（61800/400000 steps），total_reward 从 -50 改善到 -3.5，仍有明显上升趋势。
+
+**Proposed Change:** 无需立即停止训练。可考虑并行实验：
+- 当前 run 继续（观察 100k steps 时是否出现首次 all_targets_captured）
+- 新 run 使用上述 Priority 1+2+3 的修改
+
+**成功标准（下一次 run）：**
+- bounding_box termination < 0.1/rollout（当前 1.1）
+- episode_length_mean > 200 steps（当前 115，峰值 177）
+- tracking_reward > 1.5/ep（当前 0.61，上一次峰值 1.78）
+- all_targets_captured > 0（首次捕获）
+- policy_std 在 200k steps 时仍 > 0.5
+
+---
+
+## Experiment Plan
+
+**Run 9（下一步）— 核心修改：**
+
+1. **CRITICAL - bounding_box 缩小：**
+   - `bounding_box_threshold`: 20.0 → 12.0
+   - 添加软惩罚（overshoot_penalty）在 |x| or |y| > 9m 时触发
+
+2. **HIGH - 无人机初始位置靠近中心：**
+   - `drone_spawn_x_range`: (-8.0, -6.0) → (-4.0, -2.0)
+
+3. **HIGH - upright_penalty 改为阈值式或继续降权：**
+   - `upright_penalty_weight`: 1.0 → 0.3
+
+4. **保留本次成功修改：**
+   - 折返轨迹：target_bounce_x_min=-8, target_bounce_x_max=8（有效）
+   - entropy_loss_scale=0.005（有效，std 稳定在 0.82）
+
+5. **训练命令：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+6. **监控指标（前 50k steps）：**
+   - bounding_box: 应从 1.1 降至 <0.3/rollout
+   - episode_length_mean: 应从 115 回升至 200+
+   - tracking_reward: 应从 0.61 重新上升
+   - all_targets_captured: 首次出现 >0 为关键里程碑
+
+---
+
+## Changelog
+
+- 2026-04-03（run 2026-04-03_08-51-58）：折返轨迹 ±8m + upright_penalty 2.0→1.0 + entropy 0.001→0.005
+  - **height_penalty MASSIVE 改善**：-11 → -1.05/ep，无人机已学会维持高度
+  - **policy_std 稳定 0.82**：entropy=0.005 修复有效，无 std collapse
+  - **illegal_contact 基本消除**：early -2.43 → last -0.05/ep
+  - **bounding_box 未改善**：1.10/rollout，与上次相同——原因是折返修复了目标 OOB，但未修复无人机超调 OOB（targets_out_of_bounds=0 确认）
+  - **episode 长度退化**：peaked at 177 steps (step 28k) → declined to 115 steps (step 61k)
+  - **tracking_reward 退化**：0.70 peak → 0.46 recent，与 ep_len 退化同步
+  - **upright_penalty 仍加重**：-0.4 → -1.65/ep，策略"倾斜换速度"行为随追踪学习加深
+  - **all_targets_captured = 0**：未出现任何捕获，episode 太短（max=3.15s，需要 3s hold）
+  - **根本问题确认**：bounding_box=20m 对折返目标 ±8m 过大，需缩小至 12m + 添加超调软惩罚
+  - 下一步：Priority 1 缩小 bounding_box 至 12m + overshoot_penalty，Priority 2 调整 drone_spawn，Priority 3 降低 upright_penalty_weight
