@@ -800,9 +800,10 @@ class MARLMoveEnv(DirectMARLEnv):
         # Penalize if body Z-axis deviates from world Z-axis (0,0,1)
         # R[..., 2, 2] is the dot product of Body-Z and World-Z
         z_axis_body = self.drone_rot_matrices[:, :, 2, 2]  # (N, D)
-        # (z - 1.0) is negative when tilted. Multiplied by weight (positive) -> negative reward
+        # 阈值式惩罚：仅当倾斜超过 upright_penalty_threshold（cos35°=0.819）时触发
+        tilt_excess = (self.cfg.upright_penalty_threshold - z_axis_body).clamp(min=0.0)  # (N, D)
         rewards["upright_penalty"] = (
-            self.cfg.upright_penalty_weight * (z_axis_body - 1.0).sum(-1) * step_dt
+            -self.cfg.upright_penalty_weight * tilt_excess.sum(-1) * step_dt
         )
 
         # ====== Safety Penalties (kept unchanged) ======
