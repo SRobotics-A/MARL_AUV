@@ -99,7 +99,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     dist_reward_scale = 0.5  # 衰减速率减小，扩大吸引范围
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
-    success_reward_weight = 0.0
+    success_reward_weight = 5.0  # 激活：强化已建立的捕获行为
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
     tracking_reward_weight = 4.0  # 增大：强化跟随信号
@@ -130,13 +130,13 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
-    height_penalty_threshold = 1.5  # Meters，回调至1.5m，避免惩罚爆炸
+    height_penalty_threshold = 1.2  # Meters，限制俯冲深度（不过分收紧）
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
     crash_penalty_scale = 1.0
     collision_penalty_scale = 1.0
-    illegal_contact_penalty = 1.0
+    illegal_contact_penalty = 0.1  # 大幅降低：消除与捕获奖励的矛盾梯度
     fly_low_penalty = 1.0
 
     # action和observation配置
@@ -205,7 +205,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     boundary_soft_penalty_weight = 2.0  # 加强：使软惩罚大于追踪收益
 
     # contact sensor
-    contact_sensor_threshold = 5.0  # 提高阈值：过滤近距微接触噪声
+    contact_sensor_threshold = 15.0  # 进一步提高：减少捕获时的虚假触发
 
     # low level control
     low_level_decimation: int = 1  # Reduced to 1 for maximum stability
