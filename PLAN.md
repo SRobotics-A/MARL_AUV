@@ -6415,3 +6415,278 @@ python3 scripts/skrl/train.py \
   - **success = 0**：all_targets_captured 仍为 0
   - **policy_std 提升**：0.83 → 0.99，探索空间更大（也可能是 height_penalty 不确定性导致）
   - **下一步优先级**：height_threshold 回调（1.0→1.5）+ bounding_box 缩小（12→10m）+ upright 阈值放宽（cos35°→cos40°, weight 1.0→0.5）
+
+---
+
+## Run 10 训练分析报告
+
+**Run:** 2026-04-04_22-19-19_mappo_torch_mappo
+**Date:** 2026-04-05
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**num_envs:** 32（小规模验证）
+**Timesteps:** 400k
+
+### 本次修改（vs Run 9）
+| 参数 | Run 9 | Run 10 |
+|------|-------|--------|
+| `height_penalty_threshold` | 1.0m | 1.5m（回调） |
+| `bounding_box_threshold` | 12.0m | 10.0m（压缩） |
+| `upright_penalty_threshold` | cos35°=0.819 | cos40°=0.766（放宽） |
+| `upright_penalty_weight` | 1.0 | 0.5（降权） |
+
+---
+
+## Training Metrics Summary
+
+| 指标 | Run 9（last/recent） | Run 10（last/recent） | 变化 |
+|------|---------------------|----------------------|------|
+| total_reward_mean | 未知 | 96.4 / 21.9 | 大幅提升 |
+| tracking_reward | 6.82 / 5.70 | 23.87 / 13.52 | **+198% / +137%** |
+| distance_reward | — | 25.47 / 15.34 | 健康 |
+| height_penalty | -4.91（recent） | -2.7723 / -2.98 | **改善但仍显著** |
+| upright_penalty | -1.88 / — | -4.28 / -3.09 | **恶化，新关键问题** |
+| illegal_contact（奖励） | — | -2.61 / -17.40 | **爆炸性问题** |
+| bounding_box（终止） | ~1.0/rollout | 0.64 / 0.55 | **显著改善 -45%** |
+| all_targets_captured | 0 | 0.60 / 0.39 | **首次捕获，重大突破** |
+| episode_len_mean | 217 | 557 / 484 | **+123%** |
+| episode_len_peak | 263 | 2376 | **+803% 决定性突破** |
+| crash（终止） | 0.075 | 0.32 / 0.43 | **大幅恶化** |
+| falcon_fly_low（终止） | 0.058 | 0.32 / 0.34 | **大幅恶化** |
+| policy_std | 0.99 | 1.595 / 1.377 | **过高，超出健康范围** |
+
+---
+
+## Observations & Findings
+
+### 1. 全面突破：首次捕获成功 — 里程碑达成
+
+**症状（正面）：**
+- `all_targets_captured` 在 step 154300 首次出现（val=0.09），之后持续上升
+- 近期均值 0.39/rollout，末尾最后10个 rollout 中 val 在 0.42-1.00 之间波动
+- `episode_len_best=2376 steps（23.76s）`，远超之前所有 run 的 peak（Run 9 max 263）
+- `episode_len_mean_recent=484 steps（4.84s）`，Run 9 peak 仅 263 steps
+
+**根因：** 三项修改共同解锁了捕获行为：
+1. `bounding_box_threshold 12→10m`：bounding_box 终止从 ~1.0/rollout 降至 0.55/rollout（-45%），策略有更多时间完成捕获
+2. `height_penalty_threshold 1.0→1.5m`：high-altitude 惩罚削弱（-4.91→-2.98），策略行动空间扩大
+3. `upright_penalty_weight 1.0→0.5`：降低姿态惩罚压力，允许更激进的追踪动作
+
+**结论：** Run 10 是 move task 训练历史中最重要的突破。捕获成功率从 0% 提升至持续 ~40%（每 rollout）。
+
+---
+
+### 2. illegal_contact 爆炸 — CRITICAL
+
+**症状：**
+- `illegal_contact` 奖励：early=-0.12 → mid=-1.10 → recent=-17.40（爆炸），worst=-815.33
+- `illegal_contact` 终止：early=0.008 → recent=0.217/rollout（+27x）
+- 最坏三次峰值：step 301700（-815），step 377600（-523），step 154300（-521）
+- 这三次峰值恰好与首次捕获（154300）和后期捕获高频区重合
+
+**根因：** 捕获行为本质上要求无人机进入 capture_distance=3.0m 范围内，而 NovaCarter 的碰撞几何在接近时会触发 ContactSensor（阈值=5N）。当策略学会更频繁地接近目标后，接触事件激增。此问题在 Run 5 时已分析过（contact_sensor_threshold 从 1N→5N 部分缓解），但当 capture 成功率提升后，接触频率超出 5N 过滤能力。
+
+**证据：** illegal_contact_penalty=1.0（而非终止条件），worst=-815 表明单 episode 内发生了 815+ 次接触事件，极大破坏奖励信号。recent_mean=-17.4 意味着每 episode 平均有 17 个接触惩罚单位（可能是持续接触的累计）。
+
+**严重性：** CRITICAL。illegal_contact 惩罚会对策略产生强负向梯度，与捕获奖励方向相反，可能导致策略在接近目标时产生矛盾梯度（"要靠近但惩罚靠近"）。
+
+---
+
+### 3. upright_penalty 爆炸性增长 — HIGH
+
+**症状：**
+- `upright_penalty`：early=-0.23 → mid=-0.93 → recent=-3.09 → last=-4.28（单调恶化）
+- Run 9 recent=-1.88（已是问题），Run 10 recent=-3.09（+64%），last=-4.28（+128%）
+- 与 tracking_reward 的 net 关系：100% 节点 tracking=23.87, upright=-4.28, net=19.59（upright 占 tracking 的 18%，可接受但上升趋势不可忽视）
+
+**根因：** 更长的 episode 允许无人机执行更多高速追踪动作，而高速追踪必然伴随机身倾斜（物理约束）。即使 threshold 从 cos35°→cos40°，权重从 1.0→0.5，episode 长度增加 +123% 导致每 episode 累计的倾斜惩罚总量仍然增大。
+
+**与 tracking 的相关性：** 20%节点 tracking=1.92/upright=-0.45，到 100%节点 tracking=23.87/upright=-4.28。比值从 4.3x 降至 5.6x——upright 增长速度慢于 tracking，说明目前不是阻碍因素，但趋势需要观察。
+
+**结论：** 目前 upright_penalty 是次要问题，随 tracking 增长速度较慢。暂不需要进一步修改，但需要在 Run 11 监控其趋势。
+
+---
+
+### 4. crash 和 falcon_fly_low 终止急剧上升 — HIGH
+
+**症状：**
+- `crash` 终止：early=0.011 → mid=0.24（step 240k）→ recent=0.43/rollout
+- `falcon_fly_low` 终止：early=0.004 → recent=0.34/rollout
+- `fly_low` 奖励惩罚：early=-0.004 → recent=-0.33/ep（+82x）
+- 两者合计 recent=0.77/rollout——几乎每个 rollout 都有坠机或超低飞行
+
+**根因：** 与 Run 8 的"aggressive-tracking descent"模式相同，但更严重：
+1. 策略学会靠近地面的 NovaCarter（spawn_z=0.25m），倾向于向下接近
+2. height_penalty_threshold=1.5m 允许 drone 飞到 2.5-1.5=1.0m（过低）
+3. 当策略进一步接近 NovaCarter 时，可能飞到 fly_low_threshold 以下
+
+**关键时间模式：** crash 在 step 240k 出现峰值（0.24），之后 320k 时下降（0.01），再到 400k 回升（0.32）——说明策略在"学习接近→坠机→调整"的循环中振荡。这个振荡影响了 episode_len 的稳定性（recent_std=183 steps 很大）。
+
+---
+
+### 5. policy_std 持续上升至 1.595——探索过度 — MEDIUM
+
+**症状：**
+- `policy_std`：early=0.826 → mid=0.948 → recent=1.377 → last=1.595（单调上升）
+- Run 9 last=0.99，Run 10 last=1.595，Run 8 stable=0.83
+- 标准差 > 1.0 意味着动作分布异常宽（在 [-1,1] clip 的 action space 中，std=1.595 几乎是均匀随机分布）
+
+**根因：** `entropy_loss_scale=0.005` 驱动探索，在 episode 长度大幅增加后，每 episode 内的熵累积更多，导致策略被推向更高随机性。illegal_contact 的极端负奖励（-815）可能也在破坏梯度，使策略难以收敛，进一步促进"保持高熵"作为防御策略。
+
+**影响：** policy_std=1.595 的策略虽然探索能力强，但在 exploit 阶段表现差——已学到的捕获行为难以稳定复现。可能解释 all_targets_captured 的大幅波动（0.42 到 1.00 之间）。
+
+---
+
+### 6. height_penalty 部分改善但仍显著 — MEDIUM
+
+**症状：**
+- `height_penalty`：early=-1.81 → mid=-1.03（改善）→ recent=-2.98 → last=-2.77（反弹）
+- 对比 Run 9：early=-1.09 → recent=-4.91。Run 10 recent=-2.98（vs -4.91，改善 39%）
+- 但早期值 -1.81 > Run 9 early=-1.09，说明 threshold=1.5m 本身也有起始惩罚
+
+**根因：** threshold=1.5m 确实缓解了爆炸（-4.91→-2.98），验证了回调方向正确。中段（-1.03）达到最优，但后段反弹（-2.98）与 crash/fly_low 增加同步——坠机前的俯冲阶段必然超出高度带。这是 crash 问题的连带效应，不是独立的高度控制问题。
+
+**结论：** height_penalty 本身已不是主要问题。只要解决 crash/fly_low（俯冲行为），height_penalty 会自然改善。
+
+---
+
+### 7. bounding_box 终止显著改善 — 已解决
+
+**症状（正面）：**
+- `bounding_box`：early=1.15 → mid=1.02 → recent=0.55 → last=0.64/rollout
+- 对比 Run 9：~1.0/rollout（不变）→ Run 10 recent=0.55（-45%）
+
+**根因验证：** `bounding_box_threshold 12→10m` 有效压缩了动量穿越区间（8-12m→8-10m）。配合 `boundary_soft_threshold=8m, weight=2.0`，软边界效果在 2m 内得到更充分发挥。
+
+**结论：** 此修改方向正确并有效。但 0.55/rollout 仍然较高，说明还有约半数 rollout 以越界终止。随着 ep_len 增长（目标运动更远），此问题可能趋于稳定。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 解决 illegal_contact 爆炸性惩罚
+
+**Problem:** illegal_contact 惩罚 recent_mean=-17.40/ep，worst=-815/ep。随着捕获行为成熟，与 NovaCarter 的接触不可避免，但 penalty=1.0 × 接触步数会产生巨额负奖励，破坏捕获的正奖励信号。
+
+**Root cause:** NovaCarter 碰撞几何的 ContactSensor 在近距追踪时持续触发，contact_sensor_threshold=5N 无法过滤轻微接触。
+
+**Proposed Changes:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Option A（推荐）：`illegal_contact_penalty`: 1.0 → 0.1（降低单次惩罚幅度，保留信号）
+- Option B：`contact_sensor_threshold`: 5.0 → 15.0N（提高过滤门槛，减少触发频率）
+- Option C（最激进）：将 `illegal_contact_penalty` 设为 0（完全关闭）并观察行为
+- **推荐选 Option A + B 同时应用**：`penalty 1.0→0.1` + `threshold 5→15N`
+
+**Rationale:** 捕获行为成功已经建立，但 illegal_contact 爆炸在破坏后期收敛。worst=-815 表明存在持续接触（不是离散碰撞），5N 阈值过低导致振动/接近都被计为违规接触。
+
+---
+
+### Priority 2 (HIGH): 解决 crash / falcon_fly_low 俯冲坠机问题
+
+**Problem:** crash 终止 recent=0.43/rollout，fly_low 终止 recent=0.34/rollout，合计 0.77/rollout。策略在接近地面 NovaCarter 时存在俯冲至过低高度的行为。
+
+**Proposed Changes:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `height_penalty_threshold`: 1.5 → 1.2m（适度收紧，但不回到 1.0m 的爆炸阈值）
+  - 理由：1.5m 允许 drone 飞到 z=1.0m（2.5-1.5），太接近地面（NovaCarter top≈0.4m + 安全余量）
+  - 1.2m 约束 drone 在 z≥1.3m，提供 0.9m 安全余量
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 检查 `fly_low_threshold` 的具体值——是否需要提高以更早拦截俯冲（如从当前值上调 0.1-0.2m）
+
+**Rationale:** crash 和 fly_low 在 step 240k→320k 周期性出现，说明策略进入"接近→坠机→重置→再接近"循环，而非稳定学习。适度收紧 height_penalty 可以在不引发爆炸的前提下引导策略保持更高飞行高度。
+
+**注意：** 不能回到 1.0m（Run 9 的错误），1.2m 是合理折中。
+
+---
+
+### Priority 3 (HIGH): 调整 entropy_loss_scale 抑制 policy_std 过度上升
+
+**Problem:** policy_std=1.595，远超健康范围（目标 0.8-1.0）。过高的探索随机性导致已学到的捕获行为难以稳定复现，all_targets_captured 波动大。
+
+**Proposed Changes:**
+- File: `scripts/skrl/train.py` 或 MAPPO agent 配置
+- `entropy_loss_scale`: 0.005 → 0.002（适度降低熵激励）
+- 或：添加 `entropy_annealing`：在 200k steps 后从 0.005 线性衰减至 0.001
+
+**Rationale:** entropy=0.005 在 Run 7-9 维持了稳定的 policy_std=0.82-0.99，适合探索阶段。现在 Run 10 首次实现捕获，应从"探索优先"转向"收敛优化"。降低熵惩罚让策略能在已发现的成功轨迹附近收敛。
+
+---
+
+### Priority 4 (MEDIUM): 监控 upright_penalty 趋势，暂不修改
+
+**Problem:** upright_penalty recent=-3.09/ep（vs Run 9 recent=-1.88），但与 tracking_reward 的比值在改善（tracking/|upright| = 4.37），说明相对压力在降低。
+
+**Decision:** 暂不修改 upright_penalty 参数。在 Run 11 继续观察：若 `|upright|/tracking > 0.3`，则考虑进一步放宽阈值至 cos45°=0.707。
+
+---
+
+### Priority 5 (LOW): 考虑 success_reward_weight 从 0.0 启用
+
+**Problem:** success_reward_weight=0.0，捕获成功没有额外奖励。all_targets_captured 已经稳定出现（recent=0.39/rollout），现在应该给予正向激励强化捕获行为。
+
+**Proposed Changes:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `success_reward_weight`: 0.0 → 5.0（给予捕获一次性奖励，强化该行为）
+
+**Rationale:** 捕获信号已经通过 tracking_reward 隐式存在，但 tracking_reward 是连续的（持续在捕获区内）。success_reward 是对"保持捕获"的一次性激励，可以引导策略专注于维持而非反复进出捕获区。
+
+---
+
+## Experiment Plan (Run 11)
+
+**核心目标：** 在首次捕获突破的基础上，解决 illegal_contact 爆炸和 crash 俯冲问题，推动捕获率从 40% 向 80%+ 稳定化。
+
+**修改清单（按优先级）：**
+
+1. **CRITICAL：** `illegal_contact_penalty`: 1.0 → 0.1
+2. **CRITICAL：** `contact_sensor_threshold`: 5.0 → 15.0N
+3. **HIGH：** `height_penalty_threshold`: 1.5 → 1.2m
+4. **HIGH：** `entropy_loss_scale`: 0.005 → 0.002
+5. **LOW：** `success_reward_weight`: 0.0 → 5.0
+
+**保留所有 Run 10 有效配置：**
+- `bounding_box_threshold = 10.0m`（已验证，-45% bounding_box 终止）
+- `upright_penalty_threshold = 0.766`（cos40°），`weight = 0.5`（暂不动）
+- `height_penalty_threshold = 1.5m`（由 1.5 → 1.2 是本次调整）
+- `boundary_soft_threshold = 8.0m`，`weight = 2.0`
+- `capture_distance = 3.0m`（XY only）
+- `drone_spawn_x_range = (-4, -2)`
+- `tracking_reward_weight = 4.0`
+
+**训练命令：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**监控指标（前 100k steps，2048 envs 约等于 32 envs 的 64x 数据量）：**
+- illegal_contact 奖励：应 < -1.0/ep（vs Run 10 recent=-17.4）
+- crash 终止：应 < 0.1/rollout（vs Run 10 recent=0.43）
+- falcon_fly_low：应 < 0.05/rollout（vs Run 10 recent=0.34）
+- all_targets_captured：应 > 0.5/rollout 且稳定（vs Run 10 recent=0.39，波动大）
+- tracking_reward：应继续上升，不应因 illegal_contact 降权而退步
+- policy_std：应从当前 1.595 回落至 0.8-1.0 范围
+- episode_len_mean：应超过 500 steps（vs Run 10 recent=484）
+
+**成功标准（Run 11）：**
+- illegal_contact < -1.0/ep（解决爆炸）
+- crash < 0.1/rollout（解决俯冲坠机）
+- all_targets_captured > 0.5/rollout 且 std < 0.2（稳定捕获）
+- policy_std 回落至 0.9-1.1 范围
+- tracking_reward > 15.0/ep（vs Run 10 recent=13.52）
+
+---
+
+## Changelog（续）
+
+- 2026-04-05（run 2026-04-04_22-19-19，400k steps，Run 10，num_envs=32）：height_threshold 1.0→1.5 + bounding_box 12→10m + upright cos40°/weight 0.5
+  - **决定性突破：首次捕获成功**：all_targets_captured 在 step 154300 首次出现，recent=0.39/rollout，best rollout=1.38/rollout（约38%的 rollout 在1个以上时间窗口内实现捕获）
+  - **episode 长度历史最长**：mean_recent=484 steps（+123% vs Run 9 peak 263），best=2376 steps（+803%），接近 episode 最大 6000 步的 40%
+  - **tracking_reward 大幅提升**：last=23.87/ep（+250% vs Run 9 last=6.82），recent_mean=13.52/ep（+98%）
+  - **bounding_box 终止显著改善**：1.0 → 0.55/rollout（-45%），bounding_box=10m 修改验证有效
+  - **height_penalty 部分改善**：recent=-2.98（vs Run 9 recent=-4.91，改善39%），threshold=1.5m 回调方向正确
+  - **新关键问题 1：illegal_contact 爆炸**：recent=-17.40/ep，worst=-815/ep，与捕获行为同步爆发——接近 NovaCarter 时 ContactSensor 持续触发（5N 阈值不足）
+  - **新关键问题 2：crash + fly_low 急增**：crash=0.43/rollout（+474%），fly_low=0.34/rollout（+486%），"接近→俯冲→坠机"模式在 2048 env 下将更严重
+  - **policy_std 过高**：0.99 → 1.595，超出健康范围，熵激励（0.005）在长 episode 后过度推动探索
+  - **下一步优先级**：illegal_contact_penalty 1.0→0.1 + threshold 5→15N + height_threshold 1.5→1.2m + entropy 0.005→0.002 + success_reward 启用
