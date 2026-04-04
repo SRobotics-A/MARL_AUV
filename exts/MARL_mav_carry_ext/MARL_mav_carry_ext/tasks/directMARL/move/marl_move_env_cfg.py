@@ -121,8 +121,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 1.0  # 阈值式惩罚：仅倾斜>35°时生效
-    upright_penalty_threshold = 0.819  # cos(35°)，低于此值才触发惩罚
+    upright_penalty_weight = 0.5  # 降低权重，避免过度抑制追踪机动
+    upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
@@ -130,7 +130,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
-    height_penalty_threshold = 1.0  # Meters，收紧阻断俯冲碰撞行为
+    height_penalty_threshold = 1.5  # Meters，回调至1.5m，避免惩罚爆炸
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
@@ -200,7 +200,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 终止条件阈值
     drone_collision_threshold = 0.6
-    bounding_box_threshold = 12.0  # 目标折返±8m + 4m安全余量
+    bounding_box_threshold = 10.0  # 缩小至10m，压缩动量冲越区间
     boundary_soft_threshold = 8.0  # 软惩罚触发边界（对齐目标折返点±8m）
     boundary_soft_penalty_weight = 2.0  # 加强：使软惩罚大于追踪收益
 
