@@ -6160,3 +6160,258 @@ python3 scripts/skrl/train.py \
   - **success = 0**：all_targets_captured 全程 0，episode 太短（max=3.23s）不够完成 hold
   - **policy_std 稳定 0.83**：entropy=0.005 再次验证
   - **下一步优先级**：Priority 1 强化 boundary_soft（0.5→2.0，阈值 9→8m）+ 修复俯冲/碰撞（height_threshold 1.5→1.0）；Priority 3 upright 阈值化
+
+---
+
+# Training Analysis Report — Run 9（2026-04-03_16-35-11）
+
+**Run:** 2026-04-03_16-35-11_mappo_torch_mappo
+**Date:** 2026-04-03
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Steps logged:** 400k
+**Status:** improving（分析器判断）
+
+## Training Metrics Summary
+
+| 指标 | Run 8 recent | Run 9 recent | Run 9 last |
+|------|------------|------------|----------|
+| total_reward_mean | +12.8 | +8.9 | +19.4 |
+| tracking_reward | 4.01/ep | 5.70/ep | 6.82/ep |
+| distance_reward | 5.24/ep | 6.59/ep | 7.93/ep |
+| height_penalty | -1.09/ep | -4.91/ep | -4.84/ep |
+| upright_penalty | -1.13/ep | -1.88/ep | -1.82/ep |
+| illegal_contact | -2.25/ep | -1.65/ep | -0.14/ep |
+| boundary_soft | -0.28/ep | -0.35/ep | ~0/ep |
+| drone_out | — | -1.58/ep | -3.25/ep |
+| bounding_box term | 0.95/rollout | 0.98/rollout | 1.0/rollout |
+| crash term | 0.12/rollout | 0.08/rollout | 0/rollout |
+| falcon_fly_low term | 0.09/rollout | 0.06/rollout | 0/rollout |
+| ep_len_mean | 222 steps | 217 steps | 199 steps |
+| ep_len_max | 291 steps | 276 steps | 263 steps |
+| all_targets_captured | 0 | ~0 | 0 |
+| success_reward | 0 | 0 | 0 |
+| policy_std | 0.83 | 0.99 | 0.99 |
+
+**奖励分解（Run 9 recent）：**
+
+| 分项 | 均值/ep |
+|------|--------|
+| distance_reward | +6.59 |
+| tracking_reward | +5.70 |
+| height_reward | +0.32 |
+| force_penalty | +0.46 |
+| body_rate_penalty | +0.37 |
+| height_penalty | -4.91 |
+| upright_penalty | -1.88 |
+| illegal_contact | -1.65 |
+| drone_out | -1.58 |
+| boundary_soft | -0.35 |
+| fly_low | -0.05 |
+| collision_penalty | -0.03 |
+| **total (approx)** | **+8.9** |
+
+## Observations & Findings
+
+### 1. height_penalty 爆炸性增大 — CRITICAL
+
+**Symptom:** height_penalty: Run 8 recent -1.09/ep → Run 9 recent **-4.91/ep**（增加 4.5x）。整个训练过程中持续在 -3.2 至 -5.8/ep 之间振荡，无收敛趋势。对比 height_reward 仅 +0.32/ep，height_penalty 已超过 tracking_reward 成为量级最大的负项。
+
+**Root Cause:** `height_penalty_threshold` 从 Run 8 的 1.5m 收紧至 Run 9 的 **1.0m**，但惩罚公式是线性的：`-weight × max(0, |z - desired| - threshold) × step_dt`。阈值收紧意味着任何超出 desired_height±1.0m（即 z<1.5m 或 z>3.5m）的偏差都触发惩罚，而追踪行为本身需要大量俯仰调整，频繁突破此范围。
+
+**Evidence:**
+- height_penalty 从第 1 步（-0.135/ep）到第 57k 步（-4.87/ep）迅速收敛到 -4.9 量级，并保持稳定，说明不是振荡噪声而是持续高偏差
+- height_reward（+0.32/ep）很低，说明无人机大量时间不在 desired_height=2.5m 处
+- Run 8 的 height_penalty_threshold=1.5m 时 height_penalty 为 -1.09/ep；收紧 0.5m 后代价增加 4.5x，意味着运动中高度偏差平均超出 threshold 约 2.7m/step × step_dt
+
+**Expected behavior:** height_penalty 应随训练收敛趋近于 0（无人机学会维持高度），而非稳定在高负值。当前情况说明策略无法或未将高度控制纳入优先学习目标。
+
+---
+
+### 2. bounding_box 终止问题未改善，boundary_soft 仍无效 — CRITICAL
+
+**Symptom:** bounding_box 终止：Run 8 recent=0.95/rollout → Run 9 recent=**0.98/rollout**，last=1.0/rollout（反而轻微恶化）。boundary_soft: Run 8 -0.28/ep → Run 9 recent -0.35/ep，last ≈ 0/ep。
+
+**Root Cause（关键发现）：** boundary_soft 在训练末期几乎清零（last=-0.002）但 bounding_box 终止仍达 1.0/rollout，说明两者**解耦**。无人机在末期已经不超过 8m 软边界（boundary_soft→0），但仍然触发 12m 硬边界（bounding_box=1.0）。
+
+**这意味着：** 超出 8m 软边界但未到 12m 硬边界的中间区域（8-12m）是终止的真实触发区。无人机在学会避开 8m 之后仍然能够快速冲到 12m，说明 `boundary_soft_penalty_weight=2.0 + threshold=8.0m` 的组合确实形成了 8m 处的软阻力，但在 8m 被弹回后仍有动量冲过 12m。
+
+**备选假设：** bounding_box 终止的主体是 **drone_out 惩罚**（-3.25/ep at last，recent -1.58/ep）而非 boundary_soft 触发区域。drone_out 是在 `abs(pos) > bounding_box_threshold=12m` 时立即触发的 step-wise 惩罚（weight=1.0/step），而 bounding_box_termination 是同一条件的终止版本。两者完全耦合。
+
+**Evidence 时序：**
+- boundary_soft @step 57k: -0.031 → @171k: -0.168 → @400k: -0.002（先增后减，末期接近 0）
+- bounding_box term @400k: 1.0（无改善）
+- drone_out @400k: **-3.25/ep**（比 recent 均值 -1.58 高 2x，末期单次 rollout 中飞出加剧）
+
+---
+
+### 3. 俯冲/碰撞问题得到改善 — HIGH（部分成功）
+
+**Symptom:** crash: Run 8 recent=0.12 → Run 9 recent=**0.075**（降低 37%）。falcon_fly_low: Run 8 recent=0.086 → Run 9 recent=**0.058**（降低 33%）。
+
+**Assessment:** `height_penalty_threshold` 从 1.5→1.0m（提前惩罚）+ `contact_sensor_threshold` 从 1.0→5.0N（过滤微接触）确实减少了坠机，但代价是 height_penalty 爆炸。换言之，俯冲行为被抑制了，但惩罚力度过强导致无人机高度控制混乱，未达到收紧后应有的"精准维持高度"效果。
+
+**Evidence:** crash/fly_low 在 Run 9 后期（step 285k, 342k）均出现 0.27/0.16 峰值再度上升，说明高度问题未被根本解决，只是暂时缓解。
+
+---
+
+### 4. tracking_reward 继续单调增长 — MEDIUM（正面指标）
+
+**Symptom:** tracking_reward: Run 8 recent=4.01/ep → Run 9 recent=**5.70/ep**，last=**6.82/ep**（+70% vs Run 8 recent）。distance_reward: 5.24 → 6.59 → 7.93。
+
+**Assessment:** XY 追踪能力持续改善，单调上升趋势保持。这证明追踪奖励信号健康有效。但由于 height_penalty（-4.91/ep）的拖累，总奖励 recent mean 从 Run 8 的 +12.8 降低到 Run 9 的 +8.9，实际净改善被高度惩罚抵消。
+
+---
+
+### 5. upright_penalty 阈值化效果有限 — MEDIUM
+
+**Symptom:** upright_penalty: Run 8 recent -1.13/ep（weight=0.3 linear）→ Run 9 recent **-1.88/ep**（weight=1.0 threshold-based）。
+
+**Analysis:** 阈值化（cos35°=0.819）配合 weight=1.0 后，惩罚量增加了 66%，而不是减少。说明策略的倾斜程度仍然超过 35° threshold 的时间相当长，且 weight 增大直接放大了惩罚。
+
+**Root cause:** 追踪能力越强（tracking 6.82/ep），无人机需要的横向加速越大，倾斜角越大，upright_penalty 越重。这是追踪进步的附带代价，不可完全消除，但可以通过放宽阈值（cos30°=0.866 → cos40°=0.766）或降低 weight 来调整。
+
+---
+
+### 6. episode 长度不升反降，未超越 Run 8 峰值 — HIGH
+
+**Symptom:** ep_len_mean: Run 8 recent=222 → Run 9 recent=217（-2%）。ep_len_max: Run 8 best=291 → Run 9 best=263（-9.6%）。
+
+**Root Cause:** height_penalty 的爆炸性增大（-4.91/ep）直接影响总奖励，同时高度惩罚不导致终止，但可能通过 value function 影响策略学习稳定性。更直接的原因是 bounding_box 终止仍≈1/rollout，每个 rollout 至少一次提前终止，严重限制 episode 长度上限。
+
+---
+
+### 7. all_targets_captured 仍为 0，首次捕获未实现 — HIGH
+
+**Symptom:** all_targets_captured: 全程 0（recent ≈0.0001，极偶发）。success_reward=0。
+
+**Root Cause:** bounding_box 仍然是主要终止原因（~1/rollout）。episode 在超出边界前即终止，无法完成 capture hold 时间要求。ep_len_max=263 steps（约 2.6s），如果 hold_duration≥3s，从数学上不可能成功。
+
+---
+
+### 8. policy_std 显著提升 — 中性/正面
+
+**Symptom:** policy_std: Run 8 stable 0.83 → Run 9 stable **0.99**（接近初始化上界 1.0）。
+
+**Assessment:** entropy=0.005 仍然有效，但 std 比 Run 8 高 0.16，说明探索更充分。这可能是 height_penalty 爆炸引入的不确定性造成策略在高度维度更随机，而非主动探索改善。
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 回调 height_penalty_threshold，解决高度惩罚爆炸
+
+**Problem:** height_penalty_threshold=1.0m 导致 height_penalty=-4.91/ep，超过 tracking_reward 成为最大单项负惩罚，严重压制总奖励改善，且未能阻止 crash/fly_low 复发（步骤 285k 峰值重现）。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `height_penalty_threshold = 1.0` → `1.5`（回到 Run 8 的有效值）
+- Rationale: Run 8 的 1.5m threshold 时 height_penalty=-1.09/ep，是可接受的惩罚水平，且 crash/fly_low 问题在 Run 8 是在训练进行到 248k 步后才出现的，说明 1.5m threshold 在早中期是足够的约束。crash/fly_low 的根本解决需要辅助手段（见 Priority 2），而非单纯收紧阈值。
+
+**备选方案（若 crash 持续）：** 增加 `fly_low` 终止条件（z < 0.5m 直接终止，而非仅惩罚），彻底阻断俯冲路径。
+
+---
+
+### Priority 2 (CRITICAL): 解决 bounding_box 终止的根本原因
+
+**Problem:** bounding_box 终止 ≈1/rollout 在 9 次训练中持续存在，Run 9 末期反而恶化到 1.0/rollout，episode 长度无法突破 300 steps。`boundary_soft_penalty_weight` 从 0.5 增大到 2.0 几乎无效果：boundary_soft 末期接近 0（无人机绕开 8m），但仍因动量冲到 12m 触发 bounding_box。
+
+**Root cause:** 当前的 bounding_box_threshold=12m 与 boundary_soft_threshold=8m 之间存在 **4m 动量缓冲区** 不足以让高速无人机（3-5m/s）减速。更根本地：追踪 ±8m 折返目标的策略本身要求无人机在折返点迅速制动，但没有向心加速的惩罚约束。
+
+**Proposed Changes（两选其一）：**
+
+**方案 A — 缩小 bounding_box（消除动量区）：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `bounding_box_threshold = 12.0` → `10.0`（仅保留 2m 超调余量）
+- Parameter: `boundary_soft_threshold = 8.0`（保持）
+- Rationale: 减少 4m 缓冲区为 2m，无人机必须更快响应软边界，减少动量穿越。
+
+**方案 B — 添加速度惩罚（接近软边界时惩罚高速）：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在 boundary_soft 计算区域内（8-12m），额外添加 `velocity_boundary_penalty = -weight × xy_speed × soft_excess_fraction`
+- Rationale: 让高速冲出边界的代价大于追踪收益。
+
+**推荐方案 A**，因为实现简单，且 boundary_soft=8m 已证明有效（boundary_soft末期归零），问题在于 4m 余量太大。
+
+---
+
+### Priority 3 (HIGH): 将 upright_penalty 权重从 1.0 降回 0.5，或放宽阈值角度
+
+**Problem:** upright_penalty Run 9 recent=-1.88/ep（vs Run 8 -1.13/ep），weight=1.0 threshold-based 比 weight=0.3 linear 实际惩罚更重。追踪任务要求无人机倾斜超过 35°，threshold-based 方案仍然惩罚了必要的追踪倾斜。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `upright_penalty_weight = 1.0` → `0.5`
+- Parameter: `upright_penalty_threshold = 0.819`（cos35°）→ `0.766`（cos40°），给无人机更多追踪倾斜空间
+- Rationale: 当追踪需要倾斜 40° 时，35° 阈值仍然持续触发惩罚。放宽到 40° 只保护真正危险的大倾斜（>40°），同时减轻正常追踪动作的惩罚负担。
+
+---
+
+### Priority 4 (MEDIUM): 增大训练预算，监控首次捕获
+
+**Problem:** success_reward=0，all_targets_captured≈0。tracking_reward 单调上升趋势健康（6.82/ep at last, 增长未见平台期）。策略仍在有效学习，尚未到达 bounding_box 解决后的"能否捕获"阶段。
+
+**Proposed Change:**
+- 完成 Priority 1-3 修改后，运行 600k steps
+- 重点监控 `all_targets_captured > 0` 首次出现时刻
+- 如果 Priority 2 方案 A 生效（bounding_box 降至 <0.3/rollout），ep_len_mean 应超越 350 steps，满足 3s+ hold 时间要求
+
+---
+
+## Experiment Plan（Run 10）
+
+**Run 10 核心修改清单：**
+
+1. **CRITICAL — 回调 height_penalty_threshold（解决惩罚爆炸）：**
+   - `height_penalty_threshold`: 1.0 → 1.5
+   - File: `marl_move_env_cfg.py`
+
+2. **CRITICAL — 缩小 bounding_box（消除动量穿越区）：**
+   - `bounding_box_threshold`: 12.0 → 10.0
+   - File: `marl_move_env_cfg.py`
+
+3. **HIGH — 放宽 upright_penalty 阈值，降低权重：**
+   - `upright_penalty_threshold`: 0.819 → 0.766（cos40°）
+   - `upright_penalty_weight`: 1.0 → 0.5
+   - File: `marl_move_env_cfg.py`
+
+4. **保留所有 Run 9 有效修改：**
+   - `boundary_soft_threshold = 8.0`，`boundary_soft_penalty_weight = 2.0`
+   - `contact_sensor_threshold = 5.0N`
+   - `capture_distance = 3.0m XY`
+   - `entropy_loss_scale = 0.005`
+   - `tracking_reward_weight = 4.0`
+   - `drone_spawn_x_range = (-4, -2)`
+   - upright 阈值式计算逻辑（保留 cos 阈值结构，调参数）
+
+5. **训练命令：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+6. **监控指标（前 100k steps）：**
+   - height_penalty：应回到 -1.0 至 -2.0/ep 量级（vs Run 9 的 -4.9）
+   - bounding_box：应从 ~1.0 降至 <0.5/rollout（bounding_box_threshold 缩小效果）
+   - ep_len_mean：应超过 250 steps（vs Run 9 的 217）
+   - all_targets_captured：首次出现 >0 是关键里程碑
+   - tracking_reward：应继续上升，不应因 height_penalty 回调而退步
+
+**Run 10 成功标准：**
+- height_penalty < -2.0/ep（vs Run 9 的 -4.9）
+- bounding_box < 0.5/rollout（vs Run 9 的 ~1.0）
+- ep_len_mean > 250 steps
+- all_targets_captured > 0（首次捕获）
+- tracking_reward > 7.0/ep（继续上升趋势）
+
+## Changelog（续）
+
+- 2026-04-03（run 2026-04-03_16-35-11，400k steps，Run 9）：boundary_soft×4（0.5→2.0）+ threshold 8m + height_threshold 1.0 + contact 5N + upright 阈值化（cos35°, weight 1.0）
+  - **tracking_reward 持续突破**：Run 8 recent 4.01 → Run 9 recent **5.70/ep**，last **6.82/ep**（+70%），单调上升趋势健康
+  - **俯冲/碰撞部分改善**：crash 0.12→0.075（-37%），fly_low 0.09→0.058（-33%），但 285k/342k 步有复发峰值
+  - **height_penalty 爆炸性增大（新关键问题）**：-1.09/ep → **-4.91/ep**（4.5x 增大），height_penalty_threshold=1.0m 过严，无人机无法维持 2.5m ± 1.0m，追踪行为和高度控制产生冲突
+  - **bounding_box 未改善，反略恶化**：0.95 → 0.98/rollout，last=1.0；boundary_soft 末期归零（≈0）但 bounding_box 仍持续——证明 8m 软边界已被绕开，但 8-12m 动量区仍不够阻止穿越
+  - **upright_penalty 阈值化效果差**：-1.13 → -1.88/ep（增大 66%），weight=1.0 放大了 35° 以上的正常追踪倾斜
+  - **episode 长度未改善**：Run 8 peak 291 → Run 9 peak **263**（-9.6%），mean 222 → 217
+  - **success = 0**：all_targets_captured 仍为 0
+  - **policy_std 提升**：0.83 → 0.99，探索空间更大（也可能是 height_penalty 不确定性导致）
+  - **下一步优先级**：height_threshold 回调（1.0→1.5）+ bounding_box 缩小（12→10m）+ upright 阈值放宽（cos35°→cos40°, weight 1.0→0.5）
