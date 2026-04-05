@@ -7511,3 +7511,218 @@ python3 scripts/skrl/train.py \
   - **drones_collide 改善微弱**: collision_penalty×2 仅减少 8%，根因是策略方差收缩后行为趋同，单纯惩罚效果有限
   - **upright_penalty 末期恶化**: decile10=-1.97（vs decile1=-0.20），捕获阶段激进机动导致倾斜，需提升 weight 0.5→0.8
   - **KEY NEXT**: 修复 success_reward 代码注释（CRITICAL）+ fly_low_penalty 3→4 + contact_threshold 15→20N + upright_weight 0.5→0.8
+
+---
+
+# Training Analysis Report — Run 13 重新验证
+
+**Run:** 2026-04-05_23-37-49_mappo_torch_mappo
+**Date:** 2026-04-05（重新分析于 2026-04-05）
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Total steps:** 375,900
+**num_envs:** 32
+
+## Training Metrics Summary
+
+| 指标 | early_mean | recent_mean | last | d10 | d50 | d90 |
+|------|-----------|-------------|------|-----|-----|-----|
+| total_reward_mean | 1.51 | 29.04 | 42.51 | 2.68 | 17.57 | 32.73 |
+| total_reward recent_std | — | 55.42 | — | — | — | — |
+| distance_reward | 1.81 | 7.99 | 9.48 | 1.80 | 5.36 | 7.77 |
+| tracking_reward | 1.33 | 7.43 | 8.38 | 1.31 | 4.33 | 7.28 |
+| success_reward | 0.00 | **0.00** | 0.00 | 0.00 | 0.00 | 0.00 |
+| height_reward | 0.16 | 0.44 | 0.48 | 0.16 | 0.36 | 0.45 |
+| height_penalty | -1.31 | -1.90 | -2.36 | -2.44 | -1.02 | -0.39 |
+| upright_penalty | -0.31 | -1.70 | -1.91 | -1.57 | -1.19 | -0.37 |
+| illegal_contact | -0.01 | -0.85 | -0.09 | -0.38 | -0.07 | 0.00 |
+| collision_penalty | -0.02 | -0.24 | -0.26 | -0.40 | 0.00 | 0.00 |
+| fly_low | -0.01 | -0.50 | -0.38 | -0.72 | -0.06 | 0.00 |
+| all_targets_captured/ep | 0.00 | 1.020 | 1.00 | 0.00 | 0.69 | 1.06 |
+| crash/ep | 0.01 | 0.228 | 0.17 | 0.00 | 0.06 | 0.33 |
+| falcon_fly_low/ep | 0.00 | 0.174 | 0.17 | 0.00 | 0.02 | 0.26 |
+| bounding_box/ep | 1.16 | 0.756 | 0.79 | 0.66 | 0.98 | 1.20 |
+| drones_collide/ep | 0.01 | 0.129 | 0.13 | 0.00 | 0.00 | 0.21 |
+| policy_std | 0.815 | 0.759 | 0.756 | 0.726 | 0.751 | 0.816 |
+| illegal_contact min spike | — | — | — | — | -292.77 | — |
+
+## 代码 Bug 验证结论
+
+**结论：上次分析的代码 bug 描述完全属实，且经本次直接代码阅读确认。**
+
+### 直接证据
+
+文件 `marl_move_env.py` 第 726-727 行：
+
+```python
+# Success Reward (Removed)
+# rewards["success_reward"] = ...
+```
+
+- `rewards["success_reward"]` 从未被赋值，该 key 永远不会进入 `rewards` 字典
+- 第 862 行 `total_reward = sum(rewards.values())` 不包含 success_reward
+- 第 864-868 行 `_episode_sums` 累积循环只遍历 `rewards.items()`，success_reward 永远累积 0
+- TF 日志验证：`Episode_Reward/success_reward` 全程 3759 个数据点，sum=0.0，non-zero count=0
+
+### all_targets_captured 为何不触发 success_reward
+
+`all_targets_captured` 是一个终止条件标志（bool tensor），不是奖励触发器。其流程：
+
+1. `_compute_rewards()` 中：`self.all_targets_captured = (self._sustained_follow_timer >= cfg.sustained_follow_duration)` — 仅设置 bool flag
+2. `rewards["success_reward"] = ...` 被注释 → **奖励路径完全断路**
+3. `_get_dones()` 中：`all_targets_captured` 触发 `terminated=True` → episode 结束
+4. episode 结束时 `_episode_sums["success_reward"]` 记录的是 0（从未累积过任何值）
+
+因此：**大量捕获事件（all_targets_captured recent_mean=1.020）正在发生，但每次捕获带来的奖励信号为零**。策略学到了捕获行为，完全是 distance_reward + tracking_reward 驱动的，没有任何 sparse success bonus 加强。
+
+## Observations & Findings
+
+### 1. success_reward 完全断路 — Severity: CRITICAL
+
+**Symptom:** TF 中 `Episode_Reward/success_reward` 全程为 0，即使 `all_targets_captured` recent_mean=1.020，每 rollout 平均触发 1 次以上捕获成功。
+
+**Root Cause:** `marl_move_env.py` 第 727 行 `rewards["success_reward"] = ...` 被注释。`success_reward_weight=5.0` 在 cfg 中已配置，但代码执行路径不存在。
+
+**Impact:** 策略缺少捕获行为的稀疏正反馈强化。策略已能捕获（由 dense rewards 驱动），但每次成功没有额外奖励信号，无法进一步加速捕获节奏的强化或提升捕获质量。
+
+### 2. height_penalty 持续增加 — Severity: HIGH
+
+**Symptom:** height_penalty early=-1.31 → recent=-1.90 → last=-2.36，全程负增长，decile10=-2.44。
+
+**Root Cause:** 无人机在接近目标时需要俯冲（targets 在地面附近），`height_penalty_threshold=1.2m` 与 `desired_height=2.5m` 组合意味着无人机只要 z<1.3m 或 z>3.7m 就被惩罚。捕获行为本身要求低飞，与 height_penalty 存在结构性冲突。
+
+**Evidence:** height_penalty last=-2.36，比 tracking_reward last=8.38 的 28% 抵消了正向信号。
+
+### 3. upright_penalty 末期持续恶化 — Severity: HIGH
+
+**Symptom:** upright_penalty early=-0.31 → recent=-1.70 → last=-1.91，d10=-1.57，min=-78.81。
+
+**Root Cause:** 捕获阶段无人机进行激进机动，倾斜角超过 40°（upright_penalty_threshold=0.766=cos40°）。随着捕获频率增加，违规次数线性增长。
+
+**Evidence:** recent_std=2.86，有大量极端倾斜事件（min=-78.81）。
+
+### 4. illegal_contact 极端 spike — Severity: HIGH
+
+**Symptom:** illegal_contact min=-292.77，recent_mean=-0.85，recent_std=10.84。
+
+**Root Cause:** `contact_sensor_threshold=15N` 过敏感，导致接近捕获时的正常机械接触触发极端惩罚，与捕获行为产生矛盾梯度。
+
+**Evidence:** min=-292.77 表明单步出现约 2928 次非法接触或极高力值（illegal_contact_penalty=0.1，但 spike 达到 -292 意味着 max_f 极度超阈值）。
+
+### 5. bounding_box 终止率仍然偏高 — Severity: MEDIUM
+
+**Symptom:** bounding_box recent_mean=0.756/ep，d90=1.20，仅从 early=1.156 略有下降。
+
+**Root Cause:** targets 做 ±8m 折返运动，无人机跟随过程中容易越出边界。boundary_soft_penalty 效果有限（recent_mean=-0.54）。
+
+### 6. drones_collide 改善有限 — Severity: MEDIUM
+
+**Symptom:** drones_collide recent_mean=0.129，collision_penalty×2 后仅从 0.140（Run 12 推算）降低约 8%。
+
+**Root Cause:** 策略方差收缩（policy_std=0.759）后行为趋同，3 架无人机倾向于追同一目标，碰撞本质是探索不足而非单纯惩罚不够。
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 修复 success_reward 代码注释
+
+**Problem:** `rewards["success_reward"]` 永远为 0，`success_reward_weight=5.0` 的配置毫无作用。
+
+**Proposed Change:**
+
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- **Location:** 第 726-727 行
+- **Change:**
+
+```python
+# 替换为：
+rewards["success_reward"] = (
+    self.all_targets_captured.float() * self.cfg.success_reward_weight
+)
+```
+
+- **Rationale:** `all_targets_captured` 已是 bool tensor，直接 `.float()` 乘权重即可。成功时给予 5.0 一次性奖励，与 episode 终止挂钩，强化已建立的捕获行为。
+
+### Priority 2 (HIGH): 放宽 contact_sensor_threshold 消除极端 spike
+
+**Problem:** illegal_contact min spike=-292.77，与捕获行为产生梯度冲突。
+
+**Proposed Change:**
+
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `contact_sensor_threshold` → 搜索当前值（Run 13 为 15N）→ 改为 `20.0`
+- **Rationale:** 放宽接触阈值减少误触发，保留真实碰撞检测能力。
+
+### Priority 3 (HIGH): 提升 upright_penalty_weight 抑制激进倾斜
+
+**Problem:** upright_penalty recent=-1.70，末期持续恶化，捕获阶段倾斜频繁。
+
+**Proposed Change:**
+
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `upright_penalty_weight` `0.5` → `0.8`
+- **Rationale:** 提升惩罚强度，阻止激进倾斜，同时 threshold 维持 cos40°=0.766 不变（不过分收紧）。
+
+### Priority 4 (HIGH): 加强 fly_low_penalty 抑制低飞
+
+**Problem:** fly_low recent=-0.50，falcon_fly_low/ep recent=0.174，低飞率高，干扰 sustained_follow_timer。
+
+**Proposed Change:**
+
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `fly_low_penalty` `3.0` → `4.0`
+- **Rationale:** 进一步惩罚低飞行为，减少 hold 窗口被低飞终止中断的频率。
+
+### Priority 5 (MEDIUM): 调整 height_penalty_threshold 缓解捕获-高度冲突
+
+**Problem:** height_penalty 末期 last=-2.36，接近目标的俯冲行为被 height_penalty 持续惩罚。
+
+**Proposed Change:**
+
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `height_penalty_threshold` `1.2` → `1.5`（允许更大俯冲幅度，但不超过安全下限）
+- **Rationale:** 放宽 0.3m 允许无人机俯冲至 z=1.0m 时才触发惩罚（desired=2.5m，threshold=1.5m → 触发点 z<1.0m），与 fly_low 终止点（z<0.1m）之间保留足够缓冲。
+
+## Run 14 参数汇总
+
+| 参数 | Run 13 | Run 14 | 原因 |
+|------|--------|--------|------|
+| `rewards["success_reward"]`（代码） | 注释（断路） | **取消注释，实现为 all_targets_captured * weight** | CRITICAL：修复正反馈断路 |
+| `fly_low_penalty` | 3.0 | 4.0 | 减少低飞终止中断 hold 窗口 |
+| `contact_sensor_threshold` | 15N | 20N | 消除 illegal_contact 极端 spike |
+| `upright_penalty_weight` | 0.5 | 0.8 | 抑制捕获阶段激进倾斜 |
+| `height_penalty_threshold` | 1.2m | 1.5m | 缓解俯冲捕获与高度惩罚的结构性冲突 |
+| `success_reward_weight` | 5.0（cfg 已有）| 5.0（保持）| 代码修复后生效 |
+| `collision_penalty_scale` | 2.0 | 2.0 | 保持，观察 success_reward 修复效果 |
+| `entropy_loss_scale` | 0.004 | 0.004 | policy_std=0.759 正常，保持 |
+| `sustained_follow_duration` | 0.5s | 0.5s | 捕获已充分（1.020/rollout），保持 |
+
+## Experiment Plan
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --algorithm="MAPPO"
+```
+
+1. 优先修复 success_reward 代码（Priority 1），验证最简单改动
+2. 同步应用 Priority 2-4（contact_threshold + upright_weight + fly_low_penalty）
+3. Priority 5（height_penalty_threshold）可选，若前4项稳定后再追加
+4. 运行至少 400k steps，观察 success_reward 是否在 50k steps 内出现非零值
+
+### 监控目标（Run 14）
+
+1. `Episode_Reward/success_reward` — 目标：50k steps 内出现非零，recent_mean > 0.5/ep
+2. `Episode_Termination/all_targets_captured` — 目标：维持 d50 > 0.69/rollout（不退化）
+3. `Episode_Reward/illegal_contact` min spike — 目标：> -20（放宽阈值后应消除极端值）
+4. `Episode_Reward/upright_penalty` recent_mean — 目标：> -1.2（从 -1.70 改善）
+5. `Episode_Reward/height_penalty` recent_mean — 目标：> -1.5（从 -1.90 改善）
+6. `Reward / Total reward (mean)` recent_std — 目标：< 40（从 55.42 收窄）
+
+### 成功标准（Run 14 达成条件）
+
+- `success_reward` recent_mean > 0.5/ep（代码修复后的首要验证指标）
+- `all_targets_captured` d50 > 0.69/rollout（维持 Run 13 水平）
+- `illegal_contact` min spike > -20（无极端污染）
+- `upright_penalty` recent_mean > -1.2
+- `height_penalty` recent_mean > -1.5
+- `total_reward` recent_std < 40
