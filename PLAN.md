@@ -6969,3 +6969,331 @@ Watch these metrics in real-time:
   - **drones_collide WORSENING**: 0.139 → 0.195/rollout (+40%), new emerging problem as std drops
   - **INSIGHT: entropy_scale=0.002 overcorrected** — std collapsed too fast, eliminating capture approach diversity before the 3s hold criterion was ever reached
   - **KEY LESSON**: success_reward=5.0 requires captures to fire. captures require 3s hold. 3s hold at ep_len=323 mean is 93% of episode — structurally near-impossible. Reducing sustained_follow_duration 3.0→1.5s is the critical unlock for Run 12.
+
+
+---
+
+# Training Analysis Report — Move Task Run 12
+
+**Run:** 2026-04-05_15-55-42_mappo_torch_mappo
+**Analysis Date:** 2026-04-05
+**Total Steps:** 400,000
+**Task:** Isaac-marl-move-v0 (MARL NovaCarter follow)
+**Algorithm:** MAPPO (num_envs=32)
+
+---
+
+## Run 12 参数变更回顾
+
+| 参数 | Run 11 | Run 12 | 目标 |
+|------|--------|--------|------|
+| sustained_follow_duration | 3.0s | **1.5s** | 使 success_reward 在 ep_len≈323步 下可达 |
+| fly_low_penalty | 1.0 | **2.0** | 遏制"接近→俯冲→坠机"循环 |
+| drone_spawn_y_range | (-3,3) | **(-4,4)** | 减少初始 drones_collide |
+| entropy_loss_scale | 0.002 | **0.003** | 避免过早 std 收敛 |
+
+---
+
+## Training Metrics Summary
+
+| 指标 | Early (Q1) | Recent (Q5) | Last | Best |
+|------|-----------|-------------|------|------|
+| total_reward_mean | 2.27 | 38.99 | **57.19** | 68.38 |
+| tracking_reward | 1.63/ep | 9.17/ep | **11.60/ep** | 15.25/ep |
+| distance_reward | 2.24/ep | 9.20/ep | **11.57/ep** | 16.30/ep |
+| all_targets_captured | 0.000/rollout | 0.710/rollout | **1.41/rollout** | 1.74/rollout |
+| success_reward | 0.000/ep | 0.000/ep | **0.000/ep** | 0.000 |
+| crash (term) | 0.037 | 0.269 | 0.720 | — |
+| falcon_fly_low (term) | 0.021 | 0.199 | 0.700 | — |
+| crash+fly_low combined | 0.058 | 0.469 | **1.42** | — |
+| drones_collide (term) | 0.014 | 0.140 | 0.590 | — |
+| bounding_box (term) | 1.117 | 0.718 | **0.240** | — |
+| height_penalty | -1.83/ep | -1.92/ep | -1.60/ep | — |
+| upright_penalty | -0.33/ep | -1.79/ep | -2.28/ep | — |
+| policy_std | 0.777 | 0.634 | **0.627** | 0.829 |
+| ep_len_mean | 109.6 | 286.8 | **375.4** | 2423.8 |
+| ep_len_max | 149.6 | 471.3 | **500.0** | 5999.0 |
+
+---
+
+## 核心问题分析
+
+### 1. all_targets_captured 强力恢复 — Severity: RESOLVED (MILESTONE)
+
+**Run 11 遗留问题：** all_targets_captured 0.39→0.027/rollout（-93%），根因为 sustained_follow_duration=3.0s=300步，ep_len_mean=323步，结构上不可达。
+
+**Run 12 结果：**
+- all_targets_captured 首次出现非零：step 79,000（val=0.04）
+- Q3 [160k-240k]: mean=0.066，Q4: mean=0.281，Q5: mean=0.710
+- 最后20步：稳定在 0.52–1.41/rollout 范围，step 400000 = **1.41/rollout**
+- 历史最高：1.74/rollout
+
+**verdict: sustained_follow_duration 3.0→1.5s 是正确修复**，解锁了 Run 11 被结构性阻断的捕获行为。Q5 mean=0.71/rollout 相比 Run 10 recent=0.39/rollout **提升了 82%**，相比 Run 11 recent=0.027/rollout 提升 **2530%**。
+
+**但 success_reward 依然全程为 0 — 见问题 2。**
+
+---
+
+### 2. success_reward 仍为零 — Severity: CRITICAL
+
+**症状：** success_reward = 0.000/ep，全程 4000 条记录，无一非零。all_targets_captured 在 Q5 均值达 0.71 的情况下，success_reward 依然无法触发。
+
+**根因分析：**
+
+sustained_follow_duration=1.5s = 150步。当前 ep_len_mean（Q5）= 286.8步，理论上 150步占 52%，应该可达。但需要考虑以下因素：
+
+1. **crash+fly_low 在高捕获阶段同步恶化**：Q5 combined mean=0.469，最后20步中出现10次 >1.0 的高值（step 399600: 1.62, step 400000: 1.42）。捕获行为发生时，接近动作触发俯冲→坠机，打断 1.5s 的持续跟随计时。
+
+2. **ep_len 方差极大**：Q5 range = [120.8, 2423.8]，std=89.5。episode 极度不均匀。ep_len_max=2423.8 的大 episode 里理论上 1.5s 可达，但 median 更可能在 250-300 步范围。
+
+3. **all_targets_captured 与 crash+fly_low 强正相关**：Q5详细数据显示，高捕获（>1.0）的同一时刻，crash+fly_low 通常也高（例如 step 397100: captured=1.03, crash+fly=1.06；step 399600: captured=1.03, crash+fly=0.31）。说明接近捕获的动作本身就在触发低飞惩罚。
+
+4. **success_reward 激活机制**：需要在 captured 状态下连续保持 150步（1.5s @ 100Hz），而此时 crash/fly_low 随时中断计时重置。
+
+**最可能根因：** fly_low_penalty=2.0 虽然加倍，但仍不足以彻底阻止"接近→俯冲"行为。此行为在捕获阶段（接近期）高度活跃，使 success_reward 的 150步持续保持窗口被频繁中断。
+
+---
+
+### 3. crash/fly_low 未得到根本改善 — Severity: HIGH
+
+**Run 11 遗留问题：** combined crash+fly_low = 0.68/rollout（Q5）。
+
+**Run 12 结果：**
+
+| 阶段 | combined crash+fly_low |
+|------|----------------------|
+| Q1 [0-80k] | 0.058 |
+| Q2 [80k-160k] | 0.385 |
+| Q3 [160k-240k] | 0.357 |
+| Q4 [240k-320k] | 0.130 |
+| Q5 [320k-400k] | **0.469** |
+
+- Run 11 Q5 recent mean = 0.681
+- Run 12 Q5 recent mean = 0.469 (**-31%，有改善**)
+- 但最后20步中有10次 >1.0，最高达 1.62/rollout
+
+**verdict：fly_low_penalty 2.0 相比 1.0 有统计改善（-31%），但末期仍有严重高峰**。Q4（240k-320k）出现了 mean=0.130 的低谷（对应捕获大爆发、ep_len 稳定期），之后 Q5 反弹到 0.469，说明随着捕获行为更积极，低飞问题也同步加剧。
+
+**fly_low reward 的 Q5 mean = -0.376/ep**，比 Q2(-0.287)、Q3(-0.292) 更差。fly_low_penalty=2.0 改变了幅度但未改变趋势。
+
+---
+
+### 4. drones_collide 改善不显著 — Severity: MEDIUM
+
+**Run 11 遗留问题：** drones_collide 0.139→0.195/rollout，单调上升（Q1→Q5 上升 48x）。
+
+**Run 12 结果（quintile）：**
+
+| 阶段 | drones_collide |
+|------|---------------|
+| Q1 | 0.014 |
+| Q2 | 0.058 |
+| Q3 | 0.065 |
+| Q4 | 0.090 |
+| Q5 | **0.140** |
+
+- Q5 mean = 0.140 vs Run 11 Q5 = 0.195（**-28%，小幅改善**）
+- 但仍呈单调上升趋势（Q1→Q5）
+- 最后20步：最高达 0.59/rollout（step 400000）
+
+**verdict：drone_spawn_y_range 扩大到 (-4,4) 产生了一定的初始分离效果（Q1 从 Run 11 的 ~0.014 持平，但 Q5 从 0.195 降至 0.140）。然而单调上升趋势未被阻断。** 根因仍是 policy_std 持续下降导致轨迹趋同。
+
+---
+
+### 5. policy_std 继续单调下降 — Severity: HIGH
+
+**目标：** 保持在 0.65–0.75 的健康探索范围。
+
+**Run 12 结果：**
+
+| 阶段 | policy_std |
+|------|-----------|
+| Q1 | 0.777 |
+| Q2 | 0.742 |
+| Q3 | 0.730 |
+| Q4 | 0.675 |
+| Q5 | **0.634** |
+
+- last = 0.627，recent_std = 0.009（极低，说明当前已在平台期）
+- entropy_loss Q5 mean = -0.00286（vs early = -0.00350，less negative = less exploration pressure）
+
+**verdict：entropy_scale=0.003 比 Run 11 的 0.002 有明确改善**——Run 11 的 std 崩溃是 1.595→0.597（降幅 62.6%），Run 12 从 0.777→0.627（降幅 19.3%）。降幅显著减小。
+
+但当前 std=0.627 仍在 0.65 目标以下，且仍在缓慢下降。Q5 recent_std 仅 0.009，说明 std 已趋稳（plateau），但稳在了 0.62-0.63，低于目标区间 0.65-0.75。
+
+**后果：** std=0.627 处于"可接受但略低"的范围。比 Run 11 的 0.597 好，但不如 Run 10 的 1.595（彼时过高）。当前 0.627 对应 drones_collide 上升趋势，是轨迹趋同的直接驱动力。
+
+---
+
+### 6. bounding_box 显著改善 — Severity: RESOLVED
+
+**Run 11 遗留问题：** bounding_box_threshold=10m，Q1→Q5 为 1.15→0.56/rollout（下降趋势）。
+
+**Run 12 结果：**
+- Q1: 1.117, Q2: 0.887, Q3: 0.851, Q4: 0.938, Q5: **0.718**
+- last = **0.240/rollout**（Run 12 末期已非常低）
+
+**verdict：bounding_box 持续改善，末期仅 0.24/rollout，已从主要终止原因（Run 6-9 时的 ~1.0/rollout）退出前列。** 这与 ep_len 提升（375步）一致——更长的 episode 意味着 drones 有更多机会维持在 10m 内。
+
+---
+
+### 7. ep_len 持续提升，异常峰值需关注 — Severity: MEDIUM
+
+- Q1 mean = 109.6步，Q5 mean = 286.8步，last = 375.4步
+- 最高峰：step 343100 → ep_len_mean = **2423.8步**（约 24 秒），单次异常突破
+- ep_len_max 末期 = 500步（截断 by max_episode_length）
+
+**verdict：** 整体 ep_len 趋势健康。step 343100 的 2423 步峰值是极端事件，可能是该 rollout 中大多数 env 都发生了很长的追踪序列（接近但未 crash）。这是正面信号，说明策略已能维持长时间无 OOB/crash 的追踪序列。
+
+---
+
+### 8. height_penalty 和 upright_penalty 持续累积 — Severity: MEDIUM
+
+**height_penalty：**
+- Q4 = -1.127/ep（最优），Q5 = -1.924/ep（回升）
+- 存在极端 spike（Q2 min=-32.5，Q5 min=-16.3）
+
+**upright_penalty（cos40°=0.766，weight=0.5）：**
+- Q1=-0.334 → Q5=-1.793（单调上升 5.4x）
+- 末期 last = -2.281/ep
+
+**verdict：** height_penalty 的 Q2 spike (-32.5) 说明偶发的极端高度偏差事件。upright_penalty 单调上升是追踪行为改善的伴生现象（越追越倾斜），此前已分析为物理约束而非设计问题。当前 tracking/|upright| 比值 = 9.17/1.79 = 5.12，比 Run 10 的 5.57 略差但仍为正向比值，不是训练的瓶颈。
+
+---
+
+## 整体学习曲线评估
+
+**状态：Improving（持续改善），但 success_reward 仍被 crash 机制阻断。**
+
+Run 12 是 12 个 run 中综合表现最强的 run：
+- tracking_reward 11.60/ep（历史最高）
+- all_targets_captured Q5=0.71/rollout（从 Run 11 的 0.027 恢复）
+- total_reward 57.19（首次进入 50+ 区间）
+- bounding_box 降至 0.24（近乎消除）
+- ep_len 375步，peak 2423步
+
+核心未解决问题：success_reward=0，crash+fly_low Q5=0.469（仍高），drones_collide 单调上升，policy_std 0.627（略低于目标）。
+
+---
+
+## Improvement Recommendations for Run 13
+
+### Priority 1 (CRITICAL): 解决 success_reward 无法触发
+
+**Problem：** all_targets_captured 已经在 Q5 达到 0.71/rollout，但 success_reward 全程为零。根因是 crash/fly_low 在捕获接近阶段频繁打断 1.5s 持续计时。
+
+**Proposed Changes：**
+
+**方案 A（推荐）— 降低 sustained_follow_duration 进一步到 0.5s：**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`（或 move 对应 cfg）
+- Parameter: `sustained_follow_duration: 1.5 → 0.5`（50步 @ 100Hz = ep_len 的 ~15%）
+- Rationale: 当前 1.5s（150步）在 crash 频繁的环境中几乎无法维持不中断。0.5s 是在当前 crash rate 下能够被统计意义上完成的最小时间窗口。success_reward 的初次激活将为策略提供明确的 long-horizon 正信号，奠定后续 duration 渐进延长的基础。
+
+**方案 B — 增大 fly_low_penalty：**
+- Parameter: `fly_low_penalty: 2.0 → 4.0`
+- Rationale: fly_low_penalty 从 1.0→2.0 产生了 -31% 的改善，进一步加倍可能产生更强的高度维持驱动。但需注意 fly_low_penalty 过高可能诱导 drone 过度拉高高度，导致 capture_distance 无法维持。
+
+**推荐组合：sustained_follow_duration 1.5→0.5 + fly_low_penalty 2.0→3.0（温和加强）。**
+
+---
+
+### Priority 2 (HIGH): 遏制 drones_collide 单调上升
+
+**Problem：** drones_collide Q5 mean=0.140（vs Run 11 0.195，-28% 改善），但趋势依然单调上升，末期最高 0.59/rollout。根因是 policy_std 0.627 导致轨迹趋同。
+
+**Proposed Changes：**
+
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`（或 move 对应 cfg 的 agent.yaml）
+- Parameter: `entropy_loss_scale: 0.003 → 0.004`
+- Rationale: std Q5 plateau 在 0.627，已在目标区间 0.65-0.75 之下。entropy_scale 从 0.003 小幅提升到 0.004 可将 std 稳定在 0.65-0.70 区间，增加轨迹多样性，减少 drones_collide。
+
+同时考虑增加 collision_penalty 力度：
+- Parameter: `collision_penalty_weight`（当前 collision_penalty Q5=-0.134/ep，力度偏弱）→ 翻倍
+- Rationale: 轻微的 collision_penalty 无法驱动分散行为，需要更强的分散激励。
+
+---
+
+### Priority 3 (MEDIUM): 控制 upright_penalty 进一步上升
+
+**Problem：** upright_penalty 从 Q1=-0.334 单调上升至 Q5=-1.793/ep（5.4x），last=-2.281/ep。随 tracking 继续改善，倾斜角会进一步增大。
+
+**Assessment：** 当前 tracking/|upright| = 5.12，仍为正向比值，暂不构成阻断性问题。但若 upright_penalty 达到 -3.0+ 时将开始抑制追踪行为。
+
+**Proposed Change（可选）：**
+- Parameter: `upright_penalty_threshold: 0.766（cos40°）→ 0.707（cos45°）`（宽松5°）
+- Rationale: 给予更多倾斜容忍度，让策略在追踪时有更多物理自由度，减少 upright_penalty 对 tracking 的反向抑制。
+- 优先级低，当 Run 13 中 upright_penalty Q5 > -3.0 时再应用。
+
+---
+
+### Priority 4 (LOW): height_penalty spike 监控
+
+**Problem：** Q2 出现 min=-32.5/ep，Q5 min=-16.3/ep 的极端 spike（可能是极少数 env 的高度极端偏差）。
+
+**Assessment：** recent mean=-1.92/ep 仍在可接受范围（Run 9 时曾达到 -4.91/ep）。当前 height_penalty_threshold=1.2m 未产生系统性爆炸。
+
+**Action：** 无需变更，仅在 Run 13 中监控 height_penalty Q5 mean 是否超过 -3.0/ep。
+
+---
+
+## Experiment Plan for Run 13
+
+### 核心变更（按优先级）
+
+| 参数 | Run 12 | Run 13 | 预期效果 |
+|------|--------|--------|---------|
+| sustained_follow_duration | 1.5s | **0.5s** | 解锁 success_reward 首次触发 |
+| fly_low_penalty | 2.0 | **3.0** | 温和加强低飞抑制，减少 success hold 中断 |
+| entropy_loss_scale | 0.003 | **0.004** | std 从 0.627 回升至 0.65-0.70，减少 drones_collide |
+| collision_penalty_weight | (verify current) | **×2** | 加强 drone 分散激励 |
+
+保持不变（已验证有效）：
+- contact_sensor_threshold=15N
+- illegal_contact_penalty=0.1
+- height_penalty_threshold=1.2m
+- bounding_box_threshold=10m
+- boundary_soft_threshold=8m, weight=2.0
+- upright_penalty_threshold=cos40°=0.766, weight=0.5
+- capture_distance=3.0m（XY-only）
+- drone_spawn_x_range=(-4,-2)
+- drone_spawn_y_range=(-4,4)（Run 12 新增，保留）
+
+### 训练配置
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --algorithm="MAPPO"
+```
+
+### 监控目标（Run 13）
+
+1. `success_reward` — 目标：step 100k 前出现首次非零（sustained_follow=0.5s 降低门槛）
+2. `Episode_Termination/all_targets_captured` — 目标：Q5 > 0.80/rollout（超越 Run 12 Q5=0.71）
+3. `crash+fly_low combined` — 目标：Q5 < 0.30/rollout（Run 12: 0.469）
+4. `drones_collide` — 目标：Q5 < 0.10/rollout（Run 12: 0.140），趋势平稳
+5. `policy_std` — 目标：稳定在 0.65-0.72（Run 12: 0.627，略低）
+6. `tracking_reward` — 目标：recent_mean > 10.0/ep（Run 12: 9.17，保持或超越）
+
+### 成功标准（Run 13 达成条件）
+
+- success_reward > 0.0/ep（至少出现一次非零）**[首要目标]**
+- all_targets_captured Q5 mean > 0.80/rollout
+- crash+fly_low Q5 combined < 0.40/rollout
+- drones_collide Q5 < 0.12/rollout
+- policy_std final 0.63–0.72（不低于 0.62，不高于 0.80）
+
+---
+
+## Changelog
+
+- 2026-04-05 (run 2026-04-05_15-55-42, 400k steps, Run 12, num_envs=32):
+  sustained_follow 3.0→1.5s + fly_low_penalty 1.0→2.0 + spawn_y (-3,3)→(-4,4) + entropy 0.002→0.003
+  - **all_targets_captured FULLY RESTORED**: 0.027→0.710/rollout Q5 mean (+2530%), last=1.41/rollout — sustained_follow 减半完全解锁了 Run 11 的结构性阻断
+  - **success_reward 仍为零**: all_targets_captured 虽大量触发，但 crash/fly_low 在捕获阶段频繁打断 1.5s 持续计时。fly_low_penalty=2.0 效果有限
+  - **crash+fly_low 改善 -31% 但末期仍高**: Q5 combined 0.681→0.469/rollout，但最后20步有10次 >1.0 的高峰
+  - **drones_collide 改善有限**: 0.195→0.140 Q5 (-28%)，单调上升趋势未阻断，spawn_y 扩大未从根本解决 std 趋同问题
+  - **policy_std 稳定在 0.627**: entropy=0.003 比 Run 11(0.002) 改善，降幅从 62.6% 压缩至 19.3%，但 std 仍低于目标 0.65
+  - **bounding_box 近乎消除**: Q5=0.718，last=0.240（从 Run 6-9 的 ~1.0/rollout 完全解决）
+  - **tracking_reward 历史最高**: 11.60/ep (last)，9.17/ep (Q5 recent)，total_reward 57.19
+  - **KEY NEXT**: sustained_follow 1.5→0.5s（解锁 success_reward）+ fly_low_penalty 2.0→3.0 + entropy 0.003→0.004（提升 std 到 0.65+）
