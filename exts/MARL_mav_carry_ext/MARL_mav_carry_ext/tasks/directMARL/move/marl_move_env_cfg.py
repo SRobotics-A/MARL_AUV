@@ -65,7 +65,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     target_bounce_x_max = 8.0  # 折返边界：最大 x（相对 env_origin）
     target_size = (0.5, 0.5, 0.5)  # 物块尺寸 (m)
     capture_distance = 3.0  # 捕获距离阈值 (m，XY平面)，扩大适配NovaCarter 3x实际尺寸
-    sustained_follow_duration = 1.5  # 持续跟随秒数（Run12：150步≈ep_len的46%，使success可达）
+    sustained_follow_duration = 0.5  # 持续跟随秒数（Run13：50步≈ep_len的15%，解锁success首次触发）
     # 物块初始位置（地面一侧，y方向分开）
     # Spread: Targets wider apart
     target_spawn_x_range = (-6.0, -2.0)
@@ -135,9 +135,9 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
     crash_penalty_scale = 1.0
-    collision_penalty_scale = 1.0
+    collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.1  # 大幅降低：消除与捕获奖励的矛盾梯度
-    fly_low_penalty = 2.0  # Run12：加强低飞惩罚，遏制"接近→俯冲→坠机"循环
+    fly_low_penalty = 3.0  # Run13：进一步加强低飞惩罚，减少 hold 窗口中断
 
     # action和observation配置
     if control_mode == "geometric":
