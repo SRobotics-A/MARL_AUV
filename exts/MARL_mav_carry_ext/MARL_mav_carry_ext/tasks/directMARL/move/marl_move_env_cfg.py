@@ -121,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 0.5  # 降低权重，避免过度抑制追踪机动
+    upright_penalty_weight = 0.8  # Run14：加强，抑制末期激进机动
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
@@ -130,14 +130,14 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
-    height_penalty_threshold = 1.2  # Meters，限制俯冲深度（不过分收紧）
+    height_penalty_threshold = 1.5  # Run14：放宽至1.5m，避免接近捕获时误触发
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.1  # 大幅降低：消除与捕获奖励的矛盾梯度
-    fly_low_penalty = 3.0  # Run13：进一步加强低飞惩罚，减少 hold 窗口中断
+    fly_low_penalty = 4.0  # Run14：继续加强，减少接近-捕获时的低飞坠机
 
     # action和observation配置
     if control_mode == "geometric":
@@ -205,7 +205,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     boundary_soft_penalty_weight = 2.0  # 加强：使软惩罚大于追踪收益
 
     # contact sensor
-    contact_sensor_threshold = 15.0  # 进一步提高：减少捕获时的虚假触发
+    contact_sensor_threshold = 20.0  # Run14：消除极端 spike（-292）
 
     # low level control
     low_level_decimation: int = 1  # Reduced to 1 for maximum stability

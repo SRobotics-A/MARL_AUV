@@ -723,8 +723,10 @@ class MARLMoveEnv(DirectMARLEnv):
             self._sustained_follow_timer >= self.cfg.sustained_follow_duration
         )
 
-        # Success Reward (Removed)
-        # rewards["success_reward"] = ...
+        # Success Reward: triggered when all_targets_captured condition holds
+        rewards["success_reward"] = (
+            self.cfg.success_reward_weight * self.all_targets_captured.float()
+        )
 
         # Tracking Reward (Fix: Only reward when captured, prevent reward inversion)
         # Old buggy logic: exp(-dist) where dist=0 when no target -> max reward for nothing
