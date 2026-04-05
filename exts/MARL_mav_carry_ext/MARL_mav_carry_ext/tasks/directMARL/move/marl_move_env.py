@@ -781,21 +781,20 @@ class MARLMoveEnv(DirectMARLEnv):
         )
 
         # --- 6. Altitude Reward (exp-decay, positive) ---
-        height_error = torch.norm(
-            self.drone_positions[..., 2] - self.cfg.desired_height,
-            dim=-1,
-        )
+        # Fix: use per-drone mean absolute error instead of combined L2 norm.
+        # L2 norm across drones masked single-drone dives (one drone at z=1.5m
+        # with others at 2.5m gave norm=1.0 < threshold=1.5, no penalty triggered).
+        height_error_per_drone = (self.drone_positions[..., 2] - self.cfg.desired_height).abs()  # (N, D)
+        height_error = height_error_per_drone.mean(dim=-1)  # (N,)
         rewards["height_reward"] = (
             self.cfg.height_reward_weight * torch.exp(-height_error) * step_dt
         )
 
         # Height Penalty (New: Strict constraint for deviating > threshold)
-        # Linear penalty: weight * max(0, error - threshold)
-        excess_height = (height_error - self.cfg.height_penalty_threshold).clamp(
-            min=0.0
-        )
+        # Linear penalty: weight * max(0, error - threshold), applied per-drone then summed
+        excess_height = (height_error_per_drone - self.cfg.height_penalty_threshold).clamp(min=0.0)  # (N, D)
         rewards["height_penalty"] = (
-            -self.cfg.height_penalty_weight * excess_height * step_dt
+            -self.cfg.height_penalty_weight * excess_height.sum(dim=-1) * step_dt
         )
 
         # --- 6.5 Upright Penalty (New: Prevent Flipping) ---
