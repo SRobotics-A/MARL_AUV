@@ -7297,3 +7297,217 @@ python3 scripts/skrl/train.py \
   - **bounding_box 近乎消除**: Q5=0.718，last=0.240（从 Run 6-9 的 ~1.0/rollout 完全解决）
   - **tracking_reward 历史最高**: 11.60/ep (last)，9.17/ep (Q5 recent)，total_reward 57.19
   - **KEY NEXT**: sustained_follow 1.5→0.5s（解锁 success_reward）+ fly_low_penalty 2.0→3.0 + entropy 0.003→0.004（提升 std 到 0.65+）
+
+---
+
+# Training Analysis Report — Move Task Run 13
+
+**Run:** `2026-04-05_23-37-49_mappo_torch_mappo`
+**Date:** 2026-04-05（分析日期 2026-04-06）
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO，num_envs=32，~375k steps
+
+## 参数变更（相比 Run 12）
+
+| 参数 | Run 12 | Run 13 | 目标 |
+|------|--------|--------|------|
+| sustained_follow_duration | 1.5s | 0.5s | 解锁 success_reward 首次触发 |
+| fly_low_penalty | 2.0 | 3.0 | 减少 crash/fly_low 打断 |
+| collision_penalty_scale | 1.0 | 2.0 | 减少 drones_collide |
+| entropy_loss_scale | 0.003 | 0.004 | 将 policy_std 推回 0.65~0.75 |
+
+## Training Metrics Summary
+
+| 指标 | Run 12 recent_mean | Run 13 recent_mean | 变化 |
+|------|-------------------|--------------------|------|
+| total_reward_mean | 21.89 | 28.83 | +6.94 (+32%) |
+| all_targets_captured | 0.393/rollout | 1.020/rollout | +0.627 (+159%) |
+| success_reward | 0.000 | 0.000 | 无变化 |
+| crash | 0.429/rollout | 0.225/rollout | -0.203 (-47%) |
+| falcon_fly_low | 0.341/rollout | 0.172/rollout | -0.169 (-50%) |
+| drones_collide | 0.139/rollout | 0.128/rollout | -0.012 (-8%) |
+| illegal_contact_term | 0.217/rollout | 0.115/rollout | -0.103 (-47%) |
+| policy_std | 1.377 | 0.759 | -0.618 (大幅收缩) |
+| ep_len_mean | 484 steps | 261 steps | -223 steps (-46%) |
+| distance_reward | 15.34/ep | 7.95/ep | -7.39 (-48%) |
+| tracking_reward | 13.52/ep | 7.41/ep | -6.11 (-45%) |
+| upright_penalty | -3.09/ep | -1.69/ep | +1.40 (改善) |
+| illegal_contact_rw | -17.40/ep | -0.85/ep | +16.55 (大幅改善) |
+
+**总训练步数：** ~375k steps  
+**最终 ep_len_mean（decile 10）：** 289 steps  
+**最终 all_targets_captured（decile 10）：** 1.017/rollout  
+**最终 crash+fly_low combined（decile 10）：** 0.517/rollout  
+
+## Observations & Findings
+
+### 1. success_reward 依然全程为零 — CRITICAL
+
+**症状：** `success_reward` 在 375k steps 全程无一次非零。  
+**根因分析：**  
+sustained_follow_duration 已降至 0.5s（约 17 steps），理论上应触发。但代码审查发现 `rewards["success_reward"] = ...` 已被注释掉（env.py line 727），该奖励项实际上**从未被计算和分配**，只是初始化了占位符缓冲区。`success_reward_weight=5.0` 配置了但代码路径被完全注释，导致 TensorBoard 始终记录 0。
+
+**证据：** `marl_move_env.py:727` 注释 `# rewards["success_reward"] = ...`，配合 `success_reward_weight=5.0` 在 cfg 中有值但实际不影响任何计算。
+
+**影响：** success_reward 的正反馈通路完全断开，策略无法从成功捕获行为中获得额外强化信号。
+
+### 2. all_targets_captured 大幅改善至满额 — HIGH（积极）
+
+**症状：** recent_mean 从 0.393 跃升至 1.020/rollout（+159%），decile 10 稳定在 1.017。  
+**根因：** sustained_follow_duration 从 1.5s 降至 0.5s，捕获计时门槛显著降低，策略能在 crash/fly_low 打断前更容易满足计时条件。  
+**意义：** 捕获本身不是问题；问题是在捕获条件成立后，环境直接终止（all_targets_captured 为 termination 信号），success_reward 无法在终止前被计算触发。
+
+**注：** all_targets_captured > 1.0 的值（如 1.03、1.07）表示单个 rollout batch 中多个 env 同时触发 termination，属于正常的批量计数现象。
+
+### 3. crash+fly_low 显著改善但仍未消除 — HIGH
+
+**症状：** crash recent_mean -47%（0.429→0.225），falcon_fly_low -50%（0.341→0.172）；但 decile 10 combined 仍达 0.517/rollout，末期有明显反弹趋势（decile 9: 0.268 → decile 10: 0.517，+93%）。  
+**根因：** fly_low_penalty=3.0 短期内有效抑制了低飞行为，但接近-捕获阶段本身产生的俯冲动作导致高度下降，属于结构性耦合问题。末期反弹可能源于 episode 变长后无人机执行更多接近动作。  
+**fly_low 奖励：** recent Q50=-0.33（大量步数受罚），Q5=-1.38（最差时受罚强）。
+
+### 4. drones_collide 改善微弱 — MEDIUM
+
+**症状：** 从 0.139 仅降至 0.128（-8%），collision_penalty×2 效果边际。decile 10 升至 0.165/rollout，出现轻微反弹。  
+**根因：** ep_len 缩短（484→261 steps），单位 episode 内无人机相互接近次数减少，但 collision_penalty 倍增并未从根本改变运动策略的趋同倾向。  
+**新发现：** policy_std 从 1.377 降至 0.759，策略方差大幅收缩，无人机行为趋于一致，这反而可能成为 drones_collide 的深层原因（详见问题 5）。
+
+### 5. policy_std 大幅收缩至 0.759 — HIGH
+
+**症状：** policy_std 从 Run 12 末期的 1.597（recent_mean: 1.377）骤降至 Run 13 的 0.759（recent_mean: 0.759），降幅 -45%，远超预期（目标：0.65~0.75）。  
+**根因：** Run 12 policy_std=1.597 已属于异常过高（探索失控），Run 13 entropy=0.004 配合 sustained_follow_duration 降低后策略更快收敛，std 收缩是两个因素叠加的结果。当前 0.759 实际已略高于目标上限 0.75，处于合理区间上沿。  
+**注意：** Run 12 的 1.597 vs Run 13 的 0.759 对比并不能说明 entropy 变化方向错误；Run 12 的高 std 属于训练不稳定的症状，Run 13 收敛到正常范围。
+
+### 6. illegal_contact 末期大幅上升（spike 问题）— HIGH
+
+**症状：** illegal_contact_reward decile 10 mean=-1.43（decile 9: -0.26，上升 5.5×），存在极端 spike：step=362000 val=-292.77，step=246600 val=-118.25。  
+**根因：** 随着 episode 变长（decile 10: ep_len=289）、all_targets_captured 频繁触发后环境重置，无人机在接近目标的最后阶段力传感器超阈触发惩罚。接触阈值 15N 可能对高速接近的无人机过于敏感。  
+**影响：** illegal_contact_rw 极端 spike 导致 total_reward 波动（recent_std=55.86），训练信号噪声大。
+
+### 7. upright_penalty 末期恶化 — MEDIUM
+
+**症状：** upright_penalty decile 10 mean=-1.97（vs decile 8: -1.27），呈现末期上升趋势（decile 1: -0.20 → decile 10: -1.97，10×增长）。  
+**根因：** 随着无人机学会接近目标，剧烈的机动动作导致机身倾斜超过阈值（cos40°=0.766）。upright_penalty_weight=0.5 不足以抑制末期激进机动。
+
+### 8. ep_len 大幅缩短 — MEDIUM（关注）
+
+**症状：** ep_len_mean 从 484 缩短至 261 steps（-46%）。  
+**根因：** sustained_follow_duration=0.5s 使 all_targets_captured 更容易触发（终止条件），episode 自然更短。这是设计预期行为，但也意味着 distance_reward 和 tracking_reward 的累积量相应减少（各下降约 48%），这是 episode 缩短的自然结果，非策略退步。
+
+### 9. height_penalty 持续高位 — MEDIUM
+
+**症状：** height_penalty recent_mean=-1.89，decile 10=-2.23，在惩罚预算中占 27.9%（最大单项）。  
+**根因：** desired_height=2.5m，无人机在高速追踪时高度偏差超过 height_penalty_threshold=1.2m。这与接近行为的激进性直接相关。
+
+## 总体评估
+
+**训练状态：** 稳定提升（improving），无崩溃，关键指标普遍改善。
+
+**最重要发现：** success_reward 代码被注释导致信号完全断路（CRITICAL），这是独立于 sustained_follow_duration 的 bug，必须修复。
+
+**Run 13 达成情况：**
+- success_reward 首次触发：未达成（代码注释导致，非参数问题）
+- all_targets_captured Q5 > 0.80：已达成（Q5=0.84）
+- crash+fly_low Q5 < 0.40：未达成（recent Q5 combined ~0.21 实际已达成，但 decile10 末期 0.517 偏高）
+- drones_collide Q5 < 0.12：接近达成（recent Q5=0.000，mean=0.128）
+- policy_std 0.63~0.72：略超（0.759，处于目标上沿）
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 修复 success_reward 代码注释
+
+**问题：** `marl_move_env.py:727` 的 `rewards["success_reward"] = ...` 被注释，`success_reward_weight=5.0` 的配置完全无效。  
+**建议修复：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 位置：line 727 附近
+- 操作：实现 success_reward 计算逻辑，当 `self.all_targets_captured` 为 True 时给予 `cfg.success_reward_weight` 的即时奖励
+- 参考逻辑：`rewards["success_reward"] = self.cfg.success_reward_weight * self.all_targets_captured.float() * step_dt`（或改为 episodic sparse 形式）
+- 预期效果：policy 获得额外的正向强化信号，加速成功捕获行为的固化
+
+### Priority 2 (HIGH): 抑制接近-捕获耦合的低飞问题
+
+**问题：** crash+fly_low decile 10 末期反弹至 0.517，接近动作本身产生高度下降是根因。  
+**建议：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `fly_low_penalty`: 3.0 → 4.0（进一步强化高度维持的惩罚压力）
+- 同时考虑给 `desired_height` 附近的高度维持添加正向奖励（height_reward_weight 可从 0.5 提升至 1.0）
+- 预期效果：减少接近过程中的高度下坠行为
+
+### Priority 3 (HIGH): 修复 illegal_contact 末期 spike
+
+**问题：** illegal_contact decile 10 出现 -292 的极端 spike，严重污染训练信号。  
+**建议：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `contact_sensor_threshold`: 15N → 20N（放宽接触阈值，减少高速接近时的误触发）
+- 或在奖励计算中对 illegal_contact 惩罚加 clamp（如 max(-5.0, penalty)），防止单步极端值
+- 预期效果：减少噪声 spike，稳定 total_reward 的训练信号
+
+### Priority 4 (MEDIUM): drones_collide 趋同问题
+
+**问题：** collision_penalty×2 效果边际（-8%），根因是策略方差收缩导致行为趋同。  
+**建议：**
+- 当前 policy_std=0.759 已合理，不需要进一步调整 entropy
+- 考虑添加无人机间的多样性激励（如对无人机间位置差异给予正向奖励），或扩大 drone_spawn 间距
+- 暂维持 collision_penalty_scale=2.0，观察 success_reward 修复后策略分化效果
+
+### Priority 5 (MEDIUM): upright_penalty 末期恶化
+
+**问题：** decile 10 upright_penalty=-1.97，末期激进机动导致倾斜。  
+**建议：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `upright_penalty_weight`: 0.5 → 0.8（加强姿态约束）
+- 预期效果：减少捕获阶段的激进翻滚机动
+
+## Experiment Plan — Run 14
+
+### 参数变更
+
+| 参数 | Run 13 | Run 14 | 原因 |
+|------|--------|--------|------|
+| success_reward（代码） | 注释 | 取消注释/实现 | CRITICAL：修复断路的正反馈 |
+| fly_low_penalty | 3.0 | 4.0 | 抑制末期接近-低飞耦合反弹 |
+| contact_sensor_threshold | 15N | 20N | 消除 illegal_contact 极端 spike |
+| upright_penalty_weight | 0.5 | 0.8 | 抑制末期激进机动 |
+| height_reward_weight | 0.5 | 1.0 | 提供高度维持的正向激励 |
+| entropy_loss_scale | 0.004 | 0.004 | 保持（当前 0.759 已在合理区间） |
+| sustained_follow_duration | 0.5s | 0.5s | 保持（捕获已充分） |
+| collision_penalty_scale | 2.0 | 2.0 | 保持，观察 success_reward 修复效果 |
+
+### 训练配置
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --algorithm="MAPPO"
+```
+
+### 监控目标（Run 14）
+
+1. `success_reward` — 目标：step 50k 前出现首次非零（代码修复后应立即出现）
+2. `crash+fly_low combined decile 10` — 目标：< 0.40（Run 13 decile 10: 0.517）
+3. `illegal_contact_rw` — 目标：无极端 spike（min > -20），recent_mean > -0.5
+4. `upright_penalty decile 10` — 目标：> -1.5（Run 13: -1.97）
+5. `total_reward recent_std` — 目标：< 30（Run 13: 55.86，噪声过大）
+6. `all_targets_captured` — 目标：维持 Q5 > 0.85/rollout
+
+### 成功标准（Run 14 达成条件）
+
+- success_reward recent_mean > 0.5/ep（代码修复后的首要验证）
+- crash+fly_low decile 10 combined < 0.40/rollout
+- illegal_contact_rw min spike > -20（无极端污染）
+- total_reward recent_std < 35
+- all_targets_captured Q5 > 0.85/rollout（维持或超越 Run 13）
+
+---
+
+## Changelog
+
+- 2026-04-06 (run 2026-04-05_23-37-49, ~375k steps, Run 13, num_envs=32):
+  sustained_follow 1.5→0.5s + fly_low_penalty 2.0→3.0 + collision_penalty_scale 1.0→2.0 + entropy 0.003→0.004
+  - **all_targets_captured 全面达成**: 0.393→1.020/rollout (+159%)，Q5=0.84，decile10=1.017 — sustained_follow=0.5s 彻底解锁了捕获的频繁触发
+  - **success_reward 依然为零（CRITICAL BUG）**: 根因是 `rewards["success_reward"] = ...` 在 env.py 中被注释，与 sustained_follow_duration 无关；代码路径完全断路
+  - **crash/fly_low 显著改善但末期反弹**: recent_mean 各降 47%/50%，但 decile 10 combined 0.517（反弹至高位），接近-低飞耦合是结构性问题，需进一步加强 fly_low_penalty
+  - **illegal_contact 末期 spike**: decile 10 出现 -292 极端 spike（step=362k），contact_sensor_threshold=15N 过敏感，需放宽至 20N
+  - **policy_std 正常化**: Run 12 异常的 1.597 修正至 0.759，entropy=0.004 起到了稳定效果；0.759 处于目标上沿（0.65~0.75），可维持不变
+  - **drones_collide 改善微弱**: collision_penalty×2 仅减少 8%，根因是策略方差收缩后行为趋同，单纯惩罚效果有限
+  - **upright_penalty 末期恶化**: decile10=-1.97（vs decile1=-0.20），捕获阶段激进机动导致倾斜，需提升 weight 0.5→0.8
+  - **KEY NEXT**: 修复 success_reward 代码注释（CRITICAL）+ fly_low_penalty 3→4 + contact_threshold 15→20N + upright_weight 0.5→0.8
