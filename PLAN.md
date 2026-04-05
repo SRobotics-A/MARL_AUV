@@ -6690,3 +6690,282 @@ python3 scripts/skrl/train.py \
   - **新关键问题 2：crash + fly_low 急增**：crash=0.43/rollout（+474%），fly_low=0.34/rollout（+486%），"接近→俯冲→坠机"模式在 2048 env 下将更严重
   - **policy_std 过高**：0.99 → 1.595，超出健康范围，熵激励（0.005）在长 episode 后过度推动探索
   - **下一步优先级**：illegal_contact_penalty 1.0→0.1 + threshold 5→15N + height_threshold 1.5→1.2m + entropy 0.005→0.002 + success_reward 启用
+
+---
+
+# Training Analysis Report — Run 11
+
+**Run:** 2026-04-05_07-55-37_mappo_torch_mappo
+**Date:** 2026-04-05
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO (num_envs=32, 400k steps)
+
+---
+
+## Training Metrics Summary
+
+| Metric | Early (Q1) | Recent (Q5) | Last | vs Run 10 Recent |
+|--------|-----------|-------------|------|-----------------|
+| total_reward mean | 1.77 | 35.59 | 48.58 | N/A (different scale) |
+| distance_reward | 2.09 | 9.14 | 13.00 | -40.5% |
+| tracking_reward | 1.49 | 8.21 | 11.68 | -39.3% |
+| all_targets_captured | 0.000 | 0.027 | 0.000 | -93.2% |
+| illegal_contact_rew | -0.021 | -0.815 | -0.229 | +95.3% (improved) |
+| crash termination | 0.018 | 0.383 | 0.280 | -10.6% |
+| fly_low termination | 0.003 | 0.299 | 0.280 | -12.2% |
+| drones_collide | 0.004 | 0.195 | 0.080 | +40.0% (worsened) |
+| upright_penalty | -0.293 | -2.093 | -2.924 | +32.3% (improved) |
+| height_penalty | -1.918 | -1.981 | -2.716 | +33.5% (improved) |
+| ep_len mean | 104 | 323 | 396 | -33.2% |
+| policy_std | 0.764 | 0.599 | 0.597 | -56.5% (major improvement) |
+| value_loss | 0.099 | 0.072 | 0.090 | -67.8% |
+| policy_loss | 0.002 | 0.012 | 0.032 | -83.7% |
+| success_reward | 0.000 | 0.000 | 0.000 | — |
+
+---
+
+## Observations & Findings
+
+### 1. illegal_contact Penalty — FIXED (CRITICAL resolved)
+
+**Symptom:** illegal_contact_reward went from Run 10's catastrophic -17.4/ep recent (worst -815) to Run 11's -0.815/ep recent (worst -98.7). A 95.3% improvement in mean magnitude.
+
+**Root Cause (confirmed):** With illegal_contact_penalty lowered 1.0→0.1 and contact_sensor_threshold raised 5N→15N, the policy is no longer being overwhelmed by contact reward noise during proximity. The worst case (-98.7) still occurs in sporadic spikes at steps 399900 (-10.8) suggesting momentary multi-step contact during drone-drone or drone-NovaCarter encounters, but the mean burden is now manageable.
+
+**Evidence:** Q1=-0.021 → Q5=-0.815. Still rising (40x trend_ratio), meaning contacts are increasing with approach behavior — but at 0.1 penalty weight, each contact event contributes only 0.1 per timestep, not 1.0.
+
+**Status:** RESOLVED as a training blocker. Residual drift is expected and acceptable.
+
+---
+
+### 2. Crash / fly_low — PARTIALLY IMPROVED (HIGH, not resolved)
+
+**Symptom:** crash_term recent: Run 10=0.43/rollout → Run 11=0.38/rollout (-10.6%). fly_low_term: 0.34 → 0.30 (-12.2%). Combined crash+fly_low: 0.77 → 0.68/rollout (-11.7%). Marginal improvement only.
+
+**Root Cause:** The "approach→dive→crash" cycle persists. With height_penalty_threshold tightened 1.5→1.2m, the theoretical descent floor is z=2.5-1.2=1.3m, which is above the NovaCarter top (~1.35m at 3x scale). However, the policy that learned to dive under Run 10's 1.5m regime is still being exploited — the new threshold is reducing dive depth but not eliminating the behavior.
+
+**Evidence:** 
+- Crash quintile trend: Q1=0.018 → Q5=0.383 (still monotonically rising)
+- height_penalty by quintile: Q1=-1.918, Q2=-1.259, Q3=-1.138 (improvement), Q4=-1.634, Q5=-1.981 (rebound late) — late-run rebound to -1.98 matches the continued crash trend
+- fly_low quintile: Q1=0.003 → Q5=0.299 (20x rise, not arrested)
+
+**Status:** PARTIALLY IMPROVED. Requires additional action — see recommendations.
+
+---
+
+### 3. policy_std — DRAMATICALLY FIXED (CRITICAL resolved)
+
+**Symptom:** policy_std dropped from Run 10's 1.595 (end-of-run, over-exploration) to Run 11's 0.599 (stable, within healthy range 0.82→0.60). The entropy_loss_scale reduction 0.005→0.002 was effective.
+
+**Evidence:** policy_std Q1=0.764 → Q5=0.599. Monotonically declining as intended. Recent_std=0.004 — very tight, stable convergence. Compare to Run 10 where std was monotonically rising to 1.595.
+
+**Status:** RESOLVED. policy_std is now in a healthy, declining exploitation regime (0.60 at 400k steps). No action needed.
+
+---
+
+### 4. Capture Behavior (all_targets_captured) — SEVERE REGRESSION (CRITICAL)
+
+**Symptom:** all_targets_captured: Run 10 recent=0.39/rollout (best=0.60, last 10 rollouts 0.42-1.00) → Run 11 recent=0.027/rollout (best=0.49, last 10 rollouts mostly 0.00). A 93.2% collapse in capture rate despite success_reward=5.0 activation.
+
+**Root Cause — Hypothesis A (most likely): entropy collapse interfered with capture timing**
+- Run 10 had policy_std=1.595 — high exploration generated diverse approach trajectories that "accidentally" satisfied capture conditions
+- Run 11 dropped std to 0.60 rapidly (entropy_scale=0.002 applied aggressively from step 0)
+- This early entropy reduction may have locked the policy into a narrower action distribution before the capture behavior was consolidated, causing the policy to lose the approach diversity that enabled captures
+
+**Root Cause — Hypothesis B: episode_length regression**
+- ep_len_mean: Run 10 recent=484 → Run 11 recent=323 (-33.2%). The sustained_follow_duration=3.0s requires the drone to maintain capture_distance<3.0m for 300 timesteps (3s × 100Hz). With mean episodes only 323 steps, capturing is increasingly rare — the episode ends (crash/fly_low) before the 3s hold completes.
+- The crash rate (0.38/rollout) means roughly every other rollout ends in a crash, aborting potential captures.
+
+**Root Cause — Hypothesis C: success_reward=5.0 did NOT activate**
+- success_reward recent_mean=0.000 for ALL 4000 data points across the entire run. Not a single success reward was earned in 400k steps.
+- This confirms captures did not achieve the 3.0s sustained hold criterion — they were brief proximity contacts, not sustained follows.
+
+**Evidence:** 
+- all_targets_captured non-zero occurrences: 207 of 4000 rollouts (5.2%), first non-zero at step 125200
+- Q4 non-zero fraction=0.025, Q5 non-zero fraction=0.230 — capture is improving toward end but volatile (last 10: 0.19, 0.03, 0.00, 0.00, 0.00, 0.46, 0.00, 0.00, 0.00, 0.00)
+- success_reward = 0.0000 throughout — 3s hold criterion never met
+
+**Status:** CRITICAL regression vs Run 10. Capture frequency collapsed 93% and sustained capture (success_reward) was never achieved. The combination of lower std, shorter episodes, and volatile approach behavior is responsible.
+
+---
+
+### 5. Upright Penalty — IMPROVING (MEDIUM)
+
+**Symptom:** upright_penalty Run 10 recent=-3.09/ep → Run 11 recent=-2.09/ep (32% improvement). Last values are still -2.9 suggesting end-of-run tilt pressure remains.
+
+**Evidence:** Monotonically worsening through training (Q1=-0.29 → Q5=-2.09), driven by more aggressive tracking and capture approach. upright_penalty ratio vs tracking: upright(-2.09) / tracking(8.21) = 25% overhead — elevated but not dominant.
+
+**Status:** Improving trend, within tolerable range. No immediate action required.
+
+---
+
+### 6. Drone Collisions — NEW CONCERN (MEDIUM)
+
+**Symptom:** drones_collide termination: Run 10 recent=0.139/rollout → Run 11 recent=0.195/rollout (+40%). Rising monotonically: Q1=0.004 → Q5=0.195 (48x). 
+
+**Root Cause:** As policy_std dropped and drones converged to more deterministic trajectories, they may be converging to the same positions more frequently (reduced diversity in approach paths → inter-drone collision). This is a known MARL pathology when exploration collapses.
+
+**Evidence:** drones_collide trend ratio=48x, higher than crash (20x) or fly_low (92x). Emerging issue that will worsen if ep_len increases.
+
+**Status:** MEDIUM priority — not a blocker yet but will compound crash problem if drones increasingly terminate each other.
+
+---
+
+### 7. Learning Curve Health — IMPROVING but Unstable
+
+**Value Loss:** Run 10 recent=0.225 → Run 11 recent=0.072 (-68%). Very healthy — critic is converging well. Recent std=0.085 acceptable.
+
+**Policy Loss:** Run 10 recent=0.072 → Run 11 recent=0.012 (-83%). Small magnitude, low variance. Gradient norm actor: Q1=0.69 → Q5=0.93 (stable, no explosion). Gradient norm critic: stable at ~0.31.
+
+**Entropy Loss:** Q1=-0.00229 → Q5=-0.00180. Entropy is decaying as expected with scale=0.002. The trajectory is healthy — entropy stabilizing rather than collapsing to zero.
+
+**Overall:** The optimization machinery (critic, actor gradients) is healthy. The main training problem is behavioral (capture regression, crash persistence), not a RL algorithm failure.
+
+---
+
+## Root Cause Summary
+
+The Run 11 parameter changes had asymmetric effects:
+
+| Change | Intended Effect | Actual Effect |
+|--------|----------------|---------------|
+| illegal_contact_penalty 1.0→0.1 | Reduce conflict with capture | RESOLVED — 95% reduction in contact burden |
+| contact_sensor_threshold 5→15N | Reduce false contact triggers | CONFIRMED effective |
+| entropy_loss_scale 0.005→0.002 | Reduce over-exploration | OVER-CORRECTED — killed capture diversity too early |
+| height_penalty_threshold 1.5→1.2m | Constrain dive depth | PARTIAL — crash only down 10% |
+| success_reward_weight 0→5.0 | Reinforce capture | NEVER ACTIVATED — 0 success rewards earned |
+
+The central tension is: entropy reduction stabilized policy_std but simultaneously collapsed the capture rate. The policy needed to maintain higher diversity during the 3s capture hold phase, and premature convergence cut off that path.
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): Restore Capture Frequency via Entropy Schedule
+
+**Problem:** entropy_loss_scale=0.002 applied from step 0 caused rapid std collapse (0.764→0.599) that eliminated the approach diversity enabling captures. In Run 10, std=1.595 (excessive) but captures reached 0.39/rollout. In Run 11, std=0.599 (controlled) but captures dropped to 0.027/rollout.
+
+**The core issue:** sustained_follow_duration=3.0s at 100Hz = 300 consecutive timesteps within 3m. With std=0.60, the policy follows one trajectory — if it drifts outside 3m even briefly, the timer resets. With std=1.595, stochastic actions kept the drone in the capture zone via multiple approach attempts per episode.
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `sustained_follow_duration: 3.0 → 1.5`
+- Rationale: Halving the hold requirement doubles capture probability without changing reward magnitude. At ep_len=323 steps mean, 3.0s hold = 300 steps ≈ 93% of mean episode — practically unreachable. 1.5s = 150 steps ≈ 46% of mean episode — achievable.
+
+**Additional entropy fix:**
+- File: training config (skrl agent config or `train.py` arguments)
+- Parameter: `entropy_loss_scale: 0.002 → 0.003` (partial rollback — not back to 0.005, but less aggressive)
+- Rationale: Allow more action diversity during capture phases while maintaining some exploitation pressure. Target: policy_std stabilizing at 0.65-0.75 rather than continuing to decline toward 0.50.
+
+---
+
+### Priority 2 (HIGH): Resolve Crash / fly_low Pattern
+
+**Problem:** crash+fly_low still at 0.68/rollout combined. height_penalty_threshold=1.2m reduced dive depth but the "approach→dive→crash" cycle persists. The remaining crash mechanism: drones descend within 1.2m of desired_height (z=1.3m floor) and then encounter fly_low termination (presumably at z<0.4m or similar low threshold).
+
+**Proposed Changes:**
+
+**Option A (recommended): Increase fly_low_penalty weight**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `fly_low_penalty: 1.0 → 2.0`
+- Rationale: The existing fly_low_penalty at 1.0 is insufficient to prevent descent — the drone is willing to pay the 1.0 penalty for proximity reward. Doubling gives the policy a stronger aversion to near-ground positions.
+
+**Option B (complementary): Tighten height_penalty_threshold slightly more**
+- Parameter: `height_penalty_threshold: 1.2 → 1.0`
+- Caution: Run 9 showed 1.0m caused height_penalty explosion (-4.91/ep). However, Run 11's crash is now the primary height driver (not free altitude variation). If fly_low_penalty is first increased (Option A), height_threshold=1.0m may be safe to apply.
+- Defer Option B until Run 12 crash data is reviewed.
+
+---
+
+### Priority 3 (HIGH): Reduce Drone-Drone Collisions
+
+**Problem:** drones_collide at 0.195/rollout and rising 48x across training. Low policy_std means drones converge to similar trajectories, increasing inter-drone collision frequency.
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `drone_collision_threshold: 0.6 → 0.8` (expand the collision detection radius to catch near-misses and terminate before physical contact)
+- AND/OR: Add a `drone_proximity_penalty_weight` term (soft repulsion) in the reward function
+- Rationale: Reducing hard terminations from collisions via a soft repulsion would encourage drones to maintain separation without ending episodes. This preserves episode length.
+
+**Alternative (faster to implement):** Widen `drone_spawn_y_range: (-3.0, 3.0) → (-4.0, 4.0)` to start drones further apart, reducing early-episode collision risk during initial divergence.
+
+---
+
+### Priority 4 (MEDIUM): success_reward Activation Path
+
+**Problem:** success_reward=5.0 never fired. The 3.0s sustained hold is unreachable at current ep_len=323 and capture rate=2.7%. Even at Run 10's peak capture rate (0.39/rollout), success rewards were 0.
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `sustained_follow_duration: 3.0 → 1.5` (same as Priority 1 recommendation — dual benefit)
+- Expected outcome: If capture events occur at Q5 rate=0.027 × expected hold_time reduction, at 1.5s hold with similar proximity frequency, success_reward should begin firing at some rollouts
+- Additional: Once success_reward starts firing even infrequently, it will create a positive feedback loop that reinforces sustained following
+
+---
+
+### Priority 5 (LOW): Height Penalty Late-Run Rebound
+
+**Problem:** height_penalty by quintile: Q1=-1.918 → Q3=-1.138 (improving) → Q5=-1.981 (rebound). The mid-run improvement was lost in the last 20% of training. This is driven by crash events — drones dive just before crashing, triggering height penalty in the final timesteps.
+
+**Status:** This will self-resolve if crash rate decreases (Priority 2). No independent action needed.
+
+---
+
+## Run 12 Experiment Plan
+
+### Parameter Changes from Run 11
+
+| Parameter | Run 11 | Run 12 | Priority |
+|-----------|--------|--------|----------|
+| `sustained_follow_duration` | 3.0s | 1.5s | P1-CRITICAL |
+| entropy_loss_scale (skrl agent) | 0.002 | 0.003 | P1-CRITICAL |
+| `fly_low_penalty` | 1.0 | 2.0 | P2-HIGH |
+| `drone_spawn_y_range` | (-3.0, 3.0) | (-4.0, 4.0) | P3-HIGH |
+
+### Parameters to Hold Constant from Run 11
+
+- `illegal_contact_penalty = 0.1` — CONFIRMED effective, keep
+- `contact_sensor_threshold = 15.0N` — CONFIRMED effective, keep
+- `height_penalty_threshold = 1.2m` — keep for now; may tighten to 1.0 in Run 13 if crash resolves
+- `success_reward_weight = 5.0` — keep; will activate once hold_duration is reduced
+- `bounding_box_threshold = 10.0m` — VALIDATED, keep
+- `tracking_reward_weight = 4.0` — VALIDATED across runs 7-11, keep
+- All other weights unchanged
+
+### Training Command
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --seed=42 --algorithm="MAPPO"
+```
+
+### Monitoring Targets
+
+Watch these metrics in real-time:
+1. `Episode_Termination/all_targets_captured` — target: sustained >0.10/rollout by step 150k
+2. `Episode_Reward/success_reward` — target: first non-zero event before step 200k
+3. `Episode_Termination/crash + falcon_fly_low` — target: combined <0.50/rollout by step 300k
+4. `Episode_Termination/drones_collide` — target: stabilize or decline vs Run 11 Q5=0.195
+5. `Policy / Standard deviation` — target: stabilize at 0.65-0.75 (not continuing to fall)
+6. `Episode / Total timesteps (mean)` — target: >400 steps mean by step 300k
+
+### Success Criteria for Run 12
+
+- all_targets_captured recent_mean > 0.10/rollout (vs Run 11: 0.027)
+- success_reward > 0.0 in at least 5% of rollouts
+- crash_term recent_mean < 0.30/rollout (vs Run 11: 0.383)
+- policy_std stabilizes between 0.65-0.75 (not collapsing further)
+
+---
+
+## Changelog
+
+- 2026-04-05 (run 2026-04-05_07-55-37, 400k steps, Run 11, num_envs=32): illegal_contact_penalty 1.0→0.1 + threshold 5→15N + height_threshold 1.5→1.2m + entropy 0.005→0.002 + success_reward 0→5
+  - **illegal_contact RESOLVED**: -17.4 → -0.82/ep recent (-95%), no longer a training blocker
+  - **policy_std RESOLVED**: 1.595 → 0.597 (healthy exploitation regime), entropy_scale=0.002 effective
+  - **capture SEVERELY REGRESSED**: all_targets_captured 0.39 → 0.027/rollout (-93%), success_reward=0.000 throughout (3s hold never met)
+  - **crash/fly_low MARGINAL IMPROVEMENT ONLY**: combined 0.77 → 0.68/rollout (-11%), still dominant termination
+  - **drones_collide WORSENING**: 0.139 → 0.195/rollout (+40%), new emerging problem as std drops
+  - **INSIGHT: entropy_scale=0.002 overcorrected** — std collapsed too fast, eliminating capture approach diversity before the 3s hold criterion was ever reached
+  - **KEY LESSON**: success_reward=5.0 requires captures to fire. captures require 3s hold. 3s hold at ep_len=323 mean is 93% of episode — structurally near-impossible. Reducing sustained_follow_duration 3.0→1.5s is the critical unlock for Run 12.
