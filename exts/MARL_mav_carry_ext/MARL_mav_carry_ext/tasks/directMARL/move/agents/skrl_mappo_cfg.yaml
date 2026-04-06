@@ -61,7 +61,7 @@ agent:
   ratio_clip: 0.1
   value_clip: 0.1
   clip_predicted_values: True
-  entropy_loss_scale: 0.004  # Run13：将 std 推回 0.65~0.70 目标区间
+  entropy_loss_scale: 0.006  # Run15：拉回 policy_std 至 0.65~0.80 健康区间
   value_loss_scale: 1.0
   kl_threshold: 0.0
 #  rewards_shaper_scale: 1.0

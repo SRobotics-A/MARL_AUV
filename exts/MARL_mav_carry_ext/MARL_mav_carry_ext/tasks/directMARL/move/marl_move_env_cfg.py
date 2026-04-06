@@ -99,7 +99,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     dist_reward_scale = 0.5  # 衰减速率减小，扩大吸引范围
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
-    success_reward_weight = 5.0  # 激活：强化已建立的捕获行为
+    success_reward_weight = 1.0  # Run15：降低至1.0，消除量级失衡（Run14 success=1397 vs 惩罚=-47）
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
     tracking_reward_weight = 4.0  # 增大：强化跟随信号
@@ -121,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 0.8  # Run14：加强，抑制末期激进机动
+    upright_penalty_weight = 0.5  # Run15：回退至0.5，避免过度抑制机动
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
@@ -137,7 +137,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.1  # 大幅降低：消除与捕获奖励的矛盾梯度
-    fly_low_penalty = 4.0  # Run14：继续加强，减少接近-捕获时的低飞坠机
+    fly_low_penalty = 6.0  # Run15：加强安全约束，对抗 success 激励下的激进俯冲
 
     # action和observation配置
     if control_mode == "geometric":
