@@ -7726,3 +7726,263 @@ python3 scripts/skrl/train.py \
 - `upright_penalty` recent_mean > -1.2
 - `height_penalty` recent_mean > -1.5
 - `total_reward` recent_std < 40
+
+---
+
+# Training Analysis Report — Move Run 14
+
+**Run:** `2026-04-06_06-03-18_mappo_torch_mappo`
+**Date:** 2026-04-06
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Total logged steps:** 365,800
+
+---
+
+## Training Metrics Summary
+
+| 指标 | 早期均值 | 近期均值（last 20） | 最后值 | 对比 Run 13 |
+|------|---------|-------------------|--------|------------|
+| Total reward (mean) | -2.23 | ~2,672 | 4,969 | Run13 终值约 1,800，本次+176% |
+| all_targets_captured | 0.001 | 0.830 | 1.030 | Run13 Q5=1.020，本次 Q5=0.33（下降） |
+| success_reward | ~0 | 1,397 | 1,999 | Run13 全程 0，**本次首次真正触发** |
+| crash (终止/rollout) | 0.025 | 0.451 | 0.52 | Run13 约 0.52（持平） |
+| falcon_fly_low | 0.0002 | 0.309 | 0.45 | Run13 约 0.40（轻微升高） |
+| height_penalty | -1.94 | -13.18 | -15.87 | Run13 约 -1.90（大幅升高，bug 修复生效） |
+| illegal_contact | -0.032 | -19.21 | -21.68 | Run13 约 -2.0（显著升高） |
+| upright_penalty | -0.54 | -11.38 | -13.86 | Run13 约 -1.70（大幅升高） |
+| policy_std | 0.820 | 0.618 | 0.617 | Run13 约 0.759（偏低，探索减少） |
+| drone_out | -1.27 | -18.11 | -15.82 | Run13 约 -10（升高后改善） |
+
+---
+
+## Observations & Findings
+
+### 1. success_reward 首次真正触发 — MILESTONE
+
+**Symptom:** `success_reward` 在 step=700 即出现首个非零值，step=101,800 突破 100，step=253,000 突破 1,000，最后 20 点均值 1,397，last=1,999。
+
+**结论:** Run 14 的代码 bug 修复（取消注释 `rewards["success_reward"]`）完全生效。成功奖励从第一个 rollout 就开始提供正反馈信号，在 step~150k 后进入快速爬升阶段，到 ~300k+ 出现 Q95 最高 22,084 的大成功 episode。这是项目首次观察到 success_reward 真实驱动训练的运行。
+
+**对比 Run 13 的成功标准 (d50 > 0.69):** Run 14 达成，但后期（300k 起）Q5 出现从 0.672 降至 0.330 的退化迹象。
+
+---
+
+### 2. all_targets_captured 后期退化 — HIGH
+
+**Symptom:** `all_targets_captured` 在 step~180k 达到均值峰值 0.950，此后逐步下滑，最后 200 点均值 0.848，Q5 从 0.672 降至 0.525（300k 附近开始）。
+
+**Root Cause:** crash 和 falcon_fly_low 终止频率在 ~280k 步后急剧上升（crash mean 从 0.177 → 0.527，fly_low 从 0.104 → 0.410），导致 episode 在完成 all_targets_captured 前提前终止。
+
+**Evidence:** crash 趋势明确上升斜率，与 upright_penalty 和 illegal_contact 爆发时间点（step 280k）高度吻合。
+
+---
+
+### 3. crash / illegal_contact 后期爆发 — HIGH
+
+**Symptom:** crash 终止在 step 280k 后从 0.269 → 0.527，illegal_contact 终止从 0.179 → 0.405，两者时间序列几乎完全同步（相关性极高）。
+
+**Root Cause 假说 1（主要）:** `upright_penalty_weight` 从 0.5 → 0.8（+60%），导致无人机在接近小车的倾斜阶段受到更强压制。策略在高密度 success_reward 诱导下趋向激进行为（高速俯冲），而 upright_penalty 无法有效约束倾斜，反而导致碰撞频率上升。
+
+**Root Cause 假说 2（次要）:** `contact_sensor_threshold` 从 15N → 20N 放宽了 illegal_contact 的终止条件，策略学会更激进接触，但接触后位移更大导致 crash。
+
+**Evidence:** `illegal_contact` 惩罚在 step 292k 均值从 -2.24 → -12.54（6× 跃升），与 upright_penalty 从 -2.63 → -5.41 的跃升几乎同步发生在 step 280k。
+
+---
+
+### 4. upright_penalty 失控性增长 — HIGH
+
+**Symptom:** `upright_penalty` recent_mean 从早期 -0.54 增长到后期 -13.56，增幅 25×，Q5 最低达 -67.45（单次 episode 极端值）。
+
+**Root Cause:** `upright_penalty_weight=0.8` 叠加 success_reward 的高额正向激励，策略陷入「高倾斜高速接近目标 → 高 success_reward → 高 upright_penalty」的反向循环。无人机选择接受 upright_penalty 换取 success_reward，但接触质量恶化导致 illegal_contact 激增。
+
+**Target 对比 (Run 13 期望 > -1.2):** Run 14 recent_mean=-11.38，远未达标。
+
+---
+
+### 5. height_penalty bug 修复确认生效 — POSITIVE
+
+**Symptom:** `height_penalty` 从早期均值 -1.94 增长到后期 -13.18，且 Q5 在 step 320k 达到 -39.43（极端俯冲个案被正确捕获）。
+
+**结论:** per-drone 绝对误差修复完全生效。Run 13 中 height_penalty 全程约 -1.90（L2 norm 稀释），Run 14 后期均值 -13.18，说明单架无人机俯冲行为被准确检测并惩罚。
+
+**副作用:** 但 height_penalty 的持续增大同样指示无人机持续飞低，与 fly_low 终止相互印证。这不是单纯的 bug 修复副作用，而是策略确实在俯冲。
+
+---
+
+### 6. policy_std 低于健康范围 — MEDIUM
+
+**Symptom:** `policy_std` 从初始 0.82 下降到 last=0.617，recent_std 仅 0.0013（极度稳定），low watermark 约 0.525。
+
+**健康范围 0.65~0.80:** Run 14 当前 0.617，偏低但尚未严重。策略已进入 exploitation 主导阶段，探索不足可能导致陷入局部最优（激进倾斜 + 俯冲的 sub-optimal 策略）。
+
+---
+
+### 7. bounding_box 持续下降 — POSITIVE
+
+**Symptom:** `bounding_box` 终止从早期均值 1.159 下降到最后 0.629，说明无人机逐渐学会留在边界内。
+
+**结论:** `drone_out` 惩罚有效，且 step 260k 后 `drone_out` 的 Q95 降至 -0.18，说明大多数 episode 中无人机不再飞出边界。
+
+---
+
+### 8. total_reward 方差极大 — MEDIUM
+
+**Symptom:** Total reward (mean) 最后 20 步：均值 ~4,970，但 max 达 86,248（成功 episode），min 为 518。更早（step 364,100）出现 max=86,051 与 mean=3,361 同一时刻，说明环境内少数 env 大成功，多数平庸。
+
+**Root Cause:** 策略已呈现双峰分布——成功 env（all_targets_captured 触发 success_reward 爆发）vs. 崩溃 env（crash/fly_low 早终止）。两者 reward 差距 >100×。
+
+---
+
+## Run 14 成功标准对照
+
+| 指标 | 目标 | 实际 | 达标 |
+|------|------|------|------|
+| `success_reward` recent_mean > 0.5/ep | 0.5 | 1,397 | YES |
+| `all_targets_captured` Q5 > 0.69/rollout | 0.69 | 0.330（后期下降） | NO（峰值时达到，后退化） |
+| `illegal_contact` min spike > -20 | > -20 | -219.77（极端值）| NO |
+| `upright_penalty` recent_mean > -1.2 | > -1.2 | -11.38 | NO |
+| `height_penalty` recent_mean > -1.5 | > -1.5 | -13.18（bug 修复生效，策略俯冲） | NO（但 bug 修复成功） |
+| `total_reward` recent_std < 40 | < 40 | ~2,681（环境间差异巨大）| NO |
+
+---
+
+## Root Cause Summary
+
+Run 14 的核心矛盾：**success_reward 重新激活后，成功奖励（最高 22,084/episode）在量级上压倒所有惩罚项（upright~-13，height~-13，illegal~-19），策略选择「接受所有惩罚换取 success_reward」的激进策略，导致高倾斜俯冲式接近 → 碰撞式接触 → crash/fly_low 终止频率爆发。**
+
+具体链条：
+1. success_reward 重激活，量级约 1,000-22,000/episode
+2. 策略发现：高速俯冲 + 倾斜接近目标 → success_reward 大
+3. upright_penalty (-13.56) + height_penalty (-13.18) + illegal_contact (-19.21) 合计约 -46，仍远小于 success_reward > 1,000
+4. crash/fly_low 终止频率从 step 280k 起爆炸性上升（crash: 0.177→0.527）
+5. all_targets_captured Q5 下降（被提前终止打断）
+
+---
+
+## Improvement Recommendations for Run 15
+
+### Priority 1 (CRITICAL): 降低 success_reward_weight，消除量级失衡
+
+**Problem:** success_reward 在量级上（~1,000-22,000）压倒所有惩罚项总和（~-46），策略优化方向完全被 success_reward 主导，接受一切代价的激进行为。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `success_reward_weight` `5.0` → `1.0`（或）实现为固定奖励而非 cumulative
+- **Rationale:** success_reward 按持续时间累积（`all_targets_captured * weight * dt * steps`），会无限增大。应改为固定 bonus（例如 50.0 每次捕获），或将 weight 从 5.0 大幅降低到约 0.5~1.0，使成功奖励量级与惩罚项处于同一数量级。
+- **目标:** success_reward/rollout 约 50-200（当前 1,397），仍能提供正向激励但不压倒安全约束。
+
+---
+
+### Priority 2 (HIGH): 回退 upright_penalty_weight，解耦 crash 根因
+
+**Problem:** `upright_penalty_weight=0.8` 在 success_reward 高额激励下未能约束激进倾斜，反而导致策略学会「接受 upright_penalty 换取 success_reward」，是 crash 和 illegal_contact 爆发的主要共因。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `upright_penalty_weight` `0.8` → `0.5`（回退到 Run 13 值）
+- **Rationale:** 在 success_reward 量级问题解决前，维持 Run 13 的 upright 约束强度。Priority 1 修复后可重新评估是否需要增强 upright 惩罚。
+
+---
+
+### Priority 3 (HIGH): 增强 fly_low 和 crash 的惩罚力度（与 success_reward 重新平衡）
+
+**Problem:** `fly_low_penalty=4.0`（累积式），`fly_low` 终止每 rollout 约 0.31 次，说明惩罚强度不足以阻止俯冲行为。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `fly_low_penalty` `4.0` → `6.0`
+- **Rationale:** 加大 fly_low 惩罚使其在 episode 内总量（均值 -1.19）与调整后 success_reward 量级相当，迫使策略真正权衡安全与成功。若 Priority 1 将 success_reward_weight 降至 1.0，fly_low_penalty 相应需要重新对标，6.0 为保守上界。
+
+---
+
+### Priority 4 (MEDIUM): 降低 illegal_contact 联系阈值，或加强 illegal_contact 惩罚
+
+**Problem:** `contact_sensor_threshold=20N` 允许更激进接触，但 illegal_contact 后的极端 spike（min=-219.77）说明接触质量极差，策略使用高力量撞击。
+
+**Proposed Change（两选一）:**
+
+**Option A（推荐）:** 维持阈值 20N，增加 `illegal_contact_penalty_scale`。
+- **Parameter:** `illegal_contact_penalty_scale` → 检查当前值并提升 50%
+- **Rationale:** 已有的高力量接触应该被更严厉惩罚，而不是靠降低阈值增加误报。
+
+**Option B:** 回退 `contact_sensor_threshold` 15N
+- 回退到 Run 13 值，但可能重新引入误报问题（Run 13 期望修复此项）。
+
+---
+
+### Priority 5 (MEDIUM): 为 success_reward 增加安全约束门槛
+
+**Problem:** 当前 success_reward 在 all_targets_captured 时立即累积，不区分捕获质量（高倾斜俯冲式捕获与稳定悬停式捕获获得相同奖励）。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- **修改 success_reward 计算：** 添加 `upright_ok = tilt_angle < threshold` 门控条件，只有姿态正常时才累积 success_reward。
+- **Rationale:** 阻断「高倾斜 + 成功」的虚假奖励路径，强制策略学习稳定姿态下的捕获行为。
+- **实现参考:**
+  ```python
+  upright_ok = (tilt_angle < 0.5)  # ~28 degrees
+  rewards["success_reward"] = success_reward_weight * all_targets_captured.float() * upright_ok.float()
+  ```
+
+---
+
+### Priority 6 (LOW): 调整 entropy_loss_scale 防止过早收敛
+
+**Problem:** `policy_std=0.617`，低于健康范围（0.65~0.80），策略已高度确定，探索不足，容易陷入激进俯冲的局部最优。
+
+**Proposed Change:**
+- **File:** SKRL 训练配置或 `*_env_cfg.py` 中的 `entropy_loss_scale`
+- **Parameter:** `entropy_loss_scale` `0.004` → `0.006`（+50%）
+- **Rationale:** 增强探索，使策略有机会发现更稳定的捕获路径，防止过度收敛于当前激进策略。
+
+---
+
+## Run 15 参数汇总
+
+| 参数 | Run 14 | Run 15 | 原因 |
+|------|--------|--------|------|
+| `success_reward_weight` | 5.0 | **1.0** | CRITICAL：消除量级失衡（压倒所有惩罚项） |
+| `upright_penalty_weight` | 0.8 | **0.5** | 回退 Run 13 值，解耦 crash 根因 |
+| `fly_low_penalty` | 4.0 | **6.0** | 与降低后的 success_reward 重新平衡 |
+| `contact_sensor_threshold` | 20N | **20N**（保持）| 继续观察，改为加强惩罚幅度 |
+| `height_penalty_threshold` | 1.5m | **1.5m**（保持）| bug 已修复确认，维持当前值 |
+| `entropy_loss_scale` | 0.004 | **0.006** | 防止过早收敛，policy_std 偏低 |
+
+---
+
+## Experiment Plan for Run 15
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --algorithm="MAPPO"
+```
+
+1. 应用所有 Priority 1-4 变更（success_weight + upright_weight + fly_low + entropy）
+2. 运行至少 400k steps
+3. 在 step 100k 检查 crash 趋势是否降低（目标 < 0.15）
+4. 在 step 200k 检查 success_reward 是否仍有正向驱动（目标 recent_mean > 100）
+5. 在 step 300k 检查 all_targets_captured Q5 是否稳定（目标 > 0.60）
+
+### 监控目标（Run 15）
+
+1. `Episode_Termination/crash` recent_mean — 目标：< 0.15（Run 14 后期 0.451）
+2. `Episode_Termination/falcon_fly_low` recent_mean — 目标：< 0.10（Run 14 后期 0.309）
+3. `Episode_Reward/success_reward` recent_mean — 目标：50-500/ep（有效但不压倒安全项）
+4. `Episode_Reward/upright_penalty` recent_mean — 目标：> -2.0（从 -11.38 改善）
+5. `Episode_Termination/all_targets_captured` Q5 — 目标：> 0.60（维持 Run 14 峰值水平）
+6. `Policy / Standard deviation` — 目标：0.65~0.75（从 0.617 回升）
+
+### 成功标准（Run 15 达成条件）
+
+- crash mean < 0.15（关键：激进行为被抑制）
+- fly_low mean < 0.10
+- success_reward recent_mean 50~500（有效激励但不失控）
+- upright_penalty recent_mean > -2.0
+- all_targets_captured Q5 ≥ 0.60，且无后期退化趋势
+- policy_std ≥ 0.65
+
+## Changelog
+
+- 2026-04-06: Run 14 分析完成。核心发现：success_reward 代码修复完全生效（首次非零 step=700），但量级失衡（~1,000-22,000 压倒惩罚总和 ~-46）导致激进俯冲策略，crash/fly_low 在 280k 步后爆发性上升，all_targets_captured Q5 后期退化。height_penalty bug 修复确认生效（均值从 -1.90 → -13.18）。Run 15 首要任务：success_reward_weight 5.0 → 1.0 消除量级失衡，回退 upright_weight 0.8 → 0.5。
