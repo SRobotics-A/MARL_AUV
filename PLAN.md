@@ -7986,3 +7986,231 @@ python3 scripts/skrl/train.py \
 ## Changelog
 
 - 2026-04-06: Run 14 分析完成。核心发现：success_reward 代码修复完全生效（首次非零 step=700），但量级失衡（~1,000-22,000 压倒惩罚总和 ~-46）导致激进俯冲策略，crash/fly_low 在 280k 步后爆发性上升，all_targets_captured Q5 后期退化。height_penalty bug 修复确认生效（均值从 -1.90 → -13.18）。Run 15 首要任务：success_reward_weight 5.0 → 1.0 消除量级失衡，回退 upright_weight 0.8 → 0.5。
+- 2026-04-06: Run 15 分析完成。success_reward Q5=139（仍为正向组合总量的 92%，远超目标 <100），量级失衡未根治。crash Q3→Q5 改善 -25.7%，fly_low 改善 -41.1%（fly_low_penalty=6.0 有效）。all_targets_captured Q5=0.811（超目标 0.70）。policy_std Q5=0.565（低于目标 0.65~0.80，entropy 不足）。illegal_contact Q5=-5.27 复发（需 threshold 30N）。新发现：bounding_box Q5=0.809（比 Q3=0.667 更差，反弹）。
+
+---
+
+# Run 15 训练分析报告
+
+**Run:** 2026-04-06_12-35-13_mappo_torch_mappo
+**Date:** 2026-04-06
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Total Steps:** 400,000
+**Compared Against:** Run 14 (2026-04-05_23-37-49 → 2026-04-06)
+
+---
+
+## Training Metrics Summary
+
+| 指标 | Run 14 Q5 | Run 15 Q5 | 变化 | 目标 |
+|------|-----------|-----------|------|------|
+| total_reward mean | ~355 (est.) | +398.4 | +12% | 持续上升 |
+| success_reward/ep | 1,397 | 139.2 | -90% | <100 (目标未达) |
+| all_targets_captured | 0.330 (退化) | 0.811 | +146% | >0.70 ACHIEVED |
+| crash termination | 0.641 | 0.344 | -46% | <0.15 (目标未达) |
+| falcon_fly_low | 0.309 | 0.197 | -36% | <0.10 (目标未达) |
+| policy_std | 0.617 | 0.565 | -8.4% | 0.65~0.80 (目标未达) |
+| ep_len mean | ~381 | 281.4 | -26% | >300 |
+| bounding_box | 0.56 | 0.809 | +44% | <0.3 (反弹) |
+| illegal_contact/ep | -0.82 | -5.269 | -542% | 接近 0 (严重复发) |
+| height_penalty/ep | -1.98 | -5.030 | -154% | >-2.0 (严重恶化) |
+
+---
+
+## Observations & Findings
+
+### 1. success_reward 量级：大幅改善但仍失衡 — Severity: HIGH
+
+**Symptom:** success_reward_weight 5.0→1.0 后，Q5 mean 从 ~1,397 降至 139.2/ep（-90%），但仍占所有正向奖励总量的 **92.0%**（139.2 vs 其他正向 12.1 之和），vs 负向惩罚总和 |-20.5|，success_reward 与惩罚比仍为 **6.8x**（目标应 <2x）。
+
+**Root Cause:** weight=1.0 仍然允许连续捕获累积大量奖励。success_reward 的绝对值由捕获频次 × weight × hold_time 决定，当 all_targets_captured=0.81（每 rollout 超过 1 次捕获事件）时，即使 weight=1.0 也会产生远大于常规追踪奖励的累积量。
+
+**Evidence:** Q4/Q5 success_reward 最大值 2920/2476（单 episode 峰值），median 31.78 但 mean 139（重尾分布），部分 episode 仍有极端值驱动平均。
+
+**比 Run 14 改善的诊断:** 失衡从 1397 降到 139（一个数量级）是正向进展，但仍需继续降权至 0.3~0.5 使 success 不再主导。
+
+---
+
+### 2. crash/fly_low：改善趋势确认，但绝对量仍过高 — Severity: HIGH
+
+**Symptom:** crash Q3=0.463→Q4=0.378→Q5=0.344（-25.7% 改善）；fly_low Q3=0.334→Q4=0.269→Q5=0.197（-41.1% 改善）。fly_low_penalty=6.0 有效果，**fly_low 改善幅度大于 crash**，说明惩罚主要抑制了低空悬停型触发，但物理式俯冲（瞬时速度拉向目标导致 crash）尚未根治。
+
+**Root Cause:** 当 success_reward 仍主导奖励时，策略仍有动机进行激进靠近。crash Q5=0.344 意味着约 34% rollout 有坠机事件——该频率与 Run 14 的 crash 爆发期相似，但已不再是单调恶化趋势。
+
+**Evidence:** crash 和 fly_low 的 Q3-Q5 均呈单调下降，说明问题在改善但远未达到 <0.15 目标。
+
+---
+
+### 3. all_targets_captured：稳定性显著恢复 — Severity: RESOLVED (partial)
+
+**Symptom:** Q1=0.054→Q2=0.395→Q3=0.458→Q4=0.607→Q5=0.811，单调上升，Q5=0.811 超过目标 0.70，且 Q5 最小值=0.270（无后期崩溃）。
+
+**Root Cause of recovery:** Run 14 的后期退化（0.672→0.330）由 crash 主导的 episode 终止导致。Run 15 中 crash 下降 46%，使 all_targets_captured 得以积累。upright_weight 回退 0.8→0.5 也减少了追踪期的机动抑制。
+
+**Outstanding concern:** Q5 best=1.62，仍有高方差（std 估算较高），但趋势健康。
+
+---
+
+### 4. policy_std：持续向下，未达目标 — Severity: HIGH
+
+**Symptom:** Q1=0.803→Q2=0.673→Q3=0.584→Q4=0.573→Q5=0.565，单调下降，终值 0.565 低于健康下限 0.65，且仍在下降（Q5 内 range=0.558~0.571，极度压缩）。
+
+**Root Cause:** entropy_loss_scale=0.006 相比 Run 14 的 0.004 提升幅度不足。success_reward 的强梯度信号（高 reward 高方差 → policy 被"拉"向固定行为）与 entropy 项对抗，前者胜出。当 success_reward 占正向总量 92%，entropy 项的相对权重极小。
+
+**Evidence:** Run 12 中 entropy=0.003 使 std 从 62.6% 降幅收窄至 19.3%；Run 15 用 0.006 仍得到 -8.4% 降幅。根本矛盾：entropy 项受 success_reward 强信号压制。要解决 std 问题，必须同时降低 success_reward 绝对值（降权）和提高 entropy（0.008~0.010）。
+
+---
+
+### 5. illegal_contact：严重复发 — Severity: HIGH
+
+**Symptom:** Q1=-0.021→Q2=-0.757→Q3=-7.967→Q4=-6.848→Q5=-5.269，Q3 以后激增（500x 倍于 Q1）。worst=-246.36（单次极端值）。
+
+**Root Cause:** all_targets_captured 在 Q2-Q3 开始稳定（0.395→0.458）意味着无人机更频繁地靠近 NovaCarter，在 contact_sensor_threshold=20N 下仍触发大量接触事件。Run 11 的 threshold=15N 时 Q5=-0.82；Run 15 的 threshold=20N 时 Q5=-5.27——说明更多的靠近频次（0.45→0.81 all_targets_captured）比 threshold 升高的效果更强。
+
+**Evidence:** illegal_contact 与 all_targets_captured 的增长时序高度一致（Q2-Q3 同步上升），确认为靠近捕获带来的结构性碰撞。需要 threshold 进一步提升至 30N 或对每次接触的 penalty 数值限制（clip）。
+
+---
+
+### 6. bounding_box：意外反弹 — Severity: MEDIUM
+
+**Symptom:** Q1=1.119→Q2=0.930→Q3=0.668→Q4=0.733→Q5=0.809。Q3 之后反弹，Q5 回到 0.809——高于 Q2 和 Q3。
+
+**Root Cause:** crash Q3→Q4→Q5 改善（episode 变长）+ success_reward 强信号使策略追踪更激进（速度更快），靠近目标时惯性更大，更容易穿越软边界。此外 ep_len Q4=291→Q5=281（轻微缩短）说明有新的截断来源，但 bounding_box 反弹表明某些长 episode 仍在以 OOB 终止。
+
+**Note:** 此问题在没有 success_reward 量级失衡时会自然缓解（低激进性），属于次级症状。
+
+---
+
+### 7. height_penalty 恶化 — Severity: HIGH
+
+**Symptom:** Q1=-1.54→Q2=-1.24→Q3=-4.93→Q4=-4.95→Q5=-5.03，Q3 后大幅跳升并稳定在 -5/ep。
+
+**Root Cause:** 与 illegal_contact 复发同根：all_targets_captured 改善意味着无人机更频繁俯冲接近目标（z≈0.25m），而 height_penalty_threshold=1.5m、desired_height=2.5m，俯冲到 z<1.0m 时 height_penalty=-1.0×(2.5-1.0-1.5)=0 刚好在边界，但动态俯冲会超越此范围。height_penalty 在 Run 14 中已被修复为 per-drone 计算，此处的恶化说明俯冲深度（与 crash）是协变的——crash 减少 46% 但 height_penalty 加剧 154%，说明无人机学会了"更深俯冲但不坠地"的边界策略。
+
+---
+
+## Run 15 关键结论
+
+1. **success_reward 降权显著改善（-90%），但仍需继续降低**：weight=1.0 时 success 仍占正向总量 92%。目标 weight=0.3，使 success Q5 mean 降至 40-60/ep（与惩罚总量 ~20/ep 接近平衡）。
+2. **crash/fly_low 改善方向正确，但速度不够**：fly_low_penalty=6.0 使 fly_low 改善 -41%，crash 改善 -26%。需要继续加压（8.0），同时降低 success_reward 量级减少激进动机。
+3. **all_targets_captured 完全恢复并超标**：Q5=0.811，Run 15 在这一维度达标。
+4. **policy_std 问题根源在 success_reward 主导**：在 success 降权前，提高 entropy 收益有限。entropy_loss_scale 需同步提升至 0.010，让 std 实际能维持在 0.65+。
+5. **illegal_contact 是新的优先问题**：contact_sensor_threshold 需从 20N 提升至 30N，同时考虑对 illegal_contact 奖励项做 clip（如每步上限 -5.0）防止极端值。
+6. **height_penalty 反映的俯冲加深是正常学习阶段**：可容忍，但需通过 fly_low_penalty 继续约束下限。
+
+---
+
+## Improvement Recommendations for Run 16
+
+### Priority 1 (CRITICAL): 继续降低 success_reward_weight
+
+**Problem:** weight=1.0 时 success_reward 仍占正向总量 92%（Q5=139/ep vs 惩罚总量 20/ep），6.8x 失衡。策略仍被 success 主导，导致激进靠近、policy_std 压缩、bounding_box 反弹。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `success_reward_weight` `1.0` → `0.3`
+- **Rationale:** 以 Run 15 Q5 mean 比例换算：0.3/1.0 × 139 ≈ 42/ep，接近惩罚总量 20/ep，比例约 2x（健康范围）。既保持 success 的正向激励，又不压制安全行为。
+
+---
+
+### Priority 2 (HIGH): 提高 illegal_contact contact_sensor_threshold
+
+**Problem:** illegal_contact Q5=-5.27/ep（Q3 以后 500x 激增），worst=-246.36。随着捕获频率（all_targets_captured=0.81）提升，无人机更频繁靠近 NovaCarter，20N 阈值不足以过滤近距离飞行时的微接触力。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `contact_sensor_threshold` `20.0` → `30.0`（N）
+- **Rationale:** Run 11 用 15N 时 Q5=-0.82（all_targets_captured=0.027），Run 15 用 20N 时 Q5=-5.27（all_targets_captured=0.81）。捕获率增长 30x 对应接触事件增长约 6x，需 threshold 再上调。30N 历史上从未使用，预计可将 illegal_contact 压回 -1.0 量级。
+
+---
+
+### Priority 3 (HIGH): 继续提高 fly_low_penalty
+
+**Problem:** crash Q5=0.344、fly_low Q5=0.197，虽相比 Run 14 改善，但仍远超目标。fly_low_penalty=6.0 使 fly_low 下降 41%，趋势正确但需继续加压。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `fly_low_penalty` `6.0` → `8.0`
+- **Rationale:** 步进式递增历史验证：3.0→4.0→6.0 每次减少约 30-40%。8.0 预计再减 30-40%，使 fly_low Q5 降至 0.12-0.14（接近目标 <0.10）。与此同时，success_reward 降权（Priority 1）减少激进靠近动机，两者协同效果预期大于单独效果。
+
+---
+
+### Priority 4 (HIGH): 大幅提高 entropy_loss_scale
+
+**Problem:** policy_std Q5=0.565，单调下降且仍在压缩（Q5 range=0.558~0.571，极度收敛）。entropy=0.006 对抗 success_reward 强梯度完全不足。
+
+**Proposed Change:**
+- **File:** SKRL 训练配置
+- **Parameter:** `entropy_loss_scale` `0.006` → `0.010`
+- **Rationale:** 在 success_reward 降权（Priority 1）同时，success 的梯度贡献减少，entropy 的相对强度才能有效。预期两者协同：success 降权减少向固定行为的收敛压力，entropy=0.010 补偿探索损耗。目标 std 回升至 0.65~0.75（Run 7-9 验证区间）。**注意：** 如果 Priority 1 未实施，entropy=0.010 单独效果有限；两项必须同时应用。
+
+---
+
+### Priority 5 (MEDIUM): 限制 illegal_contact 奖励极端值（clip）
+
+**Problem:** illegal_contact worst=-246.36，极端 spike 会引入大梯度噪声，破坏策略稳定性（Run 10 中 -815.33 spike 曾导致训练崩溃）。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- **Logic:** 在 `_compute_rewards()` 的 illegal_contact 累积处，加入 `torch.clamp(illegal_contact_reward, min=-5.0)` 限制单步最大惩罚
+- **Rationale:** 防止单次近距离接触产生数百倍于其他奖励的梯度冲击。30N threshold（Priority 2）减少触发频率，clip 减少单次影响，双重防护。
+
+---
+
+### Priority 6 (LOW): 评估 bounding_box_threshold 进一步调整
+
+**Problem:** bounding_box Q5=0.809（Q3 后反弹），说明当 ep_len 延长且追踪更激进时，软边界（8m）和硬边界（10m）之间的 2m 缓冲不够。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** 暂时维持 `bounding_box_threshold=10.0m`，观察 success_reward 降权（Priority 1）后 bounding_box 是否自然改善（激进追踪减少 → 超界减少）
+- **Rationale:** bounding_box 反弹的根因是激进追踪（success 主导），而非边界参数问题。先解决 Priority 1-4，在 Run 16 结果中重新评估是否需要调整边界。
+
+---
+
+## Run 16 参数汇总
+
+| 参数 | Run 15 | Run 16 | 目标 |
+|------|--------|--------|------|
+| `success_reward_weight` | 1.0 | **0.3** | success Q5 mean ≈ 40/ep，与惩罚比 <2x |
+| `fly_low_penalty` | 6.0 | **8.0** | fly_low Q5 < 0.12，crash Q5 < 0.20 |
+| `contact_sensor_threshold` | 20N | **30N** | illegal_contact Q5 < -1.0 |
+| `entropy_loss_scale` | 0.006 | **0.010** | policy_std 回升至 0.65~0.75 |
+| `upright_penalty_weight` | 0.5 | **0.5**（保持）| 观察，Run 15 Q5=-3.84 可接受 |
+| `bounding_box_threshold` | 10.0m | **10.0m**（保持）| 等 success 降权后再评估 |
+
+---
+
+## Experiment Plan for Run 16
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --algorithm="MAPPO"
+```
+
+1. 同时应用 Priority 1-4 四项变更（success_weight + fly_low + contact_threshold + entropy）
+2. 在 step 80k 检查 success_reward Q1 mean（目标 <20/ep，若 >100 需提前降至 0.2）
+3. 在 step 160k 检查 policy_std（目标 >0.65；若仍 <0.60 需将 entropy 提至 0.012）
+4. 在 step 240k 检查 illegal_contact Q3（目标 >-1.5；若 <-3.0 需将 threshold 提至 40N）
+5. 在 step 320k 检查 all_targets_captured Q4（目标 >0.60；若 <0.40 需排查 crash 率）
+6. 运行至 400k steps 完整评估
+
+### 监控目标（Run 16）
+
+1. `Episode_Reward/success_reward` Q5 mean — 目标：30~80/ep（成功但不压倒）
+2. `Episode_Termination/crash` Q5 mean — 目标：< 0.20（从 0.344 改善）
+3. `Episode_Termination/falcon_fly_low` Q5 mean — 目标：< 0.12（从 0.197 改善）
+4. `Episode_Reward/illegal_contact` Q5 mean — 目标：> -1.5（从 -5.27 改善）
+5. `Policy / Standard deviation` Q5 mean — 目标：0.65~0.75（从 0.565 回升）
+6. `Episode_Termination/all_targets_captured` Q5 mean — 目标：> 0.70（维持 Run 15 水平）
+7. `Episode_Termination/bounding_box` Q5 mean — 目标：< 0.50（从 0.809 改善）
+
+### 成功标准（Run 16 达成条件）
+
+- success_reward Q5 mean 30~80/ep（有效激励但不失控）
+- crash Q5 mean < 0.20
+- illegal_contact Q5 mean > -1.5
+- policy_std Q5 mean > 0.65
+- all_targets_captured Q5 mean > 0.70，且无后期退化
