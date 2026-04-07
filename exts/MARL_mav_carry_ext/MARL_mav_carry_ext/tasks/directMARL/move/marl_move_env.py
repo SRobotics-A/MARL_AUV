@@ -842,7 +842,8 @@ class MARLMoveEnv(DirectMARLEnv):
         rewards["boundary_soft"] = -self.cfg.boundary_soft_penalty_weight * soft_penalty * step_dt
 
         # --- 9. Fly Low Penalty ---
-        fly_low = (self.drone_positions[:, :, 2] < 0.1).any(dim=-1)
+        # Run19 fix: raise threshold 0.1→0.5m to close the 0.9m unprotected dive zone
+        fly_low = (self.drone_positions[:, :, 2] < 0.5).any(dim=-1)
         rewards["fly_low"] = -fly_low.float() * self.cfg.fly_low_penalty
 
         # --- 10. Illegal Contact Penalty ---
@@ -872,8 +873,8 @@ class MARLMoveEnv(DirectMARLEnv):
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """终止条件"""
-        # 无人机飞太低
-        self.falcon_fly_low = (self.drone_positions[:, :, 2] < 0.1).any(dim=-1)
+        # 无人机飞太低（Run19 fix: 0.1→0.5m，关闭0.9m无约束俯冲区）
+        self.falcon_fly_low = (self.drone_positions[:, :, 2] < 0.5).any(dim=-1)
 
         # 非法接触（per-drone contact sensor）
         self.illegal_contact = torch.zeros(
