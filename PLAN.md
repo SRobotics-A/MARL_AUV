@@ -8710,3 +8710,264 @@ Q1 几乎为零（训练初期刚开始），Q2~Q4 维持在 0.3~0.4。这说明
 
 ## Changelog
 - 2026-04-07: 追加 Run 16 vs Baseline 独立对比分析（发现奖励欺骗模式，bounding_box/fly_low 耦合效应，success_weight 机制澄清），更新 Run 18 建议（bbox 14.0，fly_low 6.0，entropy 0.004）
+
+---
+
+# Training Analysis Report — Run 17 完整 400k 步分析
+
+**Run:** 2026-04-07_09-00-13_mappo_torch_mappo  
+**Date:** 2026-04-07  
+**Task:** Isaac-move-flyfollow-marl-v0  
+**Algorithm:** MAPPO  
+**Steps:** 400,000 (完整训练)  
+**num_envs:** 32
+
+## Training Metrics Summary
+
+| 指标 | Q1 | Q2 | Q3 | Q4 | Q5 | last20_mean |
+|------|----|----|----|----|-----|------------|
+| instant_reward_mean | 0.038 | 0.378 | 0.843 | 0.958 | 0.850 | 0.753 |
+| ep_len_mean (steps) | 111 | 256 | 742 | 1626 | 2432 | 2869 |
+| all_targets_captured | 0.030 | 0.427 | 0.360 | 0.305 | 0.332 | 0.203 |
+| success_reward | 0.30 | 48.6 | 272 | 581 | 780 | 559 |
+| bounding_box | 1.107 | 0.903 | 0.664 | 0.488 | 0.346 | 0.144 |
+| crash | 0.039 | 0.155 | 0.240 | 0.257 | 0.242 | 0.169 |
+| falcon_fly_low | 0.012 | 0.132 | 0.215 | 0.227 | 0.213 | 0.169 |
+| illegal_contact (term) | 0.031 | 0.050 | 0.072 | 0.116 | 0.111 | 0.025 |
+| time_out | 0.0001 | 0.019 | 0.122 | 0.269 | 0.419 | 0.652 |
+| policy_std | 0.837 | 0.754 | 0.721 | 0.678 | 0.637 | 0.627 |
+| fly_low_reward | -0.12 | -1.49 | -2.51 | -2.70 | -2.54 | -2.03 |
+| height_penalty | -1.33 | -4.18 | -17.8 | -37.2 | -57.4 | -89.5 |
+| upright_penalty | -0.58 | -3.84 | -20.2 | -43.2 | -66.6 | -103.2 |
+| tracking_reward | 2.06 | 4.38 | 10.56 | 18.99 | 26.94 | 35.24 |
+| distance_reward | 1.97 | 4.72 | 13.18 | 24.56 | 35.07 | 36.30 |
+
+**ep_len-normalized per-step success_reward:** Q3=0.367/step → Q4=0.357/step → Q5=0.321/step（稳定下降，无欺骗加速）
+
+---
+
+## 五个核心问题逐一回答
+
+### 1. bounding_box 终止率后期是否改善？—— YES，显著改善
+
+**结论：完全确认，且幅度超过预期。**
+
+- Q1=1.107 → Q2=0.903 → Q3=0.664 → Q4=0.488 → Q5=0.346（last20_mean=0.144）
+- Q5 相比 Q1 下降 **69%**，last20_mean 仅 0.144（接近清零水平）
+- 109k 步时的中期分析：Q4=0.748（仍高）。但从完整曲线看，Q4 是最后一个高点——Q5 和 last20 均显示 bbox 已被策略学会回避
+- 同期 time_out 从 Q1=0.0001 升至 Q5=0.419（last20=0.652），说明策略后期**主要靠自然超时退出而非 bbox 终止**
+- **中期分析的担忧是过早的**：109k 步时策略仍在高度探索阶段，bbox 终止主要来自随机动作；后期 ep_len 增长到 2432 步均值后，策略已有足够时间在边界外减速
+
+**机制证明：** ep_len Q1=111 → Q5=2432（+2191%）。bounding_box 的消失与 ep_len 的爆发性增长同步——策略学会了在边界内长期生存。
+
+---
+
+### 2. all_targets_captured 最终趋势（Q5 是否超过 0.7）？—— NO，Q5=0.332，稳定但未达到目标
+
+**结论：** Q5 均值 0.332，last20_mean=0.203，未超过 0.7 目标。趋势是 Q2 峰值后小幅衰减并稳定。
+
+**详细分解：**
+- Q1=0.030（训练初期，无捕获能力）
+- Q2=0.427（**峰值**，第一批成功捕获）
+- Q3=0.360，Q4=0.305，Q5=0.332（Q2 后小幅衰减，约 -22%，Q5 轻微回升）
+- last20_mean=0.203（最终 20 个 rollout 均值低于 Q5 均值，说明末期波动较大）
+
+**为什么未超过 0.7？** 三个并发限制：
+1. **crash+fly_low 联合率 Q5=0.454**（crash=0.242 + fly_low=0.213）——约 45% 的 rollout 以坠机/低飞终止，中断捕获
+2. **per-step success_reward 从 Q3(0.367)→Q5(0.321) 持续下降**——说明策略并未"更努力捕获"，而是在更长 episode 中接受了每步更低的捕获频率
+3. **all_targets_captured last20_mean=0.203** 低于 Q5_mean=0.332，说明训练末期（step 380k-400k）存在负波动
+
+**与 Run 16 对比：** Run 16 Q5=0.211（中期分析），Run 17 Q5=0.332（+57%）。目标方向正确，但绝对值仍不足。
+
+---
+
+### 3. crash/fly_low 最终水平 —— 高位平台，未收敛
+
+**结论：** crash+fly_low 在 Q3-Q5 稳定在约 0.45/rollout 的平台，无下降趋势。
+
+| 指标 | Q1 | Q2 | Q3 | Q4 | Q5 | 趋势 |
+|------|----|----|----|----|-----|------|
+| crash | 0.039 | 0.155 | 0.240 | 0.257 | 0.242 | 增长后平台 |
+| falcon_fly_low | 0.012 | 0.132 | 0.215 | 0.227 | 0.213 | 增长后平台 |
+| combined | 0.051 | 0.287 | 0.455 | 0.484 | 0.454 | Q3-Q5 锁定 |
+
+**fly_low_penalty=12.0 的实际效果：**
+- fly_low 奖励惩罚轨迹：Q1=-0.12 → Q3=-2.51 → Q5=-2.54/ep（Q5 基本与 Q3 持平，策略已适应惩罚幅度）
+- 但 fly_low_penalty 的绝对量在 per-step 视角只是 -2.54/2432=-0.001/step，相比 success_reward/step=0.321 是 321x 倍差距
+- **12.0 的大惩罚并没有消灭 fly_low 行为，只是将其稳定在固定比例**
+
+**关键结构性原因（fly_low/bbox 耦合验证）：**
+- 中期分析中预测的 "fly_low_penalty=12 → 策略保守 → bbox 增加" 已被完整数据**部分推翻**
+- bbox 后期确实显著改善（Q5=0.346，中期 Q4=0.488），说明保守策略最终被克服了
+- 但 crash/fly_low 未下降，说明这是 **接近 NovaCarter 时的结构性碰撞**，而非保守飞行的副产品
+- 深层原因：nova_carter_scale=3.0 + capture_distance=3.0m XY，无人机必须飞至 3m 以内，而 NovaCarter 高度约 1.35m（0.45×3），接近时不可避免发生低飞触发
+
+---
+
+### 4. policy_std 收敛情况 —— 单调下降，末期平台，低于目标范围
+
+**结论：** 单调平稳下降（0.837→0.627），entropy_scale=0.007 有效防止了崩溃式下降，但最终 std 低于目标范围 0.65~0.75。
+
+| 指标 | Q1 | Q2 | Q3 | Q4 | Q5 | last20 |
+|------|----|----|----|----|-----|--------|
+| policy_std | 0.837 | 0.754 | 0.721 | 0.678 | 0.637 | 0.627 |
+
+- Run 16（entropy=0.010）：Q5=0.826（过高，超出目标上限）
+- Run 17（entropy=0.007）：Q5=0.637（低于目标下限 0.65）
+- 线性插值：目标 std=0.70 → entropy_scale ≈ **0.0085**；或以 0.004 进一步压低至 0.55~0.65
+
+**value_loss 状况：** recent_mean=0.023，last=0.084（末期小幅回升——对应 last20 的 bbox/crash 波动）。整体 critic 收敛健康。
+
+**结合 captured 分析的推论：** std=0.63 的策略已接近确定性，但 captured Q5=0.332 仍较低，说明问题不在于探索不足，而在于**策略选择了一种不积极捕获的稳定策略**（更长 ep + 更高 per-step 奖励，但减少接近 NovaCarter 风险）。
+
+---
+
+### 5. 奖励欺骗检查 —— 不存在 Run 16 式欺骗，但存在"被动稳定"新模式
+
+**结论：** Run 17 没有 Run 16 的经典奖励欺骗（captured 下降而 success_reward 上升）。但存在一种新的"被动稳定"模式：策略在 Q2 峰后不再积极提高 captured 率，而是通过延长 episode 来被动积累 success_reward。
+
+**数据证明：**
+- Run 16 欺骗特征：captured Q2→Q4 下降 -58%，success_reward Q2→Q4 上升 +41%（**反向**）
+- Run 17 数据：captured Q2→Q4 下降 -29%，success_reward Q2→Q4 上升 +1,095%（**同向，非欺骗**）
+- per-step success_reward：Q3=0.367 → Q4=0.357 → Q5=0.321（**单调下降**）
+
+**"被动稳定"的机制：**
+1. ep_len 爆炸式增长（Q3=742 → Q5=2432），success_reward 的绝对值主要由 ep_len 驱动
+2. per-step success_reward 下降说明策略实际上是"被稀释了"——每步平均捕获贡献在减少
+3. time_out 从 Q5=0.419 升至 last20=0.652，说明策略学会了"存活到超时"而非"尽快捕获"
+4. **这是 ep_len 主导下的成功奖励膨胀，而非主动欺骗**
+
+**与 Run 16 欺骗的根本区别：** Run 16 策略主动规避捕获（在边缘徘徊）；Run 17 策略真实发生捕获（Q5=0.332），只是捕获频率随 ep_len 增长而相对降低。不需要反欺骗对策，但需要提高 per-step 的捕获效率激励。
+
+---
+
+## 关键发现
+
+### 发现 1：高度惩罚/姿态惩罚的绝对值膨胀是 ep_len artifact — MEDIUM
+
+**表现：**
+- height_penalty Q5=-57.4/ep，last20=-89.5/ep（数值极大）
+- upright_penalty Q5=-66.6/ep，last20=-103.2/ep
+
+**per-step 归一化后的真实水平：**
+- height Q5: -57.4/2432 = **-0.0236/step**（与 Run 13 的 -1.89/ep÷261 = -0.00724/step 相比有所上升，但仍属可控）
+- upright Q5: -66.6/2432 = **-0.0274/step**（在 tracking_reward/step=26.94/2432=0.0111 的 2.5x 量级，比值偏高）
+
+**实际问题：upright_penalty per-step 是 tracking_reward per-step 的 2.5x**，这意味着策略每获取 1 单位追踪奖励，就付出 2.5 单位姿态惩罚。这压制了主动追踪积极性，但并非严重阻碍（captured Q5=0.332 仍为正值）。
+
+### 发现 2：illegal_contact 渐进增长，末期控制良好 — LOW
+
+- 终止率：Q1=0.031 → Q4=0.116 → Q5=0.111（Q5 略有回落）
+- 奖励：Q5=-1.71/ep（last20=-1.49）
+- 50N 阈值有效：最差点 worst=-293（偶发尖峰）但 last20_mean=-1.49（正常水平）
+- **50N 有效，无需升级**
+
+### 发现 3：boundary_soft 末期巨幅膨胀值是数值异常 — 需注意
+
+- boundary_soft last20_mean=-44.1，但 last=-0.089
+- worst=-347.8（偶发极端值）
+- 结合 bbox Q5=0.346（正在清零），boundary_soft 末期异常是极少数残余 bbox 事件的数值放大，非系统性问题
+
+---
+
+## Run 18 建议验证与修正
+
+基于完整 400k 步数据，对原有 Run 18 候选参数逐项验证：
+
+### 参数 1：bounding_box_threshold 10.0 → 14.0
+
+**验证结论：** 需要修正。原建议基于中期（109k步）Q4=0.748 的高 bbox 率。但完整数据显示 bbox Q5=0.346，last20=0.144——策略后期已学会回避边界，10.0m 阈值本身不是障碍。
+
+**修正建议：** 仍建议扩大至 14.0，但理由改变：
+- bbox 最终虽改善，但 Q2-Q4 的高 bbox 率（0.90/0.66/0.49）延迟了 ep_len 增长
+- 14.0 可让 Q2-Q3 阶段更快进入长 episode，更早激活 success_reward
+- 14.0 不会破坏 Q5 已建立的 "存活到超时" 策略
+
+**boundary_soft_threshold 8.0 → 11.0：** 配合 bbox=14.0，soft 在 11m 建立减速梯度，逻辑正确。维持原建议。
+
+### 参数 2：fly_low_penalty 12.0 → 6.0
+
+**验证结论：** 原建议需要**谨慎验证**，但总体支持降低。
+
+**支持降低的证据：**
+- fly_low_penalty=12.0 并未解决 crash/fly_low（Q5 combined=0.454，高位平台）
+- fly_low reward per-step=-0.001，相比 success_reward per-step=0.321 可忽略不计——12.0 的惩罚强度在数量级上无效
+- 来自 Run 10-12 的历史验证：fly_low_penalty=2.0 产生 Q5 crash=-31%，penalty=3.0 进一步 -47%；6.0 是 Run 14 后的经验安全点
+
+**反对过度降低的证据：**
+- 12.0 的高惩罚可能是 bbox 后期改善的间接贡献者（迫使策略更平稳）
+- 但与 bbox 改善的主因（ep_len 自然增长）相比，12.0 的贡献无法量化
+
+**修正建议：** 维持 6.0，但**同步观察 crash/fly_low 变化**。如果 Run 18 中 fly_low Q5 反弹至 >0.30，则说明 12.0 确实在抑制 fly_low，需回调至 8.0~10.0。
+
+### 参数 3：entropy_loss_scale 0.007 → 0.004
+
+**验证结论：** 支持，但需评估是否过度降低。
+
+**Run 17 实测标定：**
+- entropy=0.007 → std Q5=0.637（低于目标 0.65~0.75 下限）
+- entropy=0.010（Run 16）→ std Q5=0.826（超出目标上限）
+- entropy=0.004（Run 12-13 验证）→ std 约 0.627（与 Run 17 Q5=0.637 接近）
+
+**问题：** entropy=0.007 在 400k 步后 std 已降至 0.627，比目标下限 0.65 低 4%。0.004 可能将 std 进一步压至 0.55~0.60（Run 11 范围），接近导致 captured 崩溃的危险区（Run 11: std=0.597→captured=-93%）。
+
+**修正建议：** 接受 0.004，但设置**早停标准**：如果 Run 18 中 std 在 Q3 降至 0.60 以下，且 captured Q5 低于 0.25，需回调至 0.005~0.006。
+
+### 参数 4：success_reward_weight 维持 0.6，tracking 维持 5.0
+
+**验证结论：** 完全支持，无需修改。
+
+**证据：**
+- success_reward per-step 从 Q3(0.367) → Q5(0.321) 单调下降——无欺骗加速，奖励权重合理
+- captured Q5=0.332（Run 16 中期值为 0.211）——维持 0.6 正确
+- 反欺骗设计（per-step 单调下降）说明 0.6 的量级恰好在"激励足够但不溢出"的区间
+
+**额外建议：** 考虑对 success_reward 进行 per-capture 而非 per-step 的改造（参考 Run 14 分析）。但这是结构性改动，留待 Run 19+。
+
+### 新增建议（基于完整数据新发现）
+
+**NEW：upright_penalty_weight 0.5 → 0.3（MEDIUM）**
+
+证据：upright Q5 per-step=-0.0274，是 tracking per-step=0.0111 的 2.5x。策略被动姿态惩罚超过主动追踪奖励，从 captured 效率角度不合理。0.3 是 Run 8 的历史验证值（-1.125/ep 正常，drones_collide 未见明显增长）。
+
+**NEW：contact_sensor_threshold 维持 50N（不降低）**
+
+完整数据：illegal_contact worst=-293（单次尖峰），last20_mean=-1.49（正常）。50N 已有效控制，无需调整。
+
+---
+
+## Run 18 最终参数表（更新后）
+
+| 参数 | Run 17 | Run 18（更新） | 变化依据 | 优先级 |
+|------|--------|--------------|---------|--------|
+| `bounding_box_threshold` | 10.0 | **14.0** | 加速 Q2-Q3 ep_len 增长；Q5 已自然改善 | HIGH |
+| `boundary_soft_threshold` | 8.0 | **11.0** | 配合 bbox=14.0 | HIGH |
+| `fly_low_penalty` | 12.0 | **6.0** | 12.0 对 crash/fly_low 无效（Q5 平台 0.454）；6.0 为历史安全点 | HIGH |
+| `entropy_loss_scale` | 0.007 | **0.004** | Q5 std=0.637 低于目标；0.004 接受，需设早停 | MEDIUM |
+| `upright_penalty_weight` | 0.5 | **0.3** | per-step upright/tracking 比 2.5x，抑制追踪积极性 | MEDIUM |
+| `success_reward_weight` | 0.6 | **0.6（不变）** | 无欺骗，per-step 单调下降，无需修改 | — |
+| `tracking_reward_weight` | 5.0 | **5.0（不变）** | tracking last20=35.2，健康增长 | — |
+| `contact_sensor_threshold` | 50N | **50N（不变）** | last20 illegal_contact=-1.49，已控制 | — |
+
+### 早停监控指标（Run 18 关键预警）
+
+| 指标 | 早停阈值 | 触发动作 |
+|------|---------|---------|
+| policy_std Q3 | < 0.60 | entropy_scale 0.004 → 0.006 |
+| crash+fly_low Q5 combined | > 0.50（若 fly_low_penalty=6.0 后反弹） | fly_low_penalty 6.0 → 8.0 |
+| all_targets_captured Q5 | < 0.20 | 检查 captured 是否被 bbox 截断，还是 std 崩溃 |
+| success_reward per-step Q4→Q5 | 上升（反欺骗检测） | 降低 success_weight 至 0.4 |
+
+## Experiment Plan
+
+1. 应用 Run 18 参数变更（bbox=14，soft=11，fly_low=6，entropy=0.004，upright=0.3）
+2. `python3 scripts/skrl/train.py --task=Isaac-move-flyfollow-marl-v0 --headless --num_envs=2048 --algorithm="MAPPO"`
+3. 监控重点（按优先级）：
+   - **Q2 ep_len**（目标：> 600 步，验证 bbox=14 加速效果）
+   - **crash+fly_low Q5 combined**（目标：< 0.40，fly_low=6 降低是否引发 fly_low 反弹）
+   - **all_targets_captured Q5**（目标：> 0.50，验证 captured 改善）
+   - **policy_std Q3-Q5 趋势**（目标：0.60~0.70，防止 0.004 过度压低）
+4. 成功标准：captured Q5 > 0.50 AND crash Q5 < 0.20 AND ep_len Q5 > 3000 步
+
+## Changelog
+- 2026-04-07: 追加 Run 17 完整 400k 步分析。关键结论：bbox Q5 降至 0.144（问题自行解决），captured Q5=0.332（未达 0.7 目标，主因 crash+fly_low 高位平台 0.454），无奖励欺骗（per-step success 单调下降），policy_std=0.627（低于目标范围）。Run 18 调整：bbox 14.0、soft 11.0、fly_low 6.0、entropy 0.004、upright 0.3（新增），其余不变。
