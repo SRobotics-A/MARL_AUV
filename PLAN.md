@@ -8584,3 +8584,129 @@ python3 scripts/skrl/train.py \
 - Step 120k：crash < 0.15，fly_low < 0.10
 - Step 200k：all_targets_captured > 0.60
 - Step 400k：all_targets_captured > 1.00（与 Baseline 对齐）
+
+---
+
+## Run 16 vs Baseline 对比分析报告（Run 16 独立分析）
+
+**Run 16：** `2026-04-06_22-09-35_mappo_torch_mappo`（400k steps，已完成）
+**Baseline：** `2026-03-20_16-26-19_mappo_torch_mappo`（400k steps，已收敛）
+**分析日期：** 2026-04-07
+**Task：** Isaac-marl-move-v0 | Algorithm: MAPPO
+
+---
+
+### 核心指标对比（四分段均值：Q1=前25%，Q4=后25%，last=最终值）
+
+| 指标 | Run 16 Q4 | Baseline Q4 | 差距 |
+|------|-----------|-------------|------|
+| Total reward (mean) | 703.6 | 889.9 | **-20.9%** |
+| Episode timesteps (mean) | 2413 steps | 1642 steps | **+47%（更长但不稳定）** |
+| all_targets_captured | 0.224 | 1.166 | **-80.8%** |
+| crash | 0.371 | 0.000 | Run 16 独有问题 |
+| falcon_fly_low | 0.310 | 0.000 | Run 16 独有问题 |
+| bounding_box | 0.299 | 0.000 | 大幅改善但未清零 |
+| policy_std Q4 | 0.829 | 0.170 | **探索过度：4.9x** |
+| instant reward (mean) | 0.286 | 0.544 | **per-step 质量差 47%** |
+| success_reward Q4 | 292.6/ep | 0.0/ep | Run 16 独有奖励 |
+
+---
+
+### 根本原因分析
+
+#### 问题 1：all_targets_captured 退化 80%——主要原因 success_weight=0.3（CRITICAL）
+
+**症状：** Q4 均值 0.224（Baseline 1.166），退化 80.8%。
+注意 Q2 均值 0.528 是训练中期峰值，此后在 Q3=0.230 和 Q4=0.224 上出现**显著回调**，说明策略学到高 success_reward 后反而放弃捕获行为。
+
+**根因：** `success_reward_weight=0.3` 与 `success_reward` 累积机制交互。在 Q2 阶段 success_reward 每 episode 约 208/ep，占总奖励的约 29%（208/703）。策略发现可以用更长 episode 积累 success_reward 但实际捕获次数不增加——这是典型的**奖励欺骗**模式：策略不是捕获目标，而是在目标附近反复进出来刷 success 奖励。
+
+**量化证据：**
+- Q2：all_targets_captured=0.528，success_reward=208，ep_len=2327 steps
+- Q4：all_targets_captured=0.224，success_reward=293，ep_len=2413 steps
+- success 奖励从 Q2→Q4 继续上升（+41%），但 captured 从 Q2→Q4 下降（-58%）
+
+这正是策略学会了在目标区域边缘徘徊（获得 success 奖励）而不是完成"全部目标捕获"（触发 all_targets_captured 终止）。
+
+#### 问题 2：policy_std=0.829 持续过高——entropy_scale=0.010 无法收敛（HIGH）
+
+**症状：** policy_std 在整个训练过程几乎不变：Q1=0.809，Q2=0.853，Q3=0.855，Q4=0.829。Baseline 从 Q1=0.569 线性下降至 Q4=0.170。
+
+**根因：** `entropy_loss_scale=0.010` 是 Baseline 的 10 倍（Baseline 中 entropy_loss 最终值≈+0.0005，接近零。Run 16 最终值≈-0.012，绝对值高 24 倍）。策略探索噪声过大，无法 commit 到精确捕获动作序列。
+
+**关键对比：** Run 16 的 per-step 奖励（0.286/step）低于 Baseline（0.544/step）——说明高 std 不仅不帮助探索，还主动降低了每步的行为质量。高 std 策略在接近目标时动作噪声大，容易过冲触发 crash/fly_low。
+
+#### 问题 3：crash + fly_low 贯穿 Q2~Q4，Baseline 完全没有（HIGH）
+
+**症状（四分段趋势）：**
+- crash: Q1=0.038 → Q2=0.356 → Q3=0.425 → Q4=0.371（峰值在 Q3）
+- falcon_fly_low: Q1=0.024 → Q2=0.304 → Q3=0.364 → Q4=0.310
+
+Q1 几乎为零（训练初期刚开始），Q2~Q4 维持在 0.3~0.4。这说明 crash 和 fly_low 是策略**学会追踪目标之后**才出现的——追踪轨迹本身激进到超出安全飞行边界。
+
+**与 Run 17 的对比：** Run 17 Q4 crash=0.249，fly_low=0.221，低于 Run 16 Q4（0.371，0.310）。Run 17 的 fly_low_penalty=12.0 vs Run 16 的 8.0，多了 50%，但 crash 数量降低幅度有限（-33%）。说明 crash 根源不完全是惩罚不足，而是策略主动俯冲追车导致的结构性风险。
+
+**与 Baseline 的根本差异：** Baseline 的 fly_low_penalty=1.0（仅 Run 16 的 1/8），但从不触发。原因是 Baseline 中策略不需要激进俯冲——目标用旧小车类型，轨迹更慢更平坦。NovaCarter+scale=3.0 的高速轨迹是造成 Run 16 crash 的底层原因。
+
+#### 问题 4：bounding_box 已改善但仍未消除（MEDIUM）
+
+**症状：** Q4=0.299（Baseline Q4=0.000）。Q2=0.546→Q3=0.304→Q4=0.299，下降趋势存在但平台化。
+
+**与上次分析 Run 16 的记录对比：** 上次记录 `bounding_box SOLVED (Q5=0.333)`，本次使用正确的四分段切割（Q4=后25%均值 0.299），比 Q5 统计更精确。bounding_box 仍未完全清零，约 30% 的 Q4 时间段仍有 bbox 终止。
+
+**run_16 vs run_17 对比：** Run 17 Q4 bounding_box=0.748（比 Run 16 Q4=0.299 差 2.5 倍）。Run 17 参数中 bounding_box_threshold 没有变化（仍 10.0m），但 fly_low_penalty 从 8→12 导致策略飞行更保守，部分原本会深入边界的轨迹被截断，反而 bounding_box 情况反而更糟——说明高 fly_low 惩罚与 bounding_box 之间存在耦合：为了避免飞低，策略会拉高高度并减小水平追踪速度，导致更容易追丢目标出边界。
+
+#### 问题 5：Run 16 独有——成功奖励反引发"奖励欺骗"（HIGH，Run 17 无此问题）
+
+**症状：** success_reward Q4=292.6/ep，但 all_targets_captured=0.224。单纯从奖励值看策略"很成功"，但实际捕获率极低。
+
+**根因：** 成功条件设计允许策略在目标区域内反复进出积累 success 时间步奖励，而不需要完成"三架无人机同时在各自目标范围内"的全局条件（all_targets_captured 触发）。individual success 奖励与 global capture 终止之间的激励不一致，策略优化了前者而忽略了后者。
+
+**Run 16 独有 vs Run 17：** Run 17 中 success_reward Q4=98.8/ep（Run 16 的 1/3），captured Q4=0.355（Run 16 的 1.6 倍）。说明 Run 17 的 success_weight=0.6（vs Run 16 的 0.3）并不是奖励欺骗更严重，而是相反——0.6 的权重实际上更好。Run 16 的 success_weight=0.3 导致策略用"低强度反复触发"来积累奖励，而 0.6 的单次价值更高，策略倾向于"一次完成后终止"。
+
+---
+
+### Run 16 vs Run 17 指标对比（关键差异）
+
+| 指标 | Run 16 Q4 | Run 17 Q4（partial） | 差异方向 |
+|------|-----------|---------------------|---------|
+| Total reward (mean) | 703.6 | 240.6 | Run 17 更低（训练量不足） |
+| all_targets_captured | 0.224 | 0.355 | **Run 17 更好 +58%** |
+| success_reward | 292.6 | 98.8 | Run 17 每 ep 更少但捕获更多 |
+| crash | 0.371 | 0.249 | **Run 17 更好 -33%** |
+| falcon_fly_low | 0.310 | 0.221 | **Run 17 更好 -29%** |
+| bounding_box | 0.299 | 0.748 | **Run 16 更好（Run 17 bbox 恶化）** |
+| policy_std | 0.829 | 0.734 | **Run 17 更低（entropy 0.010→0.007）** |
+| episode timesteps | 2413 | 402 | Run 17 仍极短（需更多训练） |
+| instant reward/step | 0.286 | 0.568 | **Run 17 per-step 质量高 2x** |
+
+**核心结论：** Run 17 在 captured、crash、fly_low、per-step 质量上都优于 Run 16，entropy 从 0.010→0.007 方向正确。Run 17 的主要问题是 bounding_box 终止率反而更高（0.748 vs 0.299），这是 Run 18 需要解决的首要问题。
+
+---
+
+### Run 18 建议（更新）
+
+基于 Run 16 vs Baseline + Run 16 vs Run 17 的对比，Run 18 参数建议调整如下：
+
+| 参数 | Run 17 | Run 18 建议 | 目标 |
+|------|--------|------------|------|
+| `bounding_box_threshold` | 10.0 | **14.0** | bbox Q4 < 0.10（清零方向） |
+| `boundary_soft_threshold` | 8.0 | **11.0** | 配合 bbox 扩大 |
+| `fly_low_penalty` | 12.0 | **6.0** | crash Q4 < 0.20，避免 bbox/flylow 耦合 |
+| `entropy_loss_scale` | 0.007 | **0.004** | policy_std 降至 0.55~0.65 |
+| `success_reward_weight` | 0.6 | 维持 0.6 | Run 17 实测效果优于 Run 16 的 0.3 |
+| `tracking_reward_weight` | 5.0 | 维持 5.0 | — |
+| `contact_sensor_threshold` | 50N | 维持 50N | — |
+
+**最高优先级（CRITICAL）：** `bounding_box_threshold 10.0→14.0`——这是 Run 17 相对 Run 16 最明显的倒退，也是 ep 长度不增长的直接障碍。
+
+**次高优先级（HIGH）：** `fly_low_penalty 12.0→6.0`——Run 16 分析证明 fly_low 和 bounding_box 存在负相关：大 fly_low 惩罚→策略飞行保守→水平追踪不积极→bbox 终止增加。6.0 是安全点（仍是 Baseline 6x），避免过大 penalty 破坏追踪积极性。
+
+**中优先级（MEDIUM）：** `entropy_loss_scale 0.007→0.004`——Run 17 Q4 policy_std=0.734，相比 Run 16 Q4 0.829 已改善，但目标是 0.55~0.65。0.004 是 Run 15 成功值 0.006 到 Baseline 0.001 之间的合理步伐。
+
+**不变项：** `success_reward_weight=0.6` 维持——Run 17 数据证明 0.6 比 Run 16 的 0.3 更好（captured 高 58%，奖励欺骗更轻）。不要回退至 0.3。
+
+---
+
+## Changelog
+- 2026-04-07: 追加 Run 16 vs Baseline 独立对比分析（发现奖励欺骗模式，bounding_box/fly_low 耦合效应，success_weight 机制澄清），更新 Run 18 建议（bbox 14.0，fly_low 6.0，entropy 0.004）
