@@ -99,10 +99,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     dist_reward_scale = 0.5  # 衰减速率减小，扩大吸引范围
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
-    success_reward_weight = 0.3  # Run16：继续降权，目标 success/惩罚比例 <2x
+    success_reward_weight = 0.6  # Run17：恢复捕获激励（0.3 导致 all_targets -74%）
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
-    tracking_reward_weight = 4.0  # 增大：强化跟随信号
+    tracking_reward_weight = 5.0  # Run17：提升，结构性稀释 success 的相对占比
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
@@ -136,8 +136,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     drone_out_of_bounds_penalty = 1.0
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
-    illegal_contact_penalty = 0.1  # 大幅降低：消除与捕获奖励的矛盾梯度
-    fly_low_penalty = 8.0  # Run16：继续加强，目标 fly_low Q5 <0.12
+    illegal_contact_penalty = 0.05  # Run17：降低单次接触梯度冲击
+    fly_low_penalty = 12.0  # Run17：大幅跨越，目标 crash Q5 <0.20
 
     # action和observation配置
     if control_mode == "geometric":
@@ -205,7 +205,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     boundary_soft_penalty_weight = 2.0  # 加强：使软惩罚大于追踪收益
 
     # contact sensor
-    contact_sensor_threshold = 30.0  # Run16：过滤捕获时的接触噪声（illegal Q5=-5.27 复发）
+    contact_sensor_threshold = 50.0  # Run17：消除灾难性脉冲（中段 6.5% 数据点 <-50/ep）
 
     # low level control
     low_level_decimation: int = 1  # Reduced to 1 for maximum stability
