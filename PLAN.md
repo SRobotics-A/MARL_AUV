@@ -8447,3 +8447,140 @@ python3 scripts/skrl/train.py \
 - policy_std Q5 mean 在 0.68~0.75（探索在健康范围内）
 - illegal_contact Q5 mean > -3.0（接触惩罚受控）
 - tracking_reward Q5 mean > 20/ep（追踪质量提升）
+
+---
+
+## Run 17 vs Baseline 差距分析报告
+
+**Run 17：** `2026-04-07_09-00-13_mappo_torch_mappo`（109k steps，仍在训练）
+**Baseline：** `2026-03-20_16-26-19_mappo_torch_mappo`（400k steps，已收敛）
+**分析日期：** 2026-04-07
+**Task：** Isaac-marl-move-v0 | Algorithm: MAPPO
+
+---
+
+### 核心指标对比（Q5 = 后20%均值，代表最终性能）
+
+| 指标 | Run 17 Q5 | Baseline Q5 | 差距倍数 |
+|------|-----------|-------------|----------|
+| Total reward (mean) | 42.8 | 885.9 | **20.7x** |
+| Episode timesteps (mean) | 155 steps (9.3s) | 1658 steps (99.5s) | **10.7x** |
+| all_targets_captured | 0.37 | 1.11 | **3.0x** |
+| crash | 0.12→0.34 (上升) | 0.000 | 无穷 |
+| falcon_fly_low | 0.12→0.34 (上升) | 0.000 | 无穷 |
+| Per-step instantaneous reward | 0.67 | 0.55 | 相近 |
+
+**关键发现：** 每步奖励率 Run 17（0.67）实际上略高于 Baseline（0.55），说明 per-step 学习质量不差。总奖励差距的核心原因是 **episode 过短**（9s vs 100s），而非策略本身的单步质量。
+
+---
+
+### 根本原因分析
+
+#### 原因 1：终止模式崩溃——crash + fly_low 主导（CRITICAL）
+
+Run 17 终止分布（最后25%训练数据）：
+- crash: 0.232（每 log step 平均 0.23 个 env 触发）
+- falcon_fly_low: 0.199
+- all_targets_captured: 0.404
+- bounding_box: 0.798（整个训练期间 bbox 都是主要终止原因）
+
+Baseline 终止分布（最后5%）：
+- crash: 0.000，fly_low: 0.000，captured: 1.162，bbox: 0.000
+
+Run 17 在 Q4 阶段 crash + fly_low 合计 0.43，接近 captured 的 0.40，说明无人机在接近目标时倾向于俯冲撞地/超出飞行高度下界。`fly_low` 惩罚虽然已调到 12.0，但 **终止数量仍在增加**，说明 reward 信号来得太晚（episode 已 crash 终止），无法有效反向传播。
+
+#### 原因 2：`fly_low_penalty=12.0` 过大，反而导致过度俯冲（HIGH）
+
+Run 17 `Episode_Reward/fly_low` 从 0 → -9.18（最终），`Episode_Reward/height_penalty` 最终 -2.38，`Episode_Reward/upright_penalty` -3.12。这三个负奖励合计约 -14.7/episode，但 `Episode / Total timesteps` 只有 155 steps，说明这些是**高频密集惩罚**而非单次大惩罚。
+
+根本原因：`fly_low_penalty=12.0` 相比 Baseline `1.0` 提高了 12 倍，但 Baseline 中从未触发过 fly_low 终止。说明 Baseline 不需要依靠大惩罚来防止飞太低——而 Run 17 的 fly_low 根本原因是 **capture_distance=3.0m 比 Baseline 1.0m 大 3 倍**，无人机需要更宽泛的悬停范围，造成高度控制更难精确。
+
+#### 原因 3：episode 极短根本原因——bounding_box 终止（HIGH）
+
+Run 17 整个训练期间 `bounding_box` 终止率均值约 0.9~1.1（Q1-Q3），而 Baseline 在训练后期降至 0.000。Run 17 的 `bounding_box_threshold=10.0m`（Baseline 12.0m），边界更小，加上 `nova_carter_scale` 扩大了小车轨迹（3x scale），导致无人机更容易冲出边界。
+
+#### 原因 4：训练量不足——Run 17 只运行了 109k steps（MEDIUM）
+
+Baseline 运行至 400k steps 才收敛（ep_len 在约 200k 步后才稳定在 1600+）。Run 17 当前只有 109k steps，从 timestep 角度看连 Baseline 的 1/4 都不到。需要等待更多训练才能做最终判断。
+
+#### 原因 5：`num_envs=32` vs Baseline `512`（MEDIUM）
+
+env.yaml 记录 `scene.num_envs: 32 vs 512`，但这仅反映配置文件中的 `num_envs` 默认值，实际训练时使用 `--num_envs` 命令行覆盖。需要确认 Run 17 实际训练是否真的只用了 32 envs。若是，这将严重影响采样效率和策略泛化性。
+
+#### 原因 6：`entropy_loss_scale=0.007` vs Baseline `0.001`（MEDIUM）
+
+Run 17 entropy 权重高出 7x，导致 policy_std 维持在 0.77（Baseline 最终 0.15）。高 entropy 有助于探索但阻碍收敛。Run 17 的 per-step 奖励率已经不低（0.67 vs 0.55），说明策略已学到有效行为，但高 entropy 阻止了策略 commit 到捕获动作序列。
+
+#### 原因 7：`success_reward_weight=0.6`（Run 17）vs Baseline `0.0`（MEDIUM）
+
+Baseline 中没有 success_reward，完全依靠 tracking_reward 和 distance_reward 驱动。Run 17 加入 success_reward 后出现过之前分析的 success_weight=0.3 导致全部捕获率下降 74% 的问题（Run 16），此次 0.6 仍需观察是否出现相同模式。
+
+---
+
+### 参数差异 vs 代码差异区分
+
+| 变更类型 | 具体内容 | 对性能的影响 |
+|---------|---------|------------|
+| **代码变更** | height_error 计算修复 | 正向：高度控制更精确 |
+| **代码变更** | success_reward bug 修复 | 正向：激励信号正确 |
+| **代码变更** | NovaCarter 目标替换 | 中性/负向：小车移动更复杂，轨迹更大(nova_carter_scale=3.0) |
+| **代码变更** | contact_forces 传感器重构（多传感器→单传感器） | 中性 |
+| **参数变更** | fly_low_penalty: 1.0→12.0 | 负向：过大惩罚加速 crash 终止 |
+| **参数变更** | capture_distance: 1.0→3.0 | 负向：成功条件宽松但高度控制难度增大 |
+| **参数变更** | bounding_box_threshold: 12.0→10.0 | 负向：更小活动范围，与大 nova_carter_scale 矛盾 |
+| **参数变更** | entropy: 0.001→0.007 | 负向（收敛角度）：阻碍策略收敛 |
+| **参数变更** | tracking_weight: 1.0→5.0 | 正向：追踪激励更强 |
+| **参数变更** | success_weight: 0.0→0.6 | 待观察：历史上曾导致 captured 下降 |
+
+---
+
+### 改进建议（针对缩小与 Baseline 的差距）
+
+#### 建议 1（CRITICAL）：修复 bounding_box + fly_low 终止主导问题
+
+**问题：** Run 17 的 episode 被 bounding_box（整个训练）和 crash/fly_low（Q4 阶段）过早截断，导致有效训练时间只有 Baseline 的 1/10。
+
+**方案 A（边界扩大）：**
+- 文件：`marl_flyfollow_env_cfg.py`（move task）
+- `bounding_box_threshold`: 10.0 → **14.0**（补偿 nova_carter_scale=3.0 带来的轨迹扩大）
+- `boundary_soft_threshold`: 8.0 → **11.0**
+
+**方案 B（fly_low 惩罚调整）：**
+- `fly_low_penalty`: 12.0 → **6.0**（仍是 Baseline 6x 而非 12x，避免频繁 crash 终止）
+- 重要：Baseline 用 fly_low=1.0 从未触发 fly_low 终止，说明 Baseline 的高度控制本身稳定；Run 17 的问题根源是 nova_carter_scale 导致追踪更激进
+
+#### 建议 2（HIGH）：确认并修复 num_envs 问题
+
+运行命令中确保使用 `--num_envs=2048`（或至少 512 与 Baseline 对齐）。若 Run 17 实际只用 32 envs，采样量是 Baseline 的 1/16，这是当前所有问题的前提放大器。
+
+#### 建议 3（HIGH）：entropy_scale 从 0.007 回调至 0.003
+
+Run 17 的 per-step 奖励率已经合理（0.67），当前高 entropy 阻碍策略从"接近目标"收敛到"稳定持续追踪"。建议：
+- `entropy_loss_scale`: 0.007 → **0.003**（介于 Baseline 0.001 和当前 0.007 之间）
+- 这样既保留 Run 16 引入高 entropy 的探索优势，又允许策略逐步收敛
+
+#### 建议 4（MEDIUM）：观察 success_weight 影响
+
+Run 17 的 all_targets_captured 目前 Q5=0.37（只有 109k steps），尚不能判断 success_weight=0.6 是否重现 Run 16 的问题。建议继续训练到 200k steps 后再决定是否调整。若 captured 在 120k~180k steps 出现下降趋势，立即将 `success_reward_weight` 从 0.6 降至 0.4。
+
+---
+
+### 实验计划（Run 18）
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+参数变更（相对 Run 17）：
+1. `bounding_box_threshold`: 10.0 → 14.0
+2. `boundary_soft_threshold`: 8.0 → 11.0
+3. `fly_low_penalty`: 12.0 → 6.0
+4. `entropy_loss_scale`: 0.007 → 0.003
+
+检查点：
+- Step 60k：episode_length > 400 steps（ep 不再被 bbox 截断）
+- Step 120k：crash < 0.15，fly_low < 0.10
+- Step 200k：all_targets_captured > 0.60
+- Step 400k：all_targets_captured > 1.00（与 Baseline 对齐）
