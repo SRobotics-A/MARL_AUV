@@ -121,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 0.5  # Run15：回退至0.5，避免过度抑制机动
+    upright_penalty_weight = 0.3  # Run18：降低，per-step 比为tracking的2.5x，压制追踪积极性
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
@@ -137,7 +137,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.05  # Run17：降低单次接触梯度冲击
-    fly_low_penalty = 12.0  # Run17：大幅跨越，目标 crash Q5 <0.20
+    fly_low_penalty = 6.0  # Run18：回退历史安全点（12.0 per-step仅-0.001，完全无效）
 
     # action和observation配置
     if control_mode == "geometric":
@@ -200,8 +200,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 终止条件阈值
     drone_collision_threshold = 0.6
-    bounding_box_threshold = 10.0  # 缩小至10m，压缩动量冲越区间
-    boundary_soft_threshold = 8.0  # 软惩罚触发边界（对齐目标折返点±8m）
+    bounding_box_threshold = 14.0  # Run18：扩大补偿 nova_carter_scale=3x 目标活动范围
+    boundary_soft_threshold = 11.0  # Run18：配合 bounding_box 扩大
     boundary_soft_penalty_weight = 2.0  # 加强：使软惩罚大于追踪收益
 
     # contact sensor
