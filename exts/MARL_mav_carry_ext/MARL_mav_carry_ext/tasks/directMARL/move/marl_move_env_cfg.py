@@ -121,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 0.3  # Run18：降低，per-step 比为tracking的2.5x，压制追踪积极性
+    upright_penalty_weight = 0.5  # Run19：恢复0.5（0.3产生逆效果，末期激增25x）
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
@@ -137,7 +137,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.05  # Run17：降低单次接触梯度冲击
-    fly_low_penalty = 6.0  # Run18：回退历史安全点（12.0 per-step仅-0.001，完全无效）
+    fly_low_penalty = 8.0  # Run19：Run16验证值（6.0在长episode下产生负效果）
 
     # action和observation配置
     if control_mode == "geometric":
