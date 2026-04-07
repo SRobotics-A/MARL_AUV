@@ -8214,3 +8214,236 @@ python3 scripts/skrl/train.py \
 - illegal_contact Q5 mean > -1.5
 - policy_std Q5 mean > 0.65
 - all_targets_captured Q5 mean > 0.70，且无后期退化
+
+---
+
+## Run 16 训练分析报告
+
+**Run:** `2026-04-06_22-09-35_mappo_torch_mappo`
+**Date:** 2026-04-07
+**Task:** Isaac-marl-move-v0（NovaCarter 追踪，3 Falcon 跟踪 4 小车）
+**Algorithm:** MAPPO
+**Steps:** 400,000
+**Status:** improving（整体学习信号存在，但多项结构性问题未解决）
+
+---
+
+### 训练指标汇总
+
+| 指标 | Q1 mean | Q5 mean | last | Run 16 目标 | 达成 |
+|------|---------|---------|------|------------|------|
+| `success_reward` | 0.88 | 274.71 | 304.56 | 30~80/ep | 未达成（6.8x 超出） |
+| `tracking_reward` | 1.74 | 17.69 | 40.30 | 持续上升 | 达成 |
+| `illegal_contact` | -0.019 | -16.02 | -0.98 | >-1.5 | 结构性未达成（见分析） |
+| `fly_low` | -0.034 | -2.40 | 0.00 | — | 波动大 |
+| `height_penalty` | -1.52 | -48.62 | -137.11 | — | 强积累效应 |
+| `upright_penalty` | -0.41 | -56.57 | -157.74 | — | 强积累效应 |
+| `all_targets_captured` | 0.10 | 0.211 | 0.27 | >0.70 | 未达成（严重退化） |
+| `crash` | 0.017 | 0.360 | 0.00 | <0.20 | 未达成 |
+| `falcon_fly_low` | 0.005 | 0.301 | 0.00 | <0.12 | 未达成 |
+| `bounding_box` | 1.13 | 0.333 | 0.00 | <0.50 | Q5 达成（Q1→Q5 持续下降） |
+| `time_out` | 0.000 | 0.352 | 1.00 | 越多越好 | 改善（Q5 35%） |
+| `policy_std` | 0.8097 | 0.8266 | 0.8111 | 0.65~0.75 | 过度探索（超出目标上限） |
+| `ep_len_mean` | 107 | 2328 | 5999 | >500 | Q5 达成，但极度双峰 |
+
+---
+
+### 核心发现
+
+#### 1. success_reward 量级问题 — CRITICAL（目标未达成）
+
+**症状：** Q5 mean=274.71/ep，nonzero 均值=663.96/ep，占总正向奖励 81.5%（目标 <50%）。
+
+**根因分析：** success_reward_weight 从 1.0→0.3 仅减少 3x，但 episode 长度从 Run 15（均值~323步）大幅延长至 Q5 均值 2328 步。成功奖励按步累积：当 episode 持续 5999 步（22.4% Q5 Episodes 达最大长度），success_reward 自然累积至 600~1770/ep，比 Run 15 的 139/ep 高出数倍。权重降低被 episode 延长完全抵消。
+
+**量化：** Run 15 ep_len_mean≈323，success_weight=1.0 → 期望 success/ep≈139。Run 16 ep_len_mean≈2328（+621%），success_weight=0.3 → 期望 success/ep ≈ 139 × 2328/323 × 0.3 = 300。实测 Q5 mean=274，与理论预测完全吻合。
+
+**关键结论：** success_reward 量级问题的根因不是 weight 不够低，而是 episode 越来越长导致累积越来越多。这是一个正向强化循环：成功训练 → 更长 episode → 更多 success 累积 → 策略更强调 success。简单降低 weight 无法打破此循环。
+
+**证据：** 41.4% 的 Q5 数据点 success_reward>0，但非零均值高达 663.96，说明成功时持续停留在捕获区（未离开），单次 episode 可获得 1770/ep 成功奖励（接近上限）。
+
+#### 2. policy_std 过度探索 — HIGH（方向反转，超出上限）
+
+**症状：** policy_std Q5 mean=0.8266（范围 0.7894~0.8745），高于目标上限 0.75，且整体稳定在 0.81 附近。Run 15 Q5=0.565（过低），Run 16 = 0.82（过高）。entropy_loss_scale 从 0.006→0.010 的调整效果过强。
+
+**根因：** entropy_loss 绝对值 Q5 mean=-0.01223（运行全程稳定），隐含熵=1.22 nats，对应 std≈0.82。这是 entropy_scale=0.010 在此任务下的稳定均衡点——policy_std 没有下降趋势，说明策略处于高探索稳态，而非过渡状态。
+
+**影响：** 高 std 引起随机飞行，导致 crash/fly_low 仍高（Q5=0.36/0.30）。Run 10 经验（std=1.595 导致过多随机崩溃）表明此任务健康 std 范围是 0.70~0.82。当前 0.82 处于可接受上边界，但略高，需微调。
+
+**与 Run 15 对比：** Run 15 std=0.565（探索不足），Run 16 std=0.82（轻度过高）。目标 0.65~0.75 介于两者之间。最优 entropy_scale 估计约 0.007~0.008。
+
+#### 3. illegal_contact 改善但仍有脉冲爆发 — HIGH（结构性残留）
+
+**症状：** Q5 mean=-16.02/ep，min=-520.52/ep（含灾难性脉冲）。最后 20 个数据点均值约-1.2/ep（正常），但 Q5 分段均值（步骤 240k-400k）在 -7 ~ -27 之间剧烈波动。
+
+**分解：**
+- Q5 中 45/688（6.5%）数据点 illegal_contact < -50：这些是灾难性脉冲，单次接触力超过阈值持续多步
+- 最后 20 数据点均值-1.2/ep：末期接近正常
+- 30N 阈值提升有效（减少普通近距离接触的触发），但未消除灾难性爆发
+
+**根因：** 高 policy_std（0.82）导致偶发的激进接近动作，叠加长 episode（最大 5999 步）使单次爆发的累积值极高（contact_force × 0.1penalty × 步数）。terminal illegal_contact Q5=0.172/rollout 说明仍有 17% 的 rollout 发生接触终止。
+
+**30N 阈值效果评估：** 相对 Run 15（20N），接触终止从 ~0.35/rollout 降至 0.172（-51%）。量级改善，但绝对值仍高。建议 40N 或改变惩罚结构（见 Run 17 建议）。
+
+#### 4. crash / fly_low 未达目标 — HIGH
+
+**症状：** crash Q5=0.360，fly_low Q5=0.301（目标分别 <0.20 和 <0.12）。
+
+**时间趋势：**
+- 步骤 240k-280k：crash=0.426，fly_low=0.357（高峰）
+- 步骤 360k-400k：crash=0.351，fly_low=0.316（微降，非单调）
+- fly_low_penalty 从 6.0→8.0 未能阻止"追踪→下潜→坠地"模式
+
+**根因诊断：** fly_low Q5 mean=-2.40/ep，而 fly_low_penalty=8.0，意味着平均每个 Q5 episode 触发约 0.3 次全力 fly_low（-8/次）。fly_low 事件并未消失，只是从高频小力变为中频全力。高 policy_std 是驱动因素：std=0.82 的随机动作经常导致意外下潜。
+
+**关键洞察：** fly_low 与 crash 的 Q5 min=0（最好状态下完全没有），但均值高，说明存在双峰：部分 episode 完美飞行，部分 episode 大量坠地。这是策略未收敛的证据，而非系统性飞行质量差。
+
+#### 5. all_targets_captured 严重退化 — HIGH（最重要发现）
+
+**症状：** Q5 mean=0.211/rollout（Run 15: Q5=0.811，退化 74%）。目标 >0.70 远未达到。Q5 最后四分段：0.221→0.255→0.196→0.226，无改善趋势。
+
+**根因（致命）：** 这是 success_reward_weight 降至 0.3 的直接后果。当 success_reward 激励减弱，策略优先选择"安全飞行"（获得 tracking_reward + height_reward）而非"积极停留在捕获区"（需要承担 crash 风险）。success_reward_weight=0.3 × 0.5s 持续时间，单次捕获奖励约 0.3/step × 50步 = 15 credit，远低于 Run 15 的 50 credit。策略理性地选择回避高风险的近距离停留。
+
+**量化验证：** all_targets_captured Q5 从 0.811→0.211（-74%）与 success_reward_weight 从 1.0→0.3（-70%）高度对应。这不是偶然相关——success_reward 是推动策略停留在捕获区的核心激励。
+
+**反直觉结论：** 减少 success_reward_weight 虽解决了"占正向奖励比例过高"问题，但同时破坏了策略维持捕获行为的动力。设计目标（抑制 success 主导）与任务目标（维持高捕获率）之间存在根本性张力。
+
+#### 6. 积累型惩罚（height_penalty / upright_penalty）的伪高值问题 — MEDIUM
+
+**症状：** height_penalty Q5 mean=-48.62/ep（last=-137.11），upright_penalty Q5 mean=-56.57/ep（last=-157.74）。这些数值看似很高，但需正确解读。
+
+**关键发现：** 这两项惩罚与 episode 长度的相关系数分别为 -0.194 和 -0.197（数量级低于预期）。per-step 归一化分析：
+- upright per-step Q5 mean = -0.1097/step（upright_weight=0.5 → 原始 tilt = -0.22/step）
+- height_penalty per-step Q5 mean = -0.0927/step（height_weight=1.0 → 误差 = 0.09m/step 超阈值）
+
+这两项惩罚在长 episode 中天然累积到高值，但 per-step 量级实际上相当温和。真正的担忧是 height_penalty 最后 10 个数据点出现大量 -136~-137（逼近最大值），这仅在 ep_len=5999 的 timeout episode 中发生，是正常的长 episode 积累，而非物理飞行质量问题。
+
+#### 7. bounding_box 显著改善 — 达成
+
+**症状：** bounding_box Q1=1.13→Q5=0.333（-71%），last=0.00。这是此次训练最明确的正向改善。
+
+**根因：** episode 延长（ep_len Q5 mean=2328 vs Run 15 ~323）使策略有时间学会在目标边界附近折返，而不是线性追出边界。这是 Run 10 以来 bounding_box_threshold=10m + bounce 轨迹组合的延迟红利。
+
+**注意：** Q5 内部四分段显示 bounding_box 在 0.18~0.34 之间波动（非单调），最后一段 0.325 略高于 Q5 整体均值 0.333。需在 Run 17 继续监控。
+
+---
+
+### 综合评价
+
+**Run 16 根本性成就：**
+1. policy_std 从 0.565（Run 15）跃升至 0.82——解决了探索坍缩问题，但过冲了
+2. bounding_box 从 0.809 降至 0.333——边界问题大幅改善
+3. 训练状态整体 improving，ep_len 达历史高位（Q5 mean=2328，max=5999）
+
+**Run 16 主要失败：**
+1. all_targets_captured 退化 74%（0.811→0.211）：success_weight 降低打击了维持捕获的动力
+2. crash/fly_low 仍高：fly_low_penalty=8 不足以覆盖 std=0.82 引起的随机下潜
+3. illegal_contact 脉冲爆发：30N 减少了频率但未消除灾难性接触事件
+
+**Run 16 遗留的核心矛盾：** 降低 success_weight 以"平衡奖励比例"与"维持捕获激励"是反向操作的。正确解法不是降低 success 绝对重量，而是**相对性地提升其他正向奖励**，让 success 在总奖励中自然稀释，同时保持捕获的绝对吸引力。
+
+---
+
+## Improvement Recommendations for Run 17
+
+### Priority 1 (CRITICAL): 恢复 success_reward_weight 并重新平衡结构
+
+**Problem:** success_weight=0.3 导致 all_targets_captured 退化 74%（0.811→0.211）。捕获激励不足是策略回避近距离停留的直接原因。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `success_reward_weight: 0.3 → 0.6`
+- **Rationale:** 折中方案——从 Run 15 的 1.0 降到 Run 16 的 0.3 使捕获率崩溃。0.6 是二者中点。预期 all_targets_captured Q5 恢复至 0.5~0.7（+130%~+230%）。同时保持 tracking_reward 的相对重要性。
+
+**附加变更（配合）:**
+- **Parameter:** `tracking_reward_weight: 4.0 → 5.0`
+- **Rationale:** 提升 tracking 的绝对权重，使 success（哪怕 weight=0.6）在奖励组合中占比相对降低。success/(success+tracking) 比例目标从 94% 降至 ~70%。
+
+### Priority 2 (HIGH): 校准 entropy_loss_scale 使 policy_std 落入目标区间
+
+**Problem:** policy_std Q5=0.826，目标 0.65~0.75。当前 entropy_scale=0.010 过强，使策略维持高探索状态，增加随机下潜和坠地风险。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`（skrl 训练配置）
+- **Parameter:** `entropy_loss_scale: 0.010 → 0.007`
+- **Rationale:** Run 15（scale=0.006）→ std=0.565，Run 16（scale=0.010）→ std=0.826。线性外推：目标 0.70 对应 scale ≈ 0.007~0.008。保守选 0.007，避免再次跌至 0.565。
+
+### Priority 3 (HIGH): 提升 contact_sensor_threshold 以消除灾难性脉冲
+
+**Problem:** illegal_contact Q5=-16.02/ep，含最小值 -520/ep 的灾难性脉冲。Q5 中 45/688（6.5%）数据点 < -50。30N 阈值相比 20N 已改善 51%，但仍有重大爆发。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `contact_sensor_threshold: 30N → 50N`
+- **Rationale:** NovaCarter 物理碰撞体在无人机快速接近时可以瞬间产生大接触力（>100N）。50N 阈值过滤大多数近距离接触，仅保留真实碰撞。目标：illegal_contact Q5 > -3.0，脉冲 <-50 的比例降至 < 1%。
+
+**附加变更：**
+- **Parameter:** `illegal_contact_penalty: 0.1 → 0.05`
+- **Rationale:** 降低单次接触事件的惩罚量级，减少梯度冲击。与阈值提升配合，双向收紧接触惩罚的影响范围。
+
+### Priority 4 (HIGH): 进一步提升 fly_low_penalty 以阻止下潜
+
+**Problem:** crash Q5=0.360，fly_low Q5=0.301，目标分别 <0.20 和 <0.12。fly_low_penalty 从 6.0（Run 15）→8.0（Run 16）未能有效阻止"追踪→下潜→坠地"模式。
+
+**Proposed Change:**
+- **File:** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- **Parameter:** `fly_low_penalty: 8.0 → 12.0`
+- **Rationale:** 目前 fly_low Q5=-2.40/ep，说明平均每 Q5 episode 触发 0.3 次（-2.40/-8.0=0.3 次/ep）。penalty=12 使单次坠地代价等于约 12/0.3=40 步 tracking_reward，显著高于追踪收益，形成有效威慑。历史数据：fly_low=3.0（Run 12）→ crash Q5=0.469；fly_low=4.0（Run 14）→ 改善；fly_low=6.0（Run 15）→ crash Q5=0.344；fly_low=8.0（Run 16）→ crash Q5=0.360（无改善）。指数式提升模式表明需要大幅跨越，12.0 是下一个显著台阶。
+
+### Priority 5 (MEDIUM): 评估 height_penalty 和 upright_penalty 的 per-step 真实量级
+
+**Problem:** height_penalty Q5=-48.62/ep，upright_penalty Q5=-56.57/ep，数值看似高，但 per-step 归一化后分别为 -0.093 和 -0.110/step（温和）。这两项惩罚是长 episode 的自然积累产物，不代表严重的飞行质量问题。
+
+**Proposed Change:** 暂不调整这两项权重/阈值，而是在 Run 17 中重点监控 per-step 归一化值（而非绝对值）。
+- **监控指标：** `height_penalty / ep_len` per-step mean（目标：< -0.15/step）
+- **监控指标：** `upright_penalty / ep_len` per-step mean（目标：< -0.15/step）
+- **Rationale:** 当前 per-step 量级分别为 0.09 和 0.11，处于可接受范围。若 Run 17 随 ep_len 进一步延长而上升至 >0.15，则需要收紧阈值。
+
+---
+
+## Run 17 参数汇总
+
+| 参数 | Run 16 | Run 17 | 目标 |
+|------|--------|--------|------|
+| `success_reward_weight` | 0.3 | **0.6** | all_targets_captured Q5 >0.55 |
+| `tracking_reward_weight` | 4.0 | **5.0** | tracking Q5 >25/ep |
+| `entropy_loss_scale` | 0.010 | **0.007** | policy_std Q5 = 0.68~0.75 |
+| `contact_sensor_threshold` | 30N | **50N** | illegal_contact 脉冲 <-50 的比例 <1% |
+| `illegal_contact_penalty` | 0.1 | **0.05** | illegal_contact Q5 > -3.0 |
+| `fly_low_penalty` | 8.0 | **12.0** | crash Q5 <0.20，fly_low Q5 <0.10 |
+
+---
+
+## Experiment Plan for Run 17
+
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=32 --algorithm="MAPPO"
+```
+
+1. 同时应用全部 5 项变更
+2. 在 step 60k 检查 all_targets_captured（目标 >0.10；若 =0 说明 success 激励仍不足）
+3. 在 step 120k 检查 policy_std（目标 0.68~0.78；若 <0.60 需将 entropy_scale 提回 0.009）
+4. 在 step 200k 检查 crash Q4（目标 <0.30；若仍 >0.40 考虑 fly_low→15.0）
+5. 在 step 320k 检查 illegal_contact 脉冲频率（目标 <1% 数据点 < -50）
+6. 运行至 400k steps 完整评估
+
+### 监控目标（Run 17）
+
+1. `Episode_Termination/all_targets_captured` Q5 mean — 目标：>0.55（从 0.211 回升）
+2. `Episode_Reward/success_reward` Q5 mean — 目标：80~200/ep（激励存在但不过载）
+3. `Episode_Termination/crash` Q5 mean — 目标：<0.20（从 0.360 改善）
+4. `Episode_Termination/falcon_fly_low` Q5 mean — 目标：<0.10（从 0.301 改善）
+5. `Policy / Standard deviation` Q5 mean — 目标：0.68~0.75（从 0.826 降低）
+6. `Episode_Reward/illegal_contact` Q5 mean — 目标：>-3.0（从 -16.02 改善）
+7. `Episode_Reward/tracking_reward` Q5 mean — 目标：>20/ep（从 17.69 提升）
+8. `Episode / Total timesteps (mean)` Q5 — 目标：>1500（维持长 episode 能力）
+
+### 成功标准（Run 17 达成条件）
+
+- all_targets_captured Q5 mean > 0.55（捕获率恢复）
+- crash Q5 mean < 0.20（安全性改善）
+- policy_std Q5 mean 在 0.68~0.75（探索在健康范围内）
+- illegal_contact Q5 mean > -3.0（接触惩罚受控）
+- tracking_reward Q5 mean > 20/ep（追踪质量提升）
