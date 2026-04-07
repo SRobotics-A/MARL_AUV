@@ -8971,3 +8971,226 @@ Q1 几乎为零（训练初期刚开始），Q2~Q4 维持在 0.3~0.4。这说明
 
 ## Changelog
 - 2026-04-07: 追加 Run 17 完整 400k 步分析。关键结论：bbox Q5 降至 0.144（问题自行解决），captured Q5=0.332（未达 0.7 目标，主因 crash+fly_low 高位平台 0.454），无奖励欺骗（per-step success 单调下降），policy_std=0.627（低于目标范围）。Run 18 调整：bbox 14.0、soft 11.0、fly_low 6.0、entropy 0.004、upright 0.3（新增），其余不变。
+
+---
+
+## Run 18 训练分析报告
+
+**Run:** 2026-04-07_17-37-21_mappo_torch_mappo
+**分析日期:** 2026-04-07
+**总训练步数:** 400,000
+**Task:** Isaac-move-flyfollow-marl-v0
+**Algorithm:** MAPPO
+
+### 训练指标摘要
+
+| 指标 | 近50步 Q3 | 近50步 Q5 | last | Run 17 对应值 |
+|------|-----------|-----------|------|--------------|
+| instant_reward (mean) | 0.5644 | 0.6937 | 0.6575 | 0.8274 (Q5) |
+| all_targets_captured | 0.0000 | 0.6330 | 0.0700 | 1.0000 (Q5) |
+| bbox termination | 0.3600 | 1.0000 | 0.1100 | 0.8490 (Q5) |
+| crash termination | 0.3700 | 1.0000 | 0.4200 | 0.6780 (Q5) |
+| fly_low termination | 0.3450 | 1.0000 | 0.4200 | 0.6780 (Q5) |
+| crash+fly_low Q5 | — | 2.0000 | 0.8400 | 1.3560 (Q5) |
+| timeout | 0.0850 | 0.5400 | 0.5400 | 1.0000 (Q5) |
+| policy_std | 0.6145 | 0.6164 | 0.6097 | 0.6283 (Q5) |
+| ep_len mean | 222 | 4555 | 1699 | 5999 (Q5) |
+| upright_penalty (近20步均值) | — | — | -13.51 | ~-40.8 (last) |
+| height_penalty (近20步均值) | — | — | -20.70 | ~-34.9 (last) |
+
+### 七大核心问题逐项分析
+
+#### 1. bounding_box 终止率：显著改善，但结构性问题仍残留
+
+**结论：bbox 扩大至 14m 有效，但效果被 crash/fly_low 激增抵消。**
+
+时序趋势（5段均值）：
+- Q1=1.051 → Q2=1.093 → Q3=0.810 → Q4=0.478 → Q5=0.363，last=0.110
+
+bbox 确实从早期的主导终止因素（>1.0/rollout）下降至末期 0.110，与 Run 17 末期 0.144 接近。但近50步 Q5=1.000 表明方差极大——部分 rollout 仍频繁触发。根本原因：bbox 改善确实存在，但 crash+fly_low 同步崛起（Q5=2.000），说明原来被 bbox 截断的 episode 现在活得更长，但在长 episode 中发生了坠机。两个终止因素此消彼长，ep_len 的双峰分布（46% 短于200步、28% 长于2000步）直接反映了这一现象。
+
+#### 2. crash/fly_low 趋势：fly_low=6.0 未能遏制，反而恶化
+
+**结论：crash+fly_low 在 Run 18 末期比 Run 17 更严重，fly_low 从 12.0 降至 6.0 产生了负效果。**
+
+时序趋势（crash+fly_low combined）：
+- Q1=0.141 → Q2=0.044 → Q3=0.463 → Q4=0.828 → Q5=0.779，近50步 Q5=2.000
+
+Run 17 末期 crash+fly_low Q5=1.356，Run 18 末期 Q5=2.000，恶化 +47%。
+
+**根本原因分析：**
+- fly_low_penalty 从 12.0 降至 6.0，削弱了对低空飞行的惩罚，策略更大胆地下降
+- bbox 扩大使 episode 存活更长（ep_len Q5 从 Run17 的约2432 升至 Run18 的4555），更长 episode 意味着更多机会发生 approach-dive 行为
+- captured 峰值区间分析显示：在最高 captured 阶段（index 1976-2026）crash+fly_low=0.538，随后随着 upright_penalty 升高（-1.17→-22.81）crash+fly_low 同步恶化。这是"学会追踪→更激进俯冲→坠机"的已知结构性耦合
+
+**结论：fly_low=6.0 是 Run 17 时基于理论推断的回退，但实际数据证明 6.0 不足，需要恢复到更高值（建议 8.0-10.0）。**
+
+#### 3. all_targets_captured：出现严重退化，未达 0.7 目标
+
+**结论：captured 全程峰值 0.870（index 1976），但末期严重崩溃至 last=0.070，远未达到 0.7 目标。**
+
+时序趋势（5段均值）：
+- Q1=0.001 → Q2=0.255 → Q3=0.692 → Q4=0.406 → Q5=0.255
+
+captured 峰值持续区间（index 1976-2026，滑动均值）= 0.868，是历史最高值，超过 Run 17 的 0.427 峰值。但峰值后出现崩溃：从 Q3 段的 0.692 降至末期 0.255，last=0.070。
+
+**崩溃机制（逐步追踪）：**
+- 峰值区间 upright_penalty=-0.915 → 100步后=-1.167 → 200步后=-3.406 → 400步后=-14.401
+- upright_penalty 增大与 crash+fly_low 增大精确同步，且均始于 index ~2076
+- 这是"tracking 学成 → 更激进俯冲 → upright 增大 → 坠机"的循环，与 Run 10/14/15 完全相同的模式
+
+近50步分析：captured>0.5 的 rollout 比例仅 12%，captured>0 的比例 37%——策略处于高度不稳定状态，偶尔捕获但无法持续。
+
+**未达 0.7 目标的核心诊断：crash+fly_low 在 captured 增长后激增，打断了捕获行为的稳定化。**
+
+#### 4. policy_std：低于目标区间，entropy=0.004 过度压制
+
+**结论：policy_std 末期 0.610，低于目标区间 0.65~0.70，entropy=0.004 压制过强。**
+
+时序趋势：Q1=0.797 → Q2=0.725 → Q3=0.674 → Q4=0.698 → Q5=0.645，last=0.610
+
+近20步 std=0.610-0.617，持续下降且未见反弹，标准差极小（recent_std=0.019）。entropy=0.004 相比 Run 17 的 0.007 降幅明显，将 std 从 0.627 进一步压低到 0.610。
+
+**关键发现：** std 下降与 captured 崩溃同期发生（两者均始于 index ~2000-2076 段），std 降低使策略减少探索，在 crash/fly_low 激增时无法逃离危险轨迹，加速了 captured 的退化。建议 entropy=0.004 不变或微调至 0.005，因为 crash 问题的优先级高于 std 问题。
+
+#### 5. per-step 瞬时奖励：接近 Baseline，但近期下滑
+
+**结论：instantaneous reward 近50步 Q3=0.564，接近 Baseline 的 0.544，但 Q5=0.694 表明高质量 episode 的峰值仍存在。**
+
+时序趋势：Q1=-0.008 → Q2=0.175 → Q3=0.674 → Q4=0.926 → Q5=0.678，last=0.6575
+
+Q4 段（步骤 240k-320k）instant_reward=0.926 是全运行峰值，显著超过 Baseline 的 0.544。但 Q5 段回落至 0.678，与 Run 17 的 0.680（last）几乎相同。
+
+**per-step 奖励质量本身没有退化**，但 crash/fly_low 导致大量短 episode（ep_len<200步），使总 reward 和 captured 看起来很差，掩盖了 per-step 质量信号。
+
+#### 6. 与 Baseline 的差距：per-step 已接近，结构差距来自 crash/fly_low
+
+| 指标 | Run 18 | Baseline | 差距 |
+|------|--------|----------|------|
+| instant_reward (last) | 0.6575 | 0.544 | **+21%（Run18优）** |
+| ep_len Q4 | 2213 | 1658 | **+33%（Run18优）** |
+| total_reward Q4 | 66.8 | 889.9 | -92%（Run18差） |
+| crash/fly_low | 0.840 | 0.000 | 严重差距 |
+| captured Q5 | 0.633 | 1.166 (Q4) | 差距大 |
+
+**核心结论：per-step 质量指标已超越 Baseline，但 crash/fly_low=0.840 导致 episode 被频繁截断，累计 total_reward 和 captured 未能体现 per-step 的优势。Baseline 的根本优势不是策略质量，而是零坠机率。**
+
+#### 7. 新出现的问题：upright+height 惩罚激增 + illegal_contact 后期爆发
+
+**upright_penalty 结构性恶化：**
+- 峰值区间 upright=-0.915/ep → 末期均值=-22.81/ep（25倍恶化）
+- 近20步中 |upright|>30 的比例：32/100（32%），明显异常
+- 根因：upright_weight 从 0.5 降至 0.3（本次变更），但惩罚量反而增大——这说明策略在追踪时的倾斜角已超过 upright 设计预期，weight 降低反而让策略更不被约束地倾斜
+- **该变更产生了负效果：upright 惩罚量上升，不是下降**
+
+**height_penalty 持续恶化：**
+- 峰值区间 height=-8.724/ep → 末期均值=-33.421/ep（4倍恶化）
+- 与 upright 同步上升，成因相同：追踪行为越激进，俯冲越深
+
+**illegal_contact 后期集中爆发：**
+- 全程爆发次数（|value|>10）= 22次，100% 集中在后半段（step 260k 之后）
+- 近200步爆发9次（vs 前200步0次），且呈加速趋势
+- last=-44.65（极端值），表明训练末期出现接触爆炸事件
+- 这与 captured 峰值后的崩溃机制一致：更积极的接近 → 更频繁的碰撞
+
+### 变更效果评估
+
+| Run 18 变更 | 预期效果 | 实际效果 | 评分 |
+|-------------|---------|---------|------|
+| bbox 14.0m | 解除早期截断 | **有效**：Q5 段 bbox=0.363（vs Run17 Q5=0.346），末期 0.110 | PASS |
+| soft 11.0m | 配合 bbox | 同上 | PASS |
+| fly_low 6.0 | 缓解 bbox-crash 耦合 | **负效果**：crash+fly_low Q5 从 1.356→2.000（+47%）| FAIL |
+| entropy 0.004 | std 0.65~0.70 | **过度压制**：std 末期 0.610（低于目标）| PARTIAL FAIL |
+| upright 0.3 | 降低 per-step 惩罚 | **负效果**：upright 惩罚量末期增大25倍 | FAIL |
+
+### 改进建议 — Run 19
+
+#### Priority 1 (HIGH): fly_low_penalty 恢复至有效区间
+
+**问题：** fly_low=6.0 不足以阻止 approach-dive 行为，Run 18 crash+fly_low Q5=2.000（+47% vs Run17）。
+
+**历史数据支撑：**
+- fly_low=6.0（Runs 10-12）：crash Q5≈0.47-0.68（中等）
+- fly_low=8.0（Run 16）：crash Q5=0.360（-24%），但仍高
+- fly_low=12.0（Run 17）：crash Q5=0.242（但 plateau 固化，per-step 惩罚=0.001 失效）
+- **Run 18 的教训：** 6.0 → crash 反弹；6.0 不是历史安全点，是导致退化的低点
+
+**建议：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`（move 任务对应 cfg）
+- 参数：`fly_low_penalty` → **8.0**（而非恢复到12.0；8.0 是 Run16 验证过的中间值，与 bbox=14m 组合未经测试）
+- 理由：fly_low=12.0 的失效原因是 per-step 效果被 success_reward 淹没（321x 比例），8.0 与调整后的 success 比例（成功率降低后）可能重新奏效
+
+#### Priority 2 (HIGH): upright_penalty_weight 恢复至 0.5
+
+**问题：** upright=0.3 导致策略更不受约束地倾斜，upright 惩罚量末期增大25倍（-0.915→-22.81）。weight 降低反而使行为更差。
+
+**历史数据支撑：**
+- upright=0.5（Runs 13-15）：upright_penalty Q5=-3.84/ep（控制有效）
+- upright=0.8（Run 14）：upright runaway（过高）
+- upright=0.3（Run 18）：upright末期均值=-22.81/ep（最差记录）
+
+**建议：**
+- 参数：`upright_penalty_weight` → **0.5**（回退至 Run 13-15 验证值）
+- 理由：0.3 是本次新增的错误变更，数据证明更低的权重不能改善行为，反而移除了必要约束
+
+#### Priority 3 (MEDIUM): entropy_loss_scale 调整至 0.005
+
+**问题：** entropy=0.004 将 std 压至 0.610，低于目标区间 0.65~0.70。captured 崩溃期间 std 过低使策略无法调整。
+
+**历史数据支撑（线性校正）：**
+- entropy=0.007 → std Q5=0.637（Run 17）
+- entropy=0.004 → std=0.610（Run 18，末期）
+- entropy=0.010 → std=0.826（Run 16）
+- 线性内插：target std=0.65 → entropy≈0.005
+
+**建议：**
+- 参数：`entropy_loss_scale` → **0.005**（小幅调整，避免振荡）
+- 注意：如果 crash/fly_low 问题先解决，std 可能自然上升至目标区间，此变更为辅助
+
+#### Priority 4 (MEDIUM): 监控 illegal_contact 是否需要进一步提高阈值
+
+**现状：** contact_sensor_threshold=50N（Run 17 设置，Run 18 延续），但 Run 18 末期 illegal_contact 出现爆发（last=-44.65，近200步9次爆发）。
+
+**不建议立即变更 50N**，原因：Run 17 末期 illegal_contact 仍受控（last20=-1.49），Run 18 的爆发是 captured 增长后的结构性接触增加（更多接近 = 更多碰撞）。优先解决 crash/fly_low 和 upright，减少接触频率，再评估阈值。
+
+#### 保持不变的参数
+
+- `bounding_box_threshold=14.0m`：Run 18 验证有效，Q5 段 bbox=0.363，末期 0.110，无需变更
+- `boundary_soft_threshold=11.0m`：配合 bbox 有效
+- `success_reward_weight=0.6`：Run 17 确认无奖励欺骗，保持
+- `tracking_reward_weight=5.0`：保持
+- `contact_sensor_threshold=50N`：暂时保持，Run 18 末期才出现爆发
+
+### Experiment Plan — Run 19
+
+1. 应用变更（按优先级）：
+   - `fly_low_penalty`: 6.0 → **8.0**
+   - `upright_penalty_weight`: 0.3 → **0.5**
+   - `entropy_loss_scale`: 0.004 → **0.005**
+2. 训练命令：`python3 scripts/skrl/train.py --task=Isaac-move-flyfollow-marl-v0 --headless --num_envs=2048 --algorithm="MAPPO"`
+3. 监控重点（按优先级）：
+   - **crash+fly_low Q3-Q5 combined**（目标：Q5 < 1.0，当前 Run18 Q5=2.000）
+   - **upright_penalty 近20步均值**（目标：<-5.0/ep，当前 Run18=-13.5/ep）
+   - **all_targets_captured Q5**（目标：> 0.70，需超过 Run17 的 0.332 并与 Run 18 峰值 0.868 持续）
+   - **policy_std Q3-Q5**（目标：0.62~0.70）
+   - **captured 是否在 Q3 之后维持而不崩溃**（Run18 的核心失败点）
+4. 成功标准：
+   - crash+fly_low Q5 < 1.0 AND
+   - captured Q5 > 0.50 AND
+   - captured 在 Q3→Q5 段不出现超过 30% 的衰减
+5. 早停标准：
+   - 若 200k 步时 crash+fly_low Q4 > 1.0（比 Run18 Q4=0.828 更差），提前终止
+   - 若 upright_penalty 近20步均值超过 -30/ep，考虑提前终止
+
+### 关键诊断结论
+
+1. **fly_low=6.0 是错误的回退**：历史上 6.0 从未被验证为"安全点"，Run 10-12 中 6.0 伴随 crash Q5=0.47-0.68。Run 18 数据明确证实 6.0 相比 12.0 产生了更多坠机。需提高至 8.0 重新测试。
+
+2. **upright=0.3 降低 weight 的假设错误**：前提是"weight 越小，per-step 惩罚越小，策略越容易追踪"。但实际上 weight 降低移除了约束，策略的倾斜角反而增大，导致绝对惩罚量上升25倍。正确方向应是保持 weight=0.5 的约束强度。
+
+3. **captured 崩溃机制已明确**：tracking 学成 → 俯冲更激进 → upright/crash 激增 → captured 被截断。这是贯穿 Runs 10/14/15/18 的共同路径。核心解法是同时压制低空行为（fly_low 阈值）和倾斜行为（upright weight），而非降低其中之一。
+
+4. **bbox 变更成功**：14m 有效扩大了 episode 生存空间（ep_len Q5 增长），这是本次唯一明确成功的变更，应保留。
+
+## Changelog（续）
+- 2026-04-07: 追加 Run 18 完整 400k 步分析。关键结论：bbox 改善（last=0.110，有效），but crash+fly_low Q5=2.000（+47% vs Run17，fly_low=6.0 产生负效果），captured 峰值 0.868 后崩溃至 last=0.070（upright 激增触发崩溃循环），policy_std=0.610（低于目标），illegal_contact 末期爆发（后50步9次）。upright=0.3 变更负效果（惩罚量增大25倍）。Run 19 调整：fly_low 6.0→8.0，upright 0.3→0.5，entropy 0.004→0.005，其余不变。
