@@ -9701,3 +9701,204 @@ python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-marl-v0 \
 
 ### Changelog
 - 2026-04-08: Run 20 完整分析（400k steps）。entropy=0.003 + fly_low_penalty=10.0 双失效：std 爆炸至 1.577（历史最高），crash+fly_low Q5=0.915（Run 19 0.638 更差）。根因：success_reward 强梯度压倒 entropy 控制；fly_low_penalty 饱和于随机俯冲。Run 21 建议：entropy→0.001 + success_weight→0.3（同时），fly_low_penalty→8.0（回退）。
+
+---
+
+# Training Analysis Report — Run 21
+
+**Run:** 2026-04-08_20-14-19_mappo_torch_mappo
+**Date:** 2026-04-08
+**Task:** Isaac-marl-move-v0（NovaCarter ×4，轨迹 ±8m）
+**Algorithm:** MAPPO
+**Total steps:** 364,600（约 91.1% budget）
+
+## Training Metrics Summary
+
+| 指标 | Q1 | Q2 | Q3 | Q4 | Q5 | last-10 |
+|------|----|----|----|----|-----|---------|
+| policy_std | 0.798 | 0.738 | 0.684 | 0.673 | 0.698 | **0.721** |
+| all_targets_captured | 0.008 | 0.283 | 0.609 | 0.760 | **0.810** | 0.856 |
+| crash | 0.076 | 0.182 | 0.343 | 0.473 | 0.451 | 0.243 |
+| falcon_fly_low | 0.071 | 0.176 | 0.334 | 0.465 | 0.443 | 0.243 |
+| crash+fly_low combined | 0.147 | 0.357 | 0.678 | 0.938 | **0.894** | **0.590** |
+| bounding_box | 0.993 | 0.845 | 0.669 | 0.542 | 0.557 | 0.717 |
+| ep_len_mean（步） | 116.6 | 154.2 | 222.4 | 239.5 | **256.4** | 308.9 |
+| success_reward/ep | 0.03 | 6.5 | 23.4 | 32.0 | **40.0** | 54.5 |
+| tracking_reward/ep | 1.95 | 3.11 | 4.65 | 5.14 | **5.59** | 5.47 |
+| instant_reward（per-step）| −0.017 | 0.127 | 0.270 | 0.373 | **0.423** | 0.488 |
+| total_reward/ep | −3.3 | 20.2 | 61.5 | 89.8 | **107.6** | 135.3 |
+
+## Observations & Findings
+
+### 1. policy_std 收敛 — CRITICAL 目标：达成
+
+**结论：entropy=0.001 + success_weight=0.3 的双管齐下成功控制了 std 扩张，这是 Run 21 最重要的修复成果。**
+
+- Q5 均值 = 0.698，末 10 点 = 0.721，远低于 Run 20 last=1.577（降幅 −54.4%）
+- std 轨迹：Q1=0.798 → Q3=0.684（收缩）→ Q5=0.698 → last=0.721（末段轻微回升，稳定态）
+- Q5 内部五等分：0.691 → 0.690 → 0.695 → 0.701 → 0.715，呈现"底部反弹"而非继续坍缩或爆炸
+- **std 现已稳定在 0.65～0.75 的目标区间内**，与 Run 12/13 健康阶段相当
+
+Run 20 失败的根因（success_reward 7x 梯度压倒 entropy）已被同步降低 success_weight 解除。两个变量必须联动调整的假设得到验证。
+
+### 2. crash+fly_low combined — HIGH 目标：部分达成，趋势积极
+
+**结论：Q5 均值 0.894 仍超出 <0.5 目标，但末段呈现明显下降趋势。**
+
+- Q5 内部五等分：Q5.1=1.025 → Q5.2=0.858 → Q5.3=0.773 → Q5.4=1.002 → Q5.5=0.810
+- last-20 均值 = 0.590，last-5 均值 = **0.244**（目标 <0.5 在最后 5 个更新窗口已达成）
+- 对比：Run 20 Q5=0.915（最后无明显下降趋势）；Run 21 Q5.5=0.810，last-5=0.244（结构性改善迹象）
+
+**解读：** Q5 均值偏高主要受 Q4 前后的"中段振荡"拉高（步约 290k–350k）。最末段已开始下降。关键问题是这一下降能否持续——std 已稳定在 0.72 意味着随机俯冲触发减少，这正是推动末段改善的机制。
+
+**与 Run 17 对比（run 中 std 0.637、fly_low=12.0）：** Run 17 Q5=0.454（plateau）；Run 21 Q5=0.894 但末段 0.244。Run 21 fly_low=8.0 比 Run 17 fly_low=12.0 温和，但 std 控制更好（0.72 vs 0.63），因此末段崩溃事件更少。
+
+### 3. all_targets_captured — HIGH 目标：完全达成
+
+**结论：Q5=0.810 满足 >0.7 目标，末段稳定，无 Run 16（−74%）型退化。**
+
+- 轨迹：Q1=0.008 → Q2=0.283 → Q3=0.609 → Q4=0.760 → Q5=0.810，单调上升
+- Q5 内部五等分：0.798 → 0.722 → 0.832 → 0.894 → 0.805，波动约 ±0.09，无系统性崩溃
+- last-20 均值 = 0.856，last-5 均值 = 0.836
+
+Run 16 担忧（success_weight=0.3 摧毁 captured）未发生。原因分析：
+1. Run 16 时 fly_low_threshold=0.1m，crash 事件频繁截断 episode，captured 无法完成
+2. Run 21 的 fly_low_threshold=0.5m + fly_low_penalty=8.0 为基础，episode 生存能力更强
+3. success_reward Q5 仍有 40/ep（Run 19 约 130/ep，降幅 −69%），激励强度适中，不至于为"规避 crash 风险"而放弃追踪
+
+### 4. ep_len 趋势 — MEDIUM 目标：方向正确，距 Baseline 仍远
+
+- Q5 均值 256 步，last-10 均值 309 步，last 单点 398 步
+- Baseline 目标：1658 步；当前 last-10 = Baseline 的 19.1%
+- 相比 Run 20（Q5=504 步），Run 21 Q5 仅 256 步——**ep_len 出现退步**
+
+**退步原因：** success_reward_weight 从 0.6 降至 0.3，成功终止激励降低，但同时 crash+fly_low 在 Q3-Q4 仍较高（0.678/0.938），短 episode 比例较大。bounding_box Q5=0.557 也维持较高，是另一主要截断源。
+
+Run 20 ep_len Q5=504 的部分原因是 std=1.577 过度探索偶发长 episode，并非稳定的高质量 episode。Run 21 ep_len Q5=256 更真实反映当前策略能力。
+
+### 5. success_reward 规模控制 — MEDIUM 目标：达成
+
+- success_reward Q5=40.0/ep（vs Run 20 Q5=194/ep，降幅 −79.4%）
+- success_reward / |total_penalties| 比值：Q3=2.41，Q4=3.19，Q5=3.42，last-20=4.23
+- Q5 比值 3.4x，低于目标 <4x，在健康范围内
+- Run 14 失效时比值 >100x，Run 20 约 7x，Run 21 3.4x——梯度平衡已逐步改善
+
+**per-step 归一化 success_reward：** Q5=0.163/step（Run 16 success_weight=0.3 时约 0.10/step，更高是因为 ep_len 不同）。未观测到 Run 16 式的 reward hacking（per-step 值 Q3→Q5 单调增长为 0.106→0.137→0.163 属于正常策略改善，非被动收集）。
+
+### 6. bounding_box — LOW 新问题：末段反弹
+
+- Q5 均值 0.557（比 Run 20 Q5=0.463 略高）
+- last-5 均值 = **0.916**（严重末段反弹！）
+- last-20 均值 = 0.692
+
+末段 bounding_box 反弹是 Run 21 中唯一出现的新负面信号。可能原因：
+1. std 末段轻微回升（0.715）使策略多样性增加，部分行为更激进
+2. success_reward 末段 last-10=54.5/ep 也在上升，追踪激励重新驱动超界
+
+此问题在 Run 20 末段同样出现（ep_len Q5=504 时成功抑制 bbox，但末段 bounding_box 未见特别监控）。bbox=14.0m 本身配置应保持不变——问题来自行为动态而非边界设置。
+
+### 7. height_penalty — LOW 可接受
+
+- per-step height_penalty Q5 = −0.0262/step（Run 17 参考值约 −0.022/step，略高但稳定）
+- 无爆炸迹象（阈值 1.5m + per-drone 修复已验证）
+- 绝对值 Q5 = −6.4/ep 是 ep_len 积累的假像，per-step 才是真实指标
+
+## Improvement Recommendations
+
+### Priority 1（CRITICAL）：crash+fly_low Q5 降至 <0.5
+
+**问题：** Q5 均值 0.894 超标，虽末段 0.244 达标，但 Q5 平均水平证明训练中段存在高强度崩溃窗口（步 280k–350k 区域，Q5.1/Q5.4 均约 1.0）。
+
+**根因：** std 在 Q3-Q4 仍约 0.68-0.67，此阶段 success_reward 梯度增长（Q3=23/ep→Q4=32/ep）驱动更激进追踪 → 更多俯冲 → crash+fly_low 激增。fly_low_penalty=8.0 的威慑力在 std 相对较高时不足。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- Parameter: `fly_low_penalty` 8.0 → **10.0**
+- Rationale: Run 20 的 10.0 失效是因为 std=1.577（随机俯冲），现在 std=0.72 已受控，10.0 的威慑力应能有效针对主动俯冲行为。Run 20 教训是"fix std first"，Run 21 已完成这一先决条件。
+
+### Priority 2（HIGH）：稳固 std 稳定性，防止末段反弹
+
+**问题：** std Q5 内部从 Q5.1=0.691 轻微回升至 Q5.5=0.715，last=0.721。虽仍在目标区间，但方向是向上的。同时 success_reward 末段 last-10=54.5/ep 仍在上升，如果持续可能重现 Run 20 的梯度不平衡。
+
+**Proposed Change:**
+- File: `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`（agent 配置部分）
+- Parameter: `entropy_loss_scale` 0.001 → **0.001**（保持不变）
+- Rationale: 当前 0.001 已将 std 从 1.577 压制到 0.72——这是正确的。不需要进一步调整。关键是监控 400k 步完成后的 std 走势；如果继续上升超过 0.75，下一轮再考虑 0.002。
+- **NOT CHANGING:** success_reward_weight 保持 0.3——当前比值 3.4x 在健康范围内，且没有 reward hacking 迹象
+
+### Priority 3（MEDIUM）：解决 bounding_box 末段反弹
+
+**问题：** bounding_box last-5=0.916，明显超出正常水平（Q5 均值 0.557 本身可接受，但最后 5 个更新窗口的反弹值得关注）。
+
+**Proposed Change:**
+- 不修改 bounding_box_threshold=14.0m（已验证有效）
+- 监控 Run 22 中 Q5 bounding_box 是否持续下降或反弹
+- 若 Run 22 Q5 bounding_box > 0.7，考虑增大 boundary_soft_penalty_weight（当前值待确认）
+
+### Priority 4（LOW）：ep_len 向 Baseline 靠拢
+
+**问题：** ep_len Q5=256 步，是 Baseline 1658 步的 19%。这是已知结构性差距，由 crash+fly_low + bounding_box 双重截断造成。
+
+**分析：** Priority 1 的 fly_low_penalty 提升如果成功降低 crash，ep_len Q4-Q5 应随之增长（参考 Run 15→16→17 的 ep_len 与 crash 反相关）。无需单独调整 ep_len 参数。
+
+## Run 22 实验计划
+
+**基准参数（继承 Run 21）：**
+- entropy_loss_scale = 0.001（保持）
+- success_reward_weight = 0.3（保持）
+- upright_penalty_weight = 0.5（保持）
+- fly_low termination z = 0.5m（保持）
+- bounding_box_threshold = 14.0m（保持）
+- tracking_reward_weight = 5.0（保持）
+- contact_sensor_threshold = 50N（保持）
+
+**Run 22 唯一变更：**
+
+| 参数 | Run 21 | Run 22 |
+|------|--------|--------|
+| `fly_low_penalty` | 8.0 | **10.0** |
+
+**理由：** Run 20 的 10.0 失效于 std=1.577 环境（随机俯冲无法被惩罚矫正）。Run 21 将 std 稳定到 0.72，消除了随机俯冲的根源。在 std 受控的前提下，10.0 的威慑力应能针对主动俯冲行为发挥作用（参考 Run 9 中 threshold=1.5m + fly_low=4.0 的协同效果）。单变量变更保证可解释性。
+
+**训练配置：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**监控目标（以 100k 步为检查点）：**
+- 200k 步：std Q2 应在 0.63~0.73（若 <0.60 → 停止，entropy 上调至 0.002）
+- 200k 步：crash+fly_low Q3 应低于 Q1（单调下降信号）
+- 300k 步：all_targets_captured Q4 应 >0.75（若 <0.55 → 检查 success_reward 是否下滑）
+- 400k 步目标：
+  - policy_std 末段：0.65～0.75（目标不变）
+  - crash+fly_low Q5 < **0.6**（从 Run 21 Q5=0.894 改善）
+  - all_targets_captured Q5 > **0.80**（维持 Run 21 水平）
+  - ep_len Q5 > **300**（从 Run 21 Q5=256 改善，crash 减少自然带动）
+  - bounding_box Q5 < **0.5**（观察末段反弹是否收敛）
+
+**成功标准：**
+- crash+fly_low Q5 < 0.6 且无末段恶化趋势
+- all_targets_captured Q5 > 0.80 且 Q5 内部无 >30% 衰减
+- std 末段稳定 0.65～0.75，不再出现 Run 19/20 式扩张
+
+**中止标准：**
+- 200k 步时 std Q2 < 0.58（entropy 过度压制探索）
+- 200k 步时 crash+fly_low Q3 > 0.90（10.0 比 8.0 更差 → 回退至 8.0，寻找其他路径）
+- 200k 步时 all_targets_captured Q3 < 0.40（captured 退化，检查 success_reward 激励）
+
+## Run 21 关键结论（供后续参考）
+
+1. **entropy=0.001 + success_weight=0.3 联动调整成功**：std 从 1.577（Run 20）稳定至 0.72（Run 21），验证了"必须同时削减 success 梯度和加强 entropy 压制"的假设。单独操作任一参数会失败（Run 11 教训：单降 entropy→std 崩溃；Run 16 教训：单降 success_weight→captured −74%）。
+
+2. **all_targets_captured Q5=0.810 无退化**：success_weight=0.3 在 fly_low_threshold=0.5m 的环境下不会摧毁追踪激励（Run 16 的 −74% 退化是 fly_low_threshold=0.1m + 高 crash 率的叠加效果，而非 success_weight 单因素导致）。
+
+3. **crash+fly_low Q5 仍是主要未解决问题**：Q5 均值 0.894 虽末段改善（last-5=0.244），但中段（步 280k–350k）振荡严重。std 已受控后，fly_low_penalty 的威慑力可以重新测试（Run 22 提升至 10.0）。
+
+4. **ep_len 退步（Q5：504→256）是设计代价**：success_weight 降低减少了成功终止频率（ep 更短），但提升了训练稳定性。这是可接受的权衡。
+
+5. **bounding_box 末段反弹是新观测到的现象**：last-5=0.916 需在 Run 22 持续监控，但不是当前最优先问题。
+
+### Changelog
+- 2026-04-08: Run 21 完整分析（364k/400k steps）。entropy=0.001 + success_weight=0.3 成功将 std 从 1.577 压制至 0.72（目标达成）。all_targets_captured Q5=0.810（>0.7 目标达成，无 Run 16 退化）。crash+fly_low Q5=0.894 仍超标但末段 0.244 展示下降趋势。Run 22 建议：fly_low_penalty 8.0→10.0（单变量，此前 std 受控后 10.0 未测试）。
