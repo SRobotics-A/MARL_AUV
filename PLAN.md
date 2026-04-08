@@ -9194,3 +9194,242 @@ Q4 段（步骤 240k-320k）instant_reward=0.926 是全运行峰值，显著超�
 
 ## Changelog（续）
 - 2026-04-07: 追加 Run 18 完整 400k 步分析。关键结论：bbox 改善（last=0.110，有效），but crash+fly_low Q5=2.000（+47% vs Run17，fly_low=6.0 产生负效果），captured 峰值 0.868 后崩溃至 last=0.070（upright 激增触发崩溃循环），policy_std=0.610（低于目标），illegal_contact 末期爆发（后50步9次）。upright=0.3 变更负效果（惩罚量增大25倍）。Run 19 调整：fly_low 6.0→8.0，upright 0.3→0.5，entropy 0.004→0.005，其余不变。
+
+---
+
+## 2026-04-08 Move Run 19 训练分析
+
+**Run:** 2026-04-08_02-23-28_mappo_torch_mappo
+**Date:** 2026-04-08
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Steps:** 400k (完整)
+**Run 19 变更：** fly_low_penalty 6→8，upright_weight 0.3→0.5，entropy 0.004→0.005，**fly_low 终止阈值 0.1m→0.5m**
+
+---
+
+### 训练指标总览
+
+| 指标 | Q1 | Q2 | Q3 | Q4 | Q5 | last |
+|------|----|----|----|----|-----|------|
+| crash+fly_low combined | 0.094 | 0.080 | 0.295 | 0.554 | 0.638 | 0.660 |
+| all_targets_captured | 0.003 | 0.271 | 0.829 | 0.894 | 0.811 | 0.520 |
+| success_reward (ep) | 0.041 | 4.63 | 45.58 | 91.46 | 130.9 | 101.1 |
+| instant_reward (mean) | −0.033 | 0.151 | 0.626 | 0.900 | 0.952 | 0.853 |
+| total_reward (mean) | −4.76 | 20.21 | 128.35 | 247.34 | 357.21 | 418.21 |
+| ep_len mean (steps) | 115.3 | 127.7 | 196.3 | 275.1 | 374.4 | 516.6 |
+| policy_std | 0.807 | 0.753 | 0.749 | 0.885 | 1.055 | 1.181 |
+| fly_low reward | −0.265 | −0.272 | −1.078 | −2.053 | −2.410 | −2.640 |
+| height_penalty | −3.44 | −1.87 | −7.65 | −11.52 | −14.96 | −28.36 |
+| upright_penalty | −0.405 | −0.579 | −0.943 | −1.595 | −2.280 | −4.083 |
+
+**Baseline 参考（2026-03-20）：** all_targets_captured Q4=1.166，crash/fly_low=0.000，instant_reward=0.544，total_reward Q4=889.9
+
+---
+
+### 核心问题分析
+
+#### 1. fly_low 阈值修复效果评估 — SIGNIFICANT（HIGH）
+
+**症状：** crash+fly_low Q5=0.638，Run 18 对应值约 2.000。**降幅 −68%，效果显著**。
+
+**详细轨迹：**
+- Q1=0.094（阈值修复在早期有效压制低空终止）
+- Q3=0.295（追踪学习后开始上升，俯冲行为被 0.5m 阈值截断）
+- Q5=0.638（仍高于目标 <0.5，但远低于 Run18 的 2.000）
+
+**根本原因分析：** fly_low 终止阈值从 0.1m 提升至 0.5m 后，之前 0.1–1.0m 的"无约束俯冲区"被关闭。策略不能再无惩罚地俯冲至 z=0.1m。但 0.5m 阈值与 height_penalty 覆盖区间（threshold=1.5m，即 z<1.0m 触发）之间仍有 0.5m 空隙（0.5–1.0m），策略在该区间仍可积累低空飞行。
+
+**结论：** 阈值修复是本次最有效的单项变更。Q5=0.638 仍高于目标，主因是 ep_len 增长后追踪阶段更长、俯冲机会更多（相对于 Run18 的超短 ep_len）。
+
+---
+
+#### 2. all_targets_captured 稳定性 — PARTIAL SUCCESS（MEDIUM）
+
+**症状：** 未出现 Run18 式的"先升后崩"。Q3=0.829→Q4=0.894→Q5=0.811（小幅回落，非崩溃）。last=0.520（末尾波动，但 Q5 整体稳定）。
+
+**与 Run18 对比：**
+- Run18：峰值 0.868（step 198k）→ last=0.070（崩溃至 8%）
+- Run19：峰值 1.510（step 383k）→ last=0.520（保持 34% of peak）
+
+**根本原因：** upright_weight=0.5 恢复有效。Run18 中 upright_weight=0.3 导致约束移除、倾斜角爆炸（25x 增长），从而截断 captured。Run19 恢复 0.5 后 upright_penalty Q5=−2.28（vs Run18 −13.50），倾斜度受控，captured 不再因 upright 爆炸而崩溃。
+
+**未达到目标 Q5>0.70 的原因：** Q5 mean=0.811 **已超过目标 0.70**。但末尾 last=0.520 提示存在波动。峰值在 step 383k（Q5 尾段），policy_std 持续上升至 1.181 可能加剧了末尾的随机性。
+
+---
+
+#### 3. per-step 瞬时奖励 — MAINTAINED（LOW）
+
+**症状：** Q5 mean=0.952，last=0.853。远超 Baseline 0.544 和目标 >0.55。
+
+**分析：** per-step 奖励质量在整个 Run19 持续提升（Q1=−0.033→Q5=0.952），说明策略的逐步决策质量在持续进步。per-step 指标未受 crash/fly_low 问题影响，因为短 episode 也有正向 per-step 奖励。
+
+---
+
+#### 4. policy_std 轨迹 — OVER-EXPLORATION（HIGH）
+
+**症状：** Q1=0.807→Q2=0.753→Q3=0.749（正常压缩）→Q4=0.885→Q5=1.055，last=1.181（持续上升，超过目标 0.63~0.68）。
+
+**根本原因分析：** entropy=0.005（Run18 的 0.004 过度压缩到 0.610）确实提升了 std，但效果超出预期。Q3→Q5 段 std 从 0.749 反弹至 1.055，增幅 41%。可能机制：
+1. success_reward Q5 mean=130.9/ep（高）→ 高回报梯度与 entropy 共同驱动 std 上升
+2. fly_low 阈值修复后策略探索空间扩大，鼓励了更多随机行为
+
+**后果：** Q5 last=1.181 是过度探索状态。std>1.0 时策略行为随机性增大，导致末尾 captured last=0.520 的波动，以及 crash+fly_low Q5 的持续高位（随机俯冲更难控制）。
+
+**目标范围：** 0.63~0.70（Run13 0.759 和 Run12 0.627 之间）。Run19 已超出上限，需降低 entropy。
+
+---
+
+#### 5. 与 Baseline 差距分析 — IMPROVING BUT STRUCTURAL GAP REMAINS（MEDIUM）
+
+| 指标 | Baseline Q4 | Run19 Q5 | 差距 |
+|------|-------------|---------|------|
+| total_reward (mean) | 889.9 | 357.2 | −60% |
+| all_targets_captured | 1.166 | 0.811 | −30% |
+| crash+fly_low | 0.000 | 0.638 | +∞ |
+| ep_len mean (steps) | ~1658 | 374.4 | −77% |
+| instant_reward (mean) | 0.544 | 0.952 | +75% |
+
+**结论：** per-step 奖励质量已超越 Baseline 75%，但 episode 长度和 crash/fly_low 仍是主要差距来源。total_reward 差距 60% 几乎完全来自 ep_len（374 vs 1658，差 4.4x）。Baseline 从未触发 crash/fly_low，是因为使用了更简单目标（非 NovaCarter scale=3x）。
+
+---
+
+#### 6. 新发现问题
+
+**6a. height_penalty 持续增长 — HIGH**
+- Q5 mean=−14.96/ep，last=−28.36（全局最差值）
+- per-step 归一化：Q5 mean=−0.041/step（Q4=−0.042，Q3=−0.039 — 已稳定，非爆炸）
+- 绝对值大是 ep_len 增长的累积效应，per-step 层面尚在控制范围内
+- 但 last=−28.36 在 ep_len=516 步时对应 per-step=−0.055，略高于 Q5 均值
+
+**6b. boundary_soft 惩罚上升 — MEDIUM**
+- Q4=−0.638→Q5=−1.260（+97%），last=−1.574
+- 追踪更积极（std 上升）→ 更多边界超出。不影响 bbox termination（Q5=0.666 仍在降低），但表明策略在边界附近频繁摩擦
+
+**6c. ep_len 显著低于 Run18 — MEDIUM（EXPECTED）**
+- Run19 Q5=374 vs Run18 Q5≈4555
+- 原因：fly_low 阈值 0.5m 提前终止了之前能存活到 timeout 的低空飞行 episode
+- 这是设计上的预期副作用：阈值修复"牺牲"了部分超长 episode 换取崩溃率下降
+
+**6d. upright_penalty 末尾加速 — MEDIUM**
+- last=−4.083（vs Q5 mean=−2.28，last 是 Q5 mean 的 1.8x）
+- 与 policy_std 末尾加速（last=1.181）同步，符合"std 上升→更随机倾斜→upright 上升"的链条
+
+---
+
+### 综合评估
+
+| 核心问题 | Run19 结果 | 目标 | 达成？ |
+|---------|----------|------|--------|
+| fly_low Q5 combined crash+fly_low | 0.638 | <0.5 | 未达（差 28%） |
+| all_targets_captured Q5 | 0.811 | >0.7 | **达成** |
+| captured 不出现崩溃（Q3→Q5 <30% 衰减） | Q4=0.894→Q5=0.811（−9%） | <30% | **达成** |
+| instant_reward Q5 | 0.952 | >0.55 | **达成** |
+| policy_std Q5 | 1.055 | 0.63~0.68 | 未达（过高） |
+
+**整体判断：** Run19 是 Run 19 系列中的最重要突破——fly_low 阈值修复将 crash+fly_low 从 2.000 降至 0.638（−68%），captured 从崩溃恢复至 Q5=0.811。但 policy_std 过度扩张（1.055→1.181）带来了新的不稳定因素，需在 Run20 中收敛。
+
+---
+
+### Run 20 改进建议
+
+#### Priority 1 (HIGH): 降低 entropy_loss_scale — 压缩 std 至目标范围
+
+**问题：** policy_std Q5=1.055，last=1.181（目标 0.63~0.68），过度探索导致末尾 captured 波动和 crash 持续
+
+**变更：**
+- 文件：`skrl/` MAPPO 训练配置（通常在 `scripts/skrl/train.py` 或 cfg 文件中）
+- 参数：`entropy_loss_scale` 0.005 → **0.003**
+- 依据：线性插值校准——Run18 entropy=0.004→std=0.610，Run19 entropy=0.005→std=1.055 末段。0.003 预计 std≈0.65，处于目标范围中心
+
+**注意：** std 不能过低（<0.60 时 captured 多样性消失，Run11 教训）。建议在 200k 步时检查 std Q2，若 <0.60 立即提高至 0.004。
+
+---
+
+#### Priority 2 (HIGH): 进一步提高 fly_low_penalty — 压制剩余俯冲
+
+**问题：** crash+fly_low Q5=0.638，阈值修复已处理最严重情况，但策略仍在 z=0.5~1.0m 区间频繁触发低空惩罚（fly_low reward Q5=−2.410/ep）
+
+**变更：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`fly_low_penalty` 8.0 → **10.0**
+- 依据：每增加 2 单位约减少 30~40% fly_low（历史数据）；Run19 crash+fly_low Q5=0.638，目标 <0.5 需再减 ~21%
+
+**替代方案：** 若担心 fly_low_penalty 与 bbox 耦合（Run17 教训：penalty 过高→保守飞行→更多 bbox），可先测试 9.0。Run19 bbox Q5=0.666（仍在改善），暂无耦合信号。
+
+---
+
+#### Priority 3 (MEDIUM): 确认 fly_low 终止阈值 0.5m 设计——考虑进一步收紧
+
+**问题：** fly_low 终止阈值 0.5m 修复了 0.1m 的无约束俯冲区，但 height_penalty 覆盖至 z<1.0m，仍有 0.5m（0.5~1.0m）的"软惩罚区"供策略探索
+
+**可选变更：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 参数：`fly_low` 终止阈值（reward 和 termination 两处） 0.5m → **0.6m**（小步收紧，避免过激）
+- 依据：NovaCarter 高度≈0.25m（scale 3x），0.5m 仍与车身贴近；0.6m 给策略 10cm 额外安全裕量
+- 风险：如果 ep_len 再次大幅下降（如 Q5 <300），则放弃此变更
+
+**优先级降为 MEDIUM：** 先观察 Priority 1+2 对 crash/fly_low 的改善效果，若 Run20 Q5 <0.5 则暂不需要此项。
+
+---
+
+#### Priority 4 (LOW): 监控 height_penalty——暂不调整，观察归一化
+
+**问题：** height_penalty last=−28.36/ep（数值大但 per-step=−0.055/step 仍可接受）
+
+**建议：** 维持现有 height_penalty_threshold=1.5m。per-step 指标未爆炸（不像 Run9 threshold=1.0m 时的 −0.08/step）。若 Run20 per-step height_penalty 超过 −0.08/step，则将 threshold 收紧至 1.3m。
+
+---
+
+### Run 20 实验计划
+
+| 参数 | Run19 | Run20 | 变更理由 |
+|------|-------|-------|---------|
+| `entropy_loss_scale` | 0.005 | **0.003** | std 过高（1.055），目标 0.65 |
+| `fly_low_penalty` | 8.0 | **10.0** | crash+fly_low Q5=0.638，再降 20% |
+| `upright_penalty_weight` | 0.5 | **0.5** | 保持（运行正常） |
+| `fly_low termination z` | 0.5m | **0.5m** | 保持（修复成功） |
+| `bounding_box_threshold` | 14.0m | **14.0m** | 保持（VALIDATED） |
+| `success_reward_weight` | 0.6 | **0.6** | 保持 |
+| `tracking_reward_weight` | 5.0 | **5.0** | 保持 |
+| `contact_sensor_threshold` | 50N | **50N** | 保持 |
+
+**训练命令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-marl-v0 \
+  --headless --num_envs=2048 --seed=-1 --algorithm="MAPPO"
+```
+
+**监控指标（按优先级）：**
+1. policy_std Q2：若 <0.60，立即 abort 并将 entropy 调回 0.004
+2. crash+fly_low Q3 mean（目标 <0.3）
+3. all_targets_captured Q3 mean（目标 >0.60，不出现崩溃）
+4. height_penalty per-step（目标 <−0.06/step）
+
+**成功标准：**
+- crash+fly_low Q5 < 0.5
+- all_targets_captured Q5 > 0.70，Q3→Q5 衰减 <30%
+- policy_std Q5 在 0.63~0.75
+- instant_reward Q5 > 0.80
+
+**早停标准：**
+- 200k 步时 std Q2 < 0.58 → 提前停止，entropy 调至 0.004
+- 200k 步时 crash+fly_low Q3 > 0.80（比 Run19 Q3=0.295 更差）→ 提前停止，检查 fly_low 惩罚设计
+
+---
+
+### Run 19 关键结论（供后续参考）
+
+1. **fly_low 终止阈值 0.1→0.5m 是最有效的单次变更**：crash+fly_low −68%，captured 从崩溃恢复至 Q5=0.811。这是 Run19 最重要的贡献。
+
+2. **upright_weight=0.5 恢复有效**：Run18 的 0.3 失败（25x 倾斜增长），0.5 恢复后 Q5=−2.28（正常）。固定为 0.5。
+
+3. **entropy=0.005 过度扩张 std**：末段 1.055→1.181，超过所有先前健康 run（0.60~0.82 范围）。0.003 是下一个校准点。
+
+4. **captured 稳定性与 std 关联**：Q5 mean=0.811（良好）但 last=0.520（末尾波动），与 std 末尾加速（1.181）强相关。压缩 std 是稳定 captured 的关键。
+
+5. **per-step 奖励质量已超越 Baseline**：Run19 Q5=0.952 vs Baseline=0.544。总奖励差距 60% 完全来自 ep_len（crash 终止缩短 episode）。修复 crash/fly_low 是追平 Baseline 的唯一剩余障碍。
+
+### Changelog
+- 2026-04-08: Run 19 完整分析（400k steps）。fly_low 阈值修复验证（−68% crash），captured 恢复 Q5=0.811，std 过扩（1.181）。Run 20 建议：entropy 0.005→0.003，fly_low_penalty 8→10。
+
