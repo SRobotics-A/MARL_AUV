@@ -9433,3 +9433,271 @@ python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-marl-v0 \
 ### Changelog
 - 2026-04-08: Run 19 完整分析（400k steps）。fly_low 阈值修复验证（−68% crash），captured 恢复 Q5=0.811，std 过扩（1.181）。Run 20 建议：entropy 0.005→0.003，fly_low_penalty 8→10。
 
+
+---
+
+# Training Analysis Report — Move Task Run 20
+
+**Run:** 2026-04-08_10-25-55_mappo_torch_mappo
+**Date:** 2026-04-08
+**Task:** Isaac-marl-move-flyfollow-marl-v0
+**Algorithm:** MAPPO
+**Total timesteps:** 400,000
+
+## Run 20 变更（相比 Run 19）
+
+| 参数 | Run 19 | Run 20 |
+|------|--------|--------|
+| `entropy_loss_scale` | 0.005 | 0.003 |
+| `fly_low_penalty` | 8.0 | 10.0 |
+| 其余 | — | 不变 |
+
+## Training Metrics Summary
+
+| 指标 | Q1 | Q2 | Q3 | Q4 | Q5 | last |
+|------|----|----|----|----|----|----|
+| total_reward_mean | 1.81 | 123.3 | 290.6 | 492.2 | 544.0 | 593.6 |
+| instant_reward_mean | 0.014 | 0.604 | 1.001 | 1.130 | 1.079 | 0.820 |
+| ep_len_mean (steps) | 130.8 | 200.5 | 289.9 | 431.8 | 503.8 | 510.6 |
+| all_targets_captured | 0.082 | 0.758 | 0.935 | 0.907 | 0.817 | 0.760 |
+| crash termination | 0.060 | 0.223 | 0.272 | 0.391 | 0.465 | 0.330 |
+| falcon_fly_low term | 0.052 | 0.218 | 0.266 | 0.382 | 0.449 | 0.330 |
+| combined crash+fly_low | 0.112 | 0.441 | 0.538 | 0.773 | 0.915 | 0.660 |
+| policy_std | 0.811 | 0.804 | 0.884 | 1.021 | 1.337 | 1.577 |
+| bounding_box term | 1.035 | 0.842 | 0.754 | 0.583 | 0.463 | 0.560 |
+| fly_low reward/ep | −0.462 | −2.025 | −2.493 | −3.696 | −4.352 | −3.300 |
+| height_penalty/ep | −4.14 | −6.16 | −11.00 | −17.36 | −19.15 | −27.14 |
+| upright_penalty/ep | −0.430 | −1.092 | −1.752 | −2.743 | −3.271 | −4.553 |
+| success_reward/ep | 2.13 | 44.6 | 104.1 | 176.9 | 194.3 | 327.3 |
+| value_loss | 0.306 | 0.401 | 0.140 | 0.144 | 0.141 | 0.218 |
+| entropy_loss | −0.0036 | −0.0036 | −0.0039 | −0.0043 | −0.0051 | −0.0056 |
+
+---
+
+## Observations & Findings
+
+### 1. policy_std 持续过度扩张，未达收敛目标 — CRITICAL
+
+**症状：** entropy=0.003 完全失控。std 从 Q1=0.811 单调上升至 Q5=1.337，last=1.577（Run 19 last=1.181，本次更差 +33%）。Q4→Q5 的后半段斜率：Q4 前半=0.972，Q4 后半=1.069，Q5 前半=1.221，Q5 后半=1.453。末段 20 次更新斜率 +0.001243/update，**仍在加速上升，未到顶**。entropy_loss 本身也在持续增大（Q1=−0.0036 → Q5=−0.0051，last=−0.0056），印证 entropy 压力没有压住 std。
+
+**Run 19 vs Run 20 对比：**
+- Run 19: entropy=0.005, std last=1.181
+- Run 20: entropy=0.003（降低 40%），std last=1.577（反而增大 +33%）
+
+**根本原因：** entropy_loss_scale 降低本应压缩 std，但 Run 20 中**负向梯度方向被 success_reward 的强正向梯度压倒**。success_reward Q5=194/ep（Run 19 Q5=130/ep，本次更高），每次成功捕获产生强梯度，驱动策略向特定行为收敛；PPO 的 clip + entropy 机制无法在这个梯度量级下维持 std。简言之：entropy 系数降低 40%，但 success 梯度增强使净探索动力反而上升。
+
+**结论：** entropy=0.003 对本任务当前 success_reward 规模完全无效。std 过扩已成为训练最严重的不稳定因素。
+
+---
+
+### 2. crash+fly_low 不降反升，为历史最高水平 — CRITICAL
+
+**症状：** 
+
+| 区间 | combined crash+fly_low | Run 19 同期 |
+|------|------------------------|------------|
+| Q1 | 0.112 | 0.143（Run 19 基准） |
+| Q2 | 0.441 | 较低（Run 19 有所压制） |
+| Q3 | 0.538 | 0.295（Run 19 明显优于本次） |
+| Q4 | 0.773 | — |
+| Q5 | **0.915** | **0.638**（本次恶化 +44%） |
+| last | 0.660 | — |
+
+Run 20 Q5=0.915，远超 Run 19 Q5=0.638，也超过目标 <0.5。这是 Run 19 之后的明确回退。
+
+fly_low reward Q5=−4.352/ep（Run 19 Q5=−2.410），惩罚绝对值更大，说明每次 fly_low 事件触发更大惩罚（fly_low_penalty 8→10），但**发生频率也在升高**，净效果为恶化。
+
+**根本原因：** policy_std 持续加速扩张（末段 1.577）导致动作随机性极高，drone 轨迹不可预测，更容易触发 z<0.5m 的低空终止。fly_low_penalty 提高到 10.0 的惩罚信号被 std 扩张引起的随机探索完全淹没——策略无法"学到"避免低空行为，因为每次低空事件都是随机偏差，不是稳定选择。这是 std 过扩的下游直接后果。
+
+**fly_low 每步惩罚率（归一化）：**
+- Q1=−0.00371/step, Q2=−0.01017/step, Q3=−0.00899/step, Q4=−0.00961/step, Q5=−0.01027/step
+- 趋势：Q2 以后基本稳定（0.009~0.010/step），说明惩罚率已饱和——即使提高 penalty，发生频率同步上升，净 per-step 惩罚几乎不变。
+
+---
+
+### 3. all_targets_captured Q5=0.817，维持 Run 19 水平，但末尾不稳定 — PARTIAL SUCCESS
+
+**症状：** Q2=0.758 → Q3=0.935 → Q4=0.907 → Q5=0.817，last=0.760。整体在目标 >0.70 以上（达成），但 Q3→Q5 出现 −12.6% 的衰减（Run 19: Q4=0.894→Q5=0.811，−9.3%，稍好）。
+
+last-10 趋势：[0.880, 1.000, 0.970, 0.820, 0.720, 0.370, 0.170, 1.140, 0.630, 0.760]——波动极大，最低 0.170（vs Run 19 末尾波动最低 0.218）。
+
+**积极面：** Q3=0.935 为历史最高（Run 19 Q3=0.829），说明中期追踪能力在提升。Q4=0.907 也高于 Run 19 Q4=0.894。
+
+**消极面：** std 末段爆炸（1.577）导致末尾 captured 波动比 Run 19 更严重。Q5 last-10 中出现 0.170（17%），是训练后期捕获能力不稳定的强信号。
+
+---
+
+### 4. ep_len 向 Baseline 靠近，但 Q5=504 仍远低于 1658 — HIGH
+
+**症状：** ep_len_mean Q5=503.8 steps（Run 19 Q5=374，本次 +35% 进步）。best=1825 steps（接近 Baseline 1658）。但 Q5 均值 504 vs Baseline 1658，差距仍为 3.3x。
+
+time_out termination 全程 = 0.0——没有任何 episode 到达 timeout（1200 steps at 20Hz = 60s）。所有 episode 都被 crash/fly_low/captured/bounding_box 提前终止。ep_len 增长完全来自 captured 的提前终止时间延长（策略更早完成捕获），不是生存能力提升。
+
+**与 Baseline 差距根源：** Baseline ep_len~1658 steps 的核心原因是"无 crash+fly_low 终止"（crash=0.000, fly_low=0.000）。Run 20 Q5 combined=0.915，几乎每轮次都有 crash 或 fly_low。修复 crash+fly_low 是 ep_len 接近 Baseline 的唯一路径。
+
+---
+
+### 5. bounding_box 持续改善，无新问题 — LOW
+
+**症状：** bounding_box Q1=1.035 → Q5=0.463，last=0.560。单调下降趋势健康。与 Run 19（具体 Q5 值未记录，目标方向一致）相比继续改善。bounding_box=14m 配置有效。
+
+---
+
+### 6. success_reward 规模过大，开始成为新的不平衡因素 — HIGH
+
+**症状：** success_reward Q5=194.3/ep，last=327.3。与所有惩罚项绝对值总和（fly_low Q5≈4.4 + height_penalty Q5≈19.1 + upright Q5≈3.3 + boundary_soft Q5≈1.1 ≈ **28/ep**）相比，success_reward 是惩罚总和的约 7x。
+
+这是 Run 14 历史教训（success_reward 1,000x >> penalties → crash 爆炸）的初步信号，尚未到崩溃程度（因为 success_reward_weight=0.6 比 Run 14 的 5.0 小得多），但已显现：policy_std 不受控扩张背后有 success_reward 强梯度的推动。
+
+---
+
+### 综合评估
+
+| 核心问题 | Run 20 结果 | 目标 | 达成？ |
+|---------|----------|------|--------|
+| policy_std Q5（目标 0.63~0.75） | **1.337，last=1.577** | 0.65 附近 | **未达，严重恶化** |
+| crash+fly_low Q5（目标 <0.5） | **0.915** | <0.5 | **未达，Run 19 比本次好** |
+| all_targets_captured Q5（目标 >0.70） | **0.817** | >0.70 | 达成（中期 Q3=0.935 历史最高） |
+| ep_len 向 Baseline 靠近 | **Q5=504，last=510** | → 1658 | 部分（+35% vs Run 19） |
+| instant_reward Q5（目标 >0.80） | **1.079** | >0.80 | 达成 |
+| 出现新问题？ | std 加速失控 + success 梯度过大 | 无新问题 | 有 |
+
+**整体判断：** Run 20 是**失败的调参轮次**——两项关键目标（std、crash+fly_low）均未达成且明显劣于 Run 19。entropy=0.003 的降低在 success_reward 强梯度面前完全无效；fly_low_penalty=10.0 的提高在 std 爆炸引起的随机俯冲面前也无效。根本问题是 **std 过扩是 crash+fly_low 的上游原因，而非 penalty 不足**。
+
+---
+
+## Improvement Recommendations
+
+### Priority 1 (CRITICAL): 大幅降低 entropy_loss_scale 至有效压制 std 的量级
+
+**问题：** entropy=0.003 时 std 仍加速扩张至 1.577（目标 0.65）。success_reward 强梯度是抗拒因素。
+
+**历史校准数据：**
+- entropy=0.002（Run 11）→ std 从 1.595 降至 0.597（过度压缩）
+- entropy=0.003（Run 12）→ std 从峰值回落至 0.627（稍低于目标）
+- entropy=0.004（Run 13/14）→ std 稳定 0.759（目标范围内）
+- entropy=0.005（Run 19）→ std 爆炸至 1.181
+- entropy=0.003（Run 20）→ std 爆炸至 1.577（更差，因 success_reward 更大）
+
+**结论：** 在 success_reward 规模 ~200/ep 的条件下，entropy=0.003 与 entropy=0.005 的效果相近（均无法压制）。需要比 0.003 更激进的压制，但又不能重蹈 Run 11（entropy=0.002 → std=0.597 崩溃）。
+
+**提议：**
+- 将 entropy_loss_scale 降至 **0.001**（在 Run 11 的 0.002 基础上再减半）
+- **同时** 将 success_reward_weight 降至 **0.3**（减少成功梯度强度，允许 entropy 发挥作用）
+- 这两个变更必须同时进行——单独降 entropy 会重蹈 Run 11 崩溃；单独降 success_weight 可能重蹈 Run 16 的 captured 回退
+
+**文件：** `scripts/skrl/train.py` 或 MAPPO 训练配置
+**参数：** `entropy_loss_scale` 0.003 → **0.001**
+
+**文件：** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+**参数：** `success_reward_weight` 0.6 → **0.3**
+
+**预期效果：**
+- success_reward Q5 从 194/ep 降至 ~97/ep（减半），与 penalties（~28/ep）比值从 7x 降至 ~3.5x（仍高但可接受）
+- entropy 在较弱 success 梯度下可将 std 压回 0.65~0.80 区间
+- 参考 Run 15（success_weight=1.0, entropy=0.006）→ captured Q5=0.811 稳定；本次 success_weight=0.3 不应像 Run 16 那样导致 captured 崩溃，因为 bounding_box 问题已在后续 run 解决（Run 16 时 bounding_box 尚未修复）
+
+**风险控制：** 200k 步时检查 std Q2：
+- 若 std Q2 < 0.58 → entropy 提回 0.002，防止 Run 11 式崩溃
+- 若 all_targets_captured Q3 < 0.50 → 立即 abort，success_weight=0.3 下降过多
+
+---
+
+### Priority 2 (HIGH): fly_low_penalty 从 10.0 回退至 8.0，等 std 稳定后再评估
+
+**问题：** fly_low_penalty=10.0 的提升在 std 爆炸（1.577）引起的随机俯冲面前完全无效（per-step fly_low 惩罚率饱和在 −0.010/step）。提高 penalty 不能解决随机动作导致的低空触发。
+
+**fly_low per-step 惩罚率分析：**
+- Run 19（penalty=8.0）：Q5 per-step ≈ −0.008/step（估算）
+- Run 20（penalty=10.0）：Q5 per-step = −0.010/step
+- 惩罚率提升 25%，但 combined termination Q5 从 0.638 恶化至 0.915（+44%）
+
+惩罚提高与发生率提高相抵消——这是"penalty 饱和"的经典症状。当 std 过高时，fly_low 事件是随机动作的副产品，不是学到的行为，因此 penalty 梯度无法对应地修正策略。
+
+**提议：** Run 21 中将 fly_low_penalty 维持在 **8.0**（回退到 Run 19 值），待 std 压缩至 <0.80 后，再评估是否需要进一步提高。
+
+**文件：** `exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+**参数：** `fly_low_penalty` 10.0 → **8.0**（回退）
+
+---
+
+### Priority 3 (MEDIUM): 监控 success_reward 是否触发 Run 14 式崩溃预警
+
+**问题：** success_reward/penalties 比值已达 7x（vs Run 14 时的 1000x）。尚未出现 Run 14 式的 crash 爆炸（upright_penalty 仅 −3.3/ep，未失控），但信号存在。
+
+**预警阈值（Run 21 中监控）：**
+- success_reward Q3 > 100/ep → 提前降低 success_weight
+- upright_penalty Q4 > −8/ep → warning（Run 14 崩溃前 upright 达 −13.56/ep）
+- crash Q5 > 0.60 → abort，success_weight 过高
+
+---
+
+### Priority 4 (MEDIUM): 确认 fly_low 终止阈值 0.5m 维持不变
+
+**依据：** 本轮 fly_low per-step 惩罚率饱和（0.010/step），并非阈值问题。0.5m 阈值是 Run 19 已验证的有效配置，维持不变。阈值进一步提高（至 0.6m）的时机是 crash+fly_low Q5 <0.4 之后，目前条件不满足。
+
+---
+
+## Experiment Plan — Run 21
+
+### 变更汇总
+
+| 参数 | Run 20 | Run 21 | 变更理由 |
+|------|--------|--------|---------|
+| `entropy_loss_scale` | 0.003 | **0.001** | std 爆炸（1.577），需强力压制 |
+| `success_reward_weight` | 0.6 | **0.3** | 削弱 success 梯度，允许 entropy 生效 |
+| `fly_low_penalty` | 10.0 | **8.0** | 回退；penalty 饱和，高 std 下无效 |
+| `upright_penalty_weight` | 0.5 | **0.5** | 维持（无问题） |
+| `fly_low termination z` | 0.5m | **0.5m** | 维持（已验证） |
+| `bounding_box_threshold` | 14.0m | **14.0m** | 维持（持续改善） |
+| `tracking_reward_weight` | 5.0 | **5.0** | 维持 |
+| `contact_sensor_threshold` | 50N | **50N** | 维持 |
+
+### 训练命令
+
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-flyfollow-marl-v0 \
+  --headless --num_envs=2048 --seed=-1 --algorithm="MAPPO"
+```
+
+### 监控指标（按优先级）
+
+1. **policy_std Q2**（200k 步时）：目标 0.60~0.75
+   - < 0.58 → abort，entropy 调回 0.002
+   - > 1.00 → abort，entropy 降至 0.0005
+2. **all_targets_captured Q3**（200k 步时）：目标 >0.60
+   - < 0.40 → abort，success_weight=0.3 影响过大
+3. **crash+fly_low Q3 mean**（目标 < 0.30）
+4. **success_reward/penalties 比值**：目标 <4x；>8x 时降低 success_weight
+5. **upright_penalty Q4**：>−8/ep 预警
+
+### 成功标准
+
+- policy_std Q5 在 0.63~0.80（核心目标）
+- crash+fly_low Q5 < 0.50（回落至 Run 19 水平或更好）
+- all_targets_captured Q5 > 0.70，Q3→Q5 衰减 <25%
+- instant_reward Q5 > 0.90
+- ep_len Q5 > 550（超过 Run 20 的 504）
+
+### 早停标准
+
+- 200k 步时 std Q2 < 0.58 → entropy 上调
+- 200k 步时 all_targets_captured Q3 < 0.40 → abort，检查 success_weight
+- 200k 步时 crash+fly_low Q3 > 0.80 → 检查 fly_low_penalty 方向
+
+---
+
+## Run 20 关键结论（供后续参考）
+
+1. **entropy=0.003 在 success_reward ~200/ep 规模下完全无效**：std 从 Run 19 last=1.181 进一步扩张至 1.577，且末段仍在加速（斜率 +0.0012/update）。entropy 系数降低 40% 被 success 梯度完全抵消。
+
+2. **fly_low_penalty 10.0 是"penalty 饱和"的典型案例**：per-step 惩罚率从 8.0 到 10.0 仅提升 25%，但 combined termination Q5 从 0.638 恶化至 0.915（+44%）。std 过高时，随机动作触发 fly_low 是结构性问题，penalty 提升不能解决。
+
+3. **std 过扩是所有下游问题的上游根因**：crash+fly_low 恶化、captured 末尾波动（0.170 最低）、height_penalty 持续增长，全部可追溯至 std=1.577 的过度探索。
+
+4. **success_reward 规模控制是 Run 21 的关键**：success_reward Q5=194/ep vs penalties=28/ep（7x 比值）开始成为新的梯度失衡源。entropy 和 fly_low_penalty 的效果都被这一强信号淹没。必须同时降低 success_weight 才能让 entropy 恢复效果。
+
+5. **all_targets_captured Q3=0.935（历史最高）是积极信号**：中期追踪能力继续提升，说明核心任务学习方向正确。问题在于末期 std 爆炸导致不稳定，而非任务理解倒退。
+
+### Changelog
+- 2026-04-08: Run 20 完整分析（400k steps）。entropy=0.003 + fly_low_penalty=10.0 双失效：std 爆炸至 1.577（历史最高），crash+fly_low Q5=0.915（Run 19 0.638 更差）。根因：success_reward 强梯度压倒 entropy 控制；fly_low_penalty 饱和于随机俯冲。Run 21 建议：entropy→0.001 + success_weight→0.3（同时），fly_low_penalty→8.0（回退）。
