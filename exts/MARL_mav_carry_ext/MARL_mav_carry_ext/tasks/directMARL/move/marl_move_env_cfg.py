@@ -126,7 +126,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
-    height_reward_weight = 0.5  # 降低：避免高度锁定压制俯冲捕获策略
+    height_reward_weight = 2.0  # Run22：提升，配合z观测清零，主动引导保持desired_height
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
@@ -137,7 +137,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.05  # Run17：降低单次接触梯度冲击
-    fly_low_penalty = 8.0  # Run21：回退，高std下饱和无效（10.0 combined Q5反升至0.915）
+    fly_low_penalty = 10.0  # Run22：std已压制至0.72，10.0应对主动俯冲有效
 
     # action和observation配置
     if control_mode == "geometric":
