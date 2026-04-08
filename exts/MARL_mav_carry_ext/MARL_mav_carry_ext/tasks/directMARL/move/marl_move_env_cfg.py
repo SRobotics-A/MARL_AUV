@@ -137,7 +137,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
     illegal_contact_penalty = 0.05  # Run17：降低单次接触梯度冲击
-    fly_low_penalty = 8.0  # Run19：Run16验证值（6.0在长episode下产生负效果）
+    fly_low_penalty = 10.0  # Run20：继续加强，目标 combined Q5 <0.5（Run19=0.638）
 
     # action和observation配置
     if control_mode == "geometric":
