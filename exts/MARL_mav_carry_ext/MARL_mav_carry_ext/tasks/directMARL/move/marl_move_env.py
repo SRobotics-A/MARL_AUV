@@ -631,8 +631,6 @@ class MARLMoveEnv(DirectMARLEnv):
             target_rel_pos = self.target_positions - self.drone_positions[
                 :, drone_idx
             ].unsqueeze(1)
-            target_rel_pos = target_rel_pos.clone()
-            target_rel_pos[:, :, 2] = 0.0  # mask z offset
 
             obs_targets = torch.cat(
                 [
@@ -851,16 +849,11 @@ class MARLMoveEnv(DirectMARLEnv):
         fly_low = (self.drone_positions[:, :, 2] < 0.5).any(dim=-1)
         rewards["fly_low"] = -fly_low.float() * self.cfg.fly_low_penalty
 
-        # --- 10. Illegal Contact Penalty ---
-        illegal_any = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for cs in self.contact_sensors:
-            net_f = cs.data.net_forces_w_history
-            max_f = torch.max(torch.norm(net_f, dim=-1), dim=1)[0]
-            has_contact = (max_f > self.cfg.contact_sensor_threshold).any(dim=1)
-            illegal_any = illegal_any | has_contact
-        rewards["illegal_contact"] = (
-            -illegal_any.float() * self.cfg.illegal_contact_penalty
-        )
+        # --- 10. Illegal Contact Penalty (Run23: disabled) ---
+        # NovaCarter CollisionAPI was never fully disabled; contact readings are noise.
+        # Threshold was raised 1N→50N chasing noise without fixing root cause.
+        # Completely disabled to remove noisy gradient signal.
+        rewards["illegal_contact"] = torch.zeros(self.num_envs, device=self.device)
 
         # --- 11. Time Penalty (Removed) ---
         # rewards["time_penalty"] = ...

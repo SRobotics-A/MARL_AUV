@@ -106,10 +106,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
-    action_smoothness_weight = 1.0  # Run22：恢复baseline值，约束动作平滑
+    action_smoothness_weight = 0.3  # Run23：回退Run21值
 
     # Body Rate Penalty: w * exp(-||body_rates||) * step_dt — 新增
-    body_rate_penalty_weight = 2.0  # Run22：恢复baseline值，约束机体角速率
+    body_rate_penalty_weight = 0.5  # Run23：回退Run21值
 
     # Time Penalty: fixed penalty per step to encourage speed
     time_penalty = 0.0
@@ -121,12 +121,12 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 2.0  # Run22：恢复baseline值，约束起飞阶段倾斜
+    upright_penalty_weight = 0.5  # Run23：回退Run21值
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
-    height_reward_weight = 2.0  # Run22：提升，配合z观测清零，主动引导保持desired_height
+    height_reward_weight = 0.5  # Run23：回退，z清零已移除
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
