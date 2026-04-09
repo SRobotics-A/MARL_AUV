@@ -200,8 +200,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 终止条件阈值
     drone_collision_threshold = 0.6
-    bounding_box_threshold = 14.0  # Run18：扩大补偿 nova_carter_scale=3x 目标活动范围
-    boundary_soft_threshold = 11.0  # Run18：配合 bounding_box 扩大
+    bounding_box_threshold = 24.0  # Run23：放宽，给(-10,-8) spawn足够生存空间（间隙14m）
+    boundary_soft_threshold = 18.0  # Run23：配合 bbox=24m，软惩罚在18m触发
     boundary_soft_penalty_weight = 2.0  # 加强：使软惩罚大于追踪收益
 
     # contact sensor
