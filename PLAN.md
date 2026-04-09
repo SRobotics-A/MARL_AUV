@@ -9902,3 +9902,181 @@ python3 scripts/skrl/train.py \
 
 ### Changelog
 - 2026-04-08: Run 21 完整分析（364k/400k steps）。entropy=0.001 + success_weight=0.3 成功将 std 从 1.577 压制至 0.72（目标达成）。all_targets_captured Q5=0.810（>0.7 目标达成，无 Run 16 退化）。crash+fly_low Q5=0.894 仍超标但末段 0.244 展示下降趋势。Run 22 建议：fly_low_penalty 8.0→10.0（单变量，此前 std 受控后 10.0 未测试）。
+- 2026-04-09: Run 22 完整分析（244k steps）。训练完全失败：bounding_box 终止率 ~1.0（all_captured=0.0），ep_len 退化至 75 步（0.75s/回合）。根本原因：drone_spawn_x_range=(-10,-8) 将无人机置于距边界仅 4m 处（|−14−(−10)|=4m），同时 upright/body_rate/smoothness 权重恢复至 baseline（2.0/2.0/1.0），三者惩罚梯度冲突导致策略以"快速冲出边界"作为局部最优解。Run 23 建议：撤销 spawn 扩展和三个权重恢复，仅保留 fly_low_penalty=10.0 单变量。
+
+---
+
+## Run 22 训练分析报告
+
+**Run:** 2026-04-09_08-34-37_mappo_torch_mappo
+**分析日期:** 2026-04-09
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**总步数:** 244,200 步（未完成 400k）
+
+### 训练指标摘要
+
+| 指标 | 早期均值（前25%）| 近期均值（后25%）| 末5点均值 |
+|------|---------|---------|---------|
+| Total reward (mean) | -19.66 | -5.91 | -4.32 |
+| all_targets_captured | 0.0000 | 0.0000 | 0.0000 |
+| bounding_box 终止率 | 0.9305 | 0.9857 | 1.0000 |
+| ep_len (mean steps) | 120.1 | 83.8 | 75.0 |
+| policy_std | 0.822 | 0.752 | 0.718 |
+| upright_penalty | -1.446 | -0.510 | -0.546 |
+| height_penalty | -4.824 | -1.008 | -0.443 |
+| height_reward | 0.791 | 0.743 | 0.758 |
+| distance_reward | 0.320 | 0.146 | 0.093 |
+| tracking_reward | 0.071 | 0.003 | 0.000 |
+| crash 终止率 | 0.061 | 0.001 | 0.000 |
+| falcon_fly_low 终止率 | 0.061 | 0.000 | 0.000 |
+
+### 问题诊断
+
+#### 问题 1：回合快速结束 — 严重（CRITICAL）
+
+**症状：** 平均回合长度从 120 步（1.2s）进一步下降至 75 步（0.75s），bounding_box 终止率达 100%。all_targets_captured 全程为 0。
+
+**根本原因：双重致命组合**
+
+1. **spawn 位置距边界间隙不足（4m）：**
+   - drone_spawn_x_range=(-10,-8)，bounding_box_threshold=14m，边界在 x=±14
+   - 无人机最近点距负 x 侧边界仅 4m（|−14−(−10)|=4m）
+   - 对比 Run 21 spawn=(-4,-2)：间隙为 10m
+   - 即使以中等速度（4 m/s）向负 x 方向飞行，仅需 1.0s = 100 步即触发边界
+
+2. **高权重惩罚组合在 early policy 中产生梯度冲突：**
+   - upright_weight=2.0、body_rate_weight=2.0、action_smoothness_weight=1.0
+   - 相比 Run 21（0.5/0.5/0.3），梯度压力放大 4×/4×/3×
+   - 随机初始化策略产生随机动作 → 触发大倾斜 → 惩罚梯度强制"停止运动"
+   - "停止运动"无法克服初始速度扰动，导致无人机随机漂移出边界
+
+3. **负反馈局部最优陷阱：**
+   - ep_len 在训练过程中持续缩短（早期120步 → 末期75步），而非增长
+   - 这是策略退化的典型信号：策略学会"更快逃出边界"来回避高惩罚步骤
+   - 对比 Run 21：ep_len 从 117 步增长至 250 步（策略学会存活）
+
+**量化验证：** 75 步 × 0.01s/步 = 0.75s/回合，而完整任务需 60s 回合（6000步）。策略完全无法在环境中生存。
+
+**证据：**
+- bounding_box 终止率早期 0.93 → 末期 1.00（恶化，非改善）
+- drone_out 奖励分量全程 -1.0（100% 环境触发边界惩罚）
+- tracking_reward 末期 = 0.000（无人机从未接近目标）
+- distance_reward 末期 0.093（比早期 0.320 更差，说明距离在增大）
+
+---
+
+#### 问题 2：姿态无法稳定 — 高（HIGH）
+
+**症状：** upright_penalty 早期 −1.446（对应 weight=2.0），表明起飞初期存在显著倾斜。trajectory 中无法维持稳定高度接近目标。
+
+**根本原因分析：**
+
+1. **target_rel_pos z 清零与 height_reward_weight=2.0 的矛盾：**
+   - 代码 `target_rel_pos[:,:,2] = 0.0` 使策略无法从观测中感知"目标高于/低于自身"
+   - 同时 height_reward_weight 从 0.5 提升至 2.0，强制策略保持 desired_height=2.5m
+   - 这两个信号并不冲突（z 清零影响目标跟随，height_reward 影响绝对高度），但组合后策略需同时：
+     - 在 XY 平面飞向目标（z 信息被隐藏）
+     - 保持绝对高度 2.5m（height_reward 激励）
+   - 在 4x 重的倾斜/角速率惩罚压力下，早期策略优先减少倾斜而非飞向目标
+
+2. **upright 量化分析：**
+   - Run 22 per-step 原始倾斜信号 = upright_penalty/ep_len/weight = −0.510/83.8/2.0 = **−0.00304/步**
+   - Run 21 per-step 原始倾斜信号 = −1.731/250.0/0.5 = **−0.01384/步**
+   - Run 22 无人机每步倾斜量（物理意义）实际比 Run 21 小 4.6倍
+   - 这说明 weight=2.0 本身并不导致倾斜——倾斜量已减少；但高权重导致早期更新幅度过大，干扰飞向目标的梯度
+
+3. **body_rate 量化对比：**
+   - Run 22 per-step raw = 0.681/83.8/2.0 = **0.00406**（比 Run 21 的 0.00222 高 83%）
+   - 无人机角速率实际比 Run 21 更大，说明在重惩罚下策略产生了更多振荡
+
+**结论：** 姿态不稳并非 weight=2.0 直接导致倾斜加剧（倾斜量更小），而是 spawn 位置 + 重惩罚组合产生的梯度冲突使策略无法学习协调的飞行行为，进而快速退出边界、使问题恶化的恶性循环。
+
+---
+
+### 改进建议
+
+#### Priority 1 (CRITICAL)：撤销 drone_spawn_x_range 扩展
+
+**问题：** spawn=(-10,-8) 导致无人机距边界仅 4m，是 bounding_box=1.0 的直接物理原因。
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 参数：`drone_spawn_x_range` → `(-4.0, -2.0)`（回退至 Run 21）
+- 理由：Run 21 spawn=(-4,-2) 下无人机到边界间隙为 10m，策略有足够的生存余量；"对侧出发"的实验设计需要先确保基础稳定性
+
+#### Priority 2 (CRITICAL)：撤销 upright/body_rate/smoothness 权重恢复
+
+**问题：** 在 ep_len=120 步（早期）的脆弱策略中，4× 的惩罚梯度压制了飞向目标的激励，触发局部最优。
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `upright_penalty_weight`: 2.0 → **0.5**（回退至 Run 21）
+- `body_rate_penalty_weight`: 2.0 → **0.5**（回退至 Run 21）
+- `action_smoothness_weight`: 1.0 → **0.3**（回退至 Run 21）
+- 理由：Run 21 在这三个参数下实现了 all_captured Q5=0.810，说明低权重足够约束行为；提升这三个权重需等策略已能稳定飞行后（ep_len > 200 步）再探索
+
+#### Priority 3 (HIGH)：保留 fly_low_penalty=10.0 单变量测试
+
+**问题：** Run 22 的目标是测试 fly_low_penalty 从 8.0 → 10.0 的效果，但由于 CRITICAL 问题的干扰，该变量从未获得有效测试。
+
+**建议：** 在 Run 23 中仅保留 fly_low_penalty=10.0 这一个变量，撤销其他所有 Run 22 变更，得到纯净的因果归因。
+
+#### Priority 4 (MEDIUM)：暂停 height_reward_weight=2.0 变更
+
+**问题：** height_reward_weight 从 0.5 提升至 2.0 与 target_rel_pos z 清零组合后，高度激励与目标接近激励的相对权重变化未经验证。
+
+**建议：** 回退至 0.5（Run 21 值），待 fly_low_penalty=10.0 效果验证后再单独测试 height_reward 权重。
+
+---
+
+### Run 23 实验计划
+
+**目标：** 在 Run 21 基础上，仅测试 fly_low_penalty=10.0 单变量（这是 Run 22 原始意图，现在获得纯净测试）。
+
+**参数配置（相比 Run 21 的唯一变更）：**
+
+| 参数 | Run 21 | Run 23 |
+|------|--------|--------|
+| `fly_low_penalty` | 8.0 | **10.0** |
+| `drone_spawn_x_range` | (-4,-2) | (-4,-2)（回退）|
+| `upright_penalty_weight` | 0.5 | 0.5（回退）|
+| `body_rate_penalty_weight` | 0.5 | 0.5（回退）|
+| `action_smoothness_weight` | 0.3 | 0.3（回退）|
+| `height_reward_weight` | 0.5 | 0.5（回退）|
+
+**训练配置：**
+```bash
+python3 scripts/skrl/train.py \
+  --task=Isaac-marl-move-v0 \
+  --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**监控目标（以 100k 步为检查点）：**
+- 100k 步：bounding_box 终止率应 < 0.70（若 > 0.90 → 立即停止，检查 spawn/边界配置）
+- 100k 步：ep_len Q2 应 > 150 步（策略应学会存活）
+- 200k 步：crash+fly_low Q3 应低于 Run 21 同期（0.89），验证 10.0 的威慑效果
+- 400k 步目标：
+  - all_targets_captured Q5 > 0.80（维持 Run 21 水平）
+  - crash+fly_low Q5 < 0.60（Run 21 末期 0.244 趋势的延续）
+  - policy_std 末段 0.65～0.75
+
+**成功标准：**
+- ep_len Q3 > 200 步（确认策略能在环境中生存）
+- crash+fly_low Q5 < 0.60 且无恶化趋势
+- all_targets_captured Q5 > 0.80
+
+**中止标准（100k 步时）：**
+- bounding_box 终止率 > 0.90（spawn/边界问题未修复）
+- ep_len Q2 < 100 步（策略无法存活）
+- all_targets_captured 全程为 0
+
+### Run 22 关键教训
+
+1. **spawn 位置与边界距离是硬约束**：drone_spawn_x_range 必须确保间隙 ≥ 8m（bounding_box=14m 时，spawn 上限不得超过 −6m）。超出此约束的所有其他变更都无意义。
+
+2. **多参数同时恢复 baseline 是高风险操作**：Run 22 一次性改变了 7 个参数（spawn + 3个权重 + height_reward + fly_low + z清零），无法归因。单变量原则必须严格遵守，尤其是存在参数间协同效应的惩罚权重。
+
+3. **ep_len 趋势是训练健康度的关键指标**：ep_len 在训练中下降（120→75步）是比奖励曲线更可靠的失败信号——它意味着策略在向"快速死亡"局部最优收敛，而非学习任务。
+
+4. **upright_penalty_weight=2.0 在低 ep_len 环境中适得其反**：即使物理倾斜量更小（raw tilt signal −0.003 vs Run21 −0.014），高权重在早期训练中产生的梯度冲击会干扰飞向目标的梯度方向。此参数的调整应等到策略已建立基础飞行能力后进行。
