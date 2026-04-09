@@ -106,10 +106,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
-    action_smoothness_weight = 0.3  # 降低：避免"舒适奖励"主导策略
+    action_smoothness_weight = 1.0  # Run22：恢复baseline值，约束动作平滑
 
     # Body Rate Penalty: w * exp(-||body_rates||) * step_dt — 新增
-    body_rate_penalty_weight = 0.5  # 降低：避免"舒适奖励"主导策略
+    body_rate_penalty_weight = 2.0  # Run22：恢复baseline值，约束机体角速率
 
     # Time Penalty: fixed penalty per step to encourage speed
     time_penalty = 0.0
@@ -121,7 +121,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 0.5  # Run19：恢复0.5（0.3产生逆效果，末期激增25x）
+    upright_penalty_weight = 2.0  # Run22：恢复baseline值，约束起飞阶段倾斜
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
