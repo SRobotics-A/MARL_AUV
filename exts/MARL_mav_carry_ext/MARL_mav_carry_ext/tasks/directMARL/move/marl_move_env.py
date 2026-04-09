@@ -224,6 +224,10 @@ class MARLMoveEnv(DirectMARLEnv):
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
+        # Progress reward buffer: -1.0 = first-step sentinel (skip progress on reset step)
+        self._prev_min_dists = torch.full(
+            (self.num_envs, self.cfg.num_targets), fill_value=-1.0, device=self.device
+        )
         self.targets_out_of_bounds = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -701,6 +705,19 @@ class MARLMoveEnv(DirectMARLEnv):
         dist_reward = torch.sum(dist_per_target * self.target_values, dim=-1)
         rewards["distance_reward"] = self.cfg.dist_reward_weight * dist_reward * step_dt
 
+        # --- 1b. Progress Reward: reward approach, penalize retreat ---
+        # Provides strong gradient at large distances where exp-decay is near zero.
+        # valid_prev skips the first step after reset (sentinel=-1.0).
+        valid_prev = self._prev_min_dists >= 0  # (N, T)
+        dist_progress = torch.where(
+            valid_prev,
+            (self._prev_min_dists - min_dists).clamp(-0.1, 0.1),  # m/step, capped
+            torch.zeros_like(min_dists),
+        )
+        progress_reward = (dist_progress * self.target_values).sum(dim=-1)  # (N,)
+        rewards["dist_progress"] = self.cfg.progress_reward_weight * progress_reward
+        self._prev_min_dists = min_dists.clone()
+
         # --- Update Capture State (real-time, revocable) ---
         is_captured_now = min_dists < self.cfg.capture_distance
         self.target_captured = is_captured_now  # 实时状态
@@ -975,6 +992,7 @@ class MARLMoveEnv(DirectMARLEnv):
         self._reset_targets(env_ids)
         self._prev_vel_error[env_ids] = 0.0
         self._sustained_follow_timer[env_ids] = 0.0
+        self._prev_min_dists[env_ids] = -1.0  # invalidate for first-step skip
 
         if not isinstance(env_ids, torch.Tensor):
             env_ids = torch.tensor(env_ids, device=self.device)

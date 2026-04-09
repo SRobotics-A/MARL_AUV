@@ -98,6 +98,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     dist_reward_weight = 0.8  # 降低：避免高度锁定时dist_reward主导
     dist_reward_scale = 0.5  # 衰减速率减小，扩大吸引范围
 
+    # Progress Reward: w * Σ(dist_decrease * target_value) per step (Run25: 修复退让)
+    # 直接奖励每步靠近目标的位移，在远距时依然有强梯度（不受指数衰减影响）
+    progress_reward_weight = 1.0
+
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
     success_reward_weight = 0.3  # Run21：削减success梯度根因（必须与entropy同步降低）
 
