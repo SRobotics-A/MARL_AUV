@@ -715,7 +715,7 @@ class MARLMoveEnv(DirectMARLEnv):
             torch.zeros_like(min_dists),
         )
         progress_reward = (dist_progress * self.target_values).sum(dim=-1)  # (N,)
-        rewards["dist_progress"] = self.cfg.progress_reward_weight * progress_reward
+        rewards["dist_progress"] = self.cfg.progress_reward_weight * progress_reward * step_dt
         self._prev_min_dists = min_dists.clone()
 
         # --- Update Capture State (real-time, revocable) ---
