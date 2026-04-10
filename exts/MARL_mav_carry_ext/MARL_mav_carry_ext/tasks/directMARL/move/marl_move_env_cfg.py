@@ -37,14 +37,14 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # control mode
     control_mode = "ACCBR"  # ACCBR or geometric
     # 动作空间参数
-    # 增大最大速度，确保能追上物块(0.2m/s)，并有足够余量进行机动
-    lin_vel_max = 3.0  # m/s
-    ang_vel_max = 3.0  # rad/s
+    # Run31: 降低最大速度，小车0.3m/s，无人机1.5m/s足够追上且不会冲刺乱飞
+    lin_vel_max = 1.5  # m/s（Run31: 3.0→1.5，防止策略探索时高速冲刺）
+    ang_vel_max = 2.0  # rad/s（Run31: 3.0→2.0，配合姿态稳定）
     # env
     decimation = 3
     episode_length_s = 60
     # Added action limits for scaling
-    lin_acc_max = 5.0  # m/s^2
+    lin_acc_max = 3.0  # m/s^2（Run31: 5.0→3.0，更温和的加速度）
     # PD velocity controller gains
     vel_Kp = 3.0  # Proportional gain
     vel_Kd = 0.5  # Derivative gain
@@ -119,7 +119,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     time_penalty = 0.0
 
     # Velocity Penalty: w * exp(-||vel||) * step_dt — 新增：抑制高速
-    velocity_penalty_weight = 0.3
+    velocity_penalty_weight = 1.5  # Run31: 0.3→1.5，与body_rate同量级，强制低速稳定飞行
 
     # Force Penalty: w * exp(-max_thrust) * step_dt — 新增
     force_penalty_weight = 0.5
