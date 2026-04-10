@@ -10080,3 +10080,199 @@ python3 scripts/skrl/train.py \
 3. **ep_len 趋势是训练健康度的关键指标**：ep_len 在训练中下降（120→75步）是比奖励曲线更可靠的失败信号——它意味着策略在向"快速死亡"局部最优收敛，而非学习任务。
 
 4. **upright_penalty_weight=2.0 在低 ep_len 环境中适得其反**：即使物理倾斜量更小（raw tilt signal −0.003 vs Run21 −0.014），高权重在早期训练中产生的梯度冲击会干扰飞向目标的梯度方向。此参数的调整应等到策略已建立基础飞行能力后进行。
+
+---
+
+## Run 28 训练分析报告
+
+**Run:** 2026-04-10_02-42-01_mappo_torch_mappo
+**分析日期:** 2026-04-10
+**任务:** Isaac-marl-move-v0
+**算法:** MAPPO
+**总步数:** ~298k steps（约 74% 的 400k 预算）
+
+### Run 28 主要变更（相比 Run 27）
+
+| 参数 | Run 27 | Run 28 | 说明 |
+|------|--------|--------|------|
+| `progress_reward_weight` | 3.0 | 30.0 | 修复 step_dt 缺失后重新校准（3.0 × 1/dt = ~900 → 30.0 × dt ≈ 正常量级）|
+| `progress_reward` 实现 | 缺 step_dt 归一化 | 乘以 step_dt | 修复：原来量级 100x，完全压制姿态惩罚 |
+| obs_dim per_step | 49 | 53 | 新增：目标 x 方向速度（4 dims）|
+| obs_dim total | 147 | 159 | 3 步历史 × 53 |
+| `upright_penalty_weight` | — | 2.0 | Run 26 已恢复 baseline |
+| `body_rate_penalty_weight` | — | 2.0 | Run 26 已恢复 baseline |
+| `height_reward_weight` | — | 2.0 | Run 26 已恢复 baseline |
+
+---
+
+### 训练指标汇总
+
+| 指标 | 早期 (Q1) | 近期 (Q5) | 末值 | baseline |
+|------|-----------|-----------|------|----------|
+| Total reward (mean) | −88.68 | −21.43 | −3.73 | — |
+| ep_len (mean steps) | 202 | 120 | 194 | 1658 |
+| crash 终止率 | 0.016 | 0.814 | 1.000 | 0.000 |
+| falcon_fly_low 终止率 | 0.016 | 0.809 | 1.000 | 0.000 |
+| bounding_box 终止率 | 0.941 | 0.172 | 0.000 | 0.000 |
+| all_targets_captured | 0.000 | 0.000 | 0.000 | 0.8+ |
+| time_out | 0.000 | 0.000 | 0.000 | — |
+| dist_progress | 1.85 | 4.42 | 9.62 | — |
+| distance_reward | 1.14 | 0.49 | 1.58 | — |
+| tracking_reward | 0.59 | 0.20 | 0.56 | — |
+| fly_low (penalty) | −0.16 | −8.09 | −10.00 | — |
+| upright_penalty | −1.80 | −3.28 | −7.00 | — |
+| height_penalty | −29.56 | −2.36 | −3.26 | — |
+| policy_std | 0.834 | 0.924 | 0.920 | ~0.15 |
+
+---
+
+### 问题诊断
+
+#### 1. crash/fly_low 主导终止 — 严重性：CRITICAL
+
+**症状：**
+- crash 终止率从 Q1=0.016 单调上升至 Q5=0.814，末值=1.000
+- falcon_fly_low 与 crash 几乎完全同步（Q5=0.809），说明两者来自同一事件（低飞即坠）
+- ep_len 早期均值 202 步，Q5 下降至 120 步，末值反弹至 194 步（高度不稳定）
+- all_targets_captured 全程为 0.000
+
+**根因分析：**
+
+Run 28 的核心修复（progress_reward 加 step_dt）有效消除了原有的 100x 量级溢出问题，使高度惩罚从 Q1 early_mean=−29.56 降至 Q5=−2.36（−92%）。这是真实的改善。
+
+然而，crash+fly_low 在修复后反而恶化（Q1→Q5 单调上升），原因在于以下联动：
+1. progress_reward 量级修复后，梯度重新鼓励无人机向目标 x 方向移动
+2. 目标沿 −x 方向行驶，无人机从 spawn=(-10,-8) 追赶目标 spawn=(-6,-2)，需向 +x 方向加速
+3. 当前 upright_penalty_weight=2.0 + body_rate_penalty_weight=2.0（Run 26 恢复的 baseline 值）在高速追赶时持续触发
+4. upright_penalty Q5=−3.29/ep（worsening: Q1=−1.80→Q5=−3.29），策略学会追赶但姿态代价递增
+5. fly_low 出现在追赶动作的俯冲段：无人机加速追目标时下压，触及 fly_low 阈值（z=0.5m）终止 episode
+
+**关键对比（Run 27 vs Run 28）：**
+- Run 27 Q5 crash=0.807（有无效 progress_reward，量级溢出导致姿态失控，原因不同）
+- Run 28 Q5 crash=0.814（progress_reward 修复后，追赶动作触发的结构性 crash，原因不同）
+- 两者 crash 率相近，但 Run 28 的 dist_progress 已从 Run 27 Q5=18.09 上升至 Run 28 Q5=4.42（末值 9.62），说明无人机确实在向目标移动
+
+**证据汇总：**
+- fly_low reward: Q1=−0.16/ep → Q5=−8.09/ep → 末=−10.00（saturated，即每个 episode 都触发 fly_low 终止）
+- dist_progress 正增长（Q5=4.42，末=9.62），说明 progress_reward 起效
+- height_penalty 大幅改善（Q1=−29.56 → Q5=−2.36），说明 step_dt 修复有效
+- crash 与 fly_low 完全同步（相关系数 ~1.0），确认低飞是终止原因而非碰撞
+
+---
+
+#### 2. bounding_box 终止率大幅下降 — 正面信号
+
+**症状：** bounding_box 从 Q1=0.941 降至 Q5=0.172，末值=0.000
+
+**解读：** Run 23 将 bounding_box_threshold 扩大至 24.0m 后，加上 spawn=(-10,-8) 与边界间隙约 14m，bounding_box 作为终止原因已基本消除。这是结构性改善，与 Run 28 的修复无关，但确认了当前边界配置适合 spawn 范围。
+
+---
+
+#### 3. ep_len 在 Q5 持续下降 — 严重性：HIGH
+
+**症状：** ep_len 早期 202 步，Q5=120 步，最低 50 步（worst case）
+
+**解读：** ep_len 下降是 crash/fly_low 率上升的直接结果。策略在学会追赶目标的同时，也学会了俯冲追赶然后被 fly_low 终止的短路行为。这与 Run 22 的"快速死亡"局部最优不同——Run 22 是纯粹的 boundary exit，Run 28 是追赶时俯冲触发 fly_low。
+
+**ep_len 末值反弹至 194（vs Q5=120）**：这是正面信号，说明策略在最后阶段开始学习如何在追赶时维持高度，但尚未稳定。
+
+---
+
+#### 4. tracking_reward 存在但下降 — 严重性：MEDIUM
+
+**症状：** tracking_reward Q5=0.196（vs Q1=0.591），呈下降趋势
+
+**解读：** tracking_reward 自始至终不为零（Q1=0.59、Q5=0.20），说明无人机在某些 episode 内确实进入了 capture_distance=3m 范围。但随着 crash 率上升，episode 被提前截断，tracking_reward 的累积时间缩短，导致其均值下降。
+
+这不是"无人机不再接近目标"——而是"接近目标后 episode 很快因 fly_low 终止"。
+
+---
+
+#### 5. policy_std 偏高且轻微上升 — 严重性：MEDIUM
+
+**症状：** policy_std Q5=0.924，末=0.920（Run 21 良好范围 0.65~0.75）
+
+**解读：** 当前 entropy_loss_scale=0.001 + success_reward_weight=0.3，在 Run 21 产生了 std=0.72（合格）。Run 28 重新引入 upright/body_rate/height 权重（baseline 值 2.0），可能与 entropy 的正则化效果产生交互，std 偏高。std=0.92 意味着策略仍在大量探索，crash 事件中有随机下冲的成分。
+
+---
+
+### 改进建议
+
+#### Priority 1 (CRITICAL)：fly_low 俯冲行为的结构性压制
+
+**问题：** crash+fly_low Q5=0.814，每个 episode 几乎都以低飞终止。当前 fly_low_penalty=10.0 已经 saturated（reward=−10.0/ep 是上限），说明惩罚已不能提供更多梯度信息——无人机每次都触发终止，无法从梯度中学习"不俯冲"。
+
+**根因定位：** 追赶目标（目标沿 +x 移动，无人机 spawn 在 −x 侧）需要 XY 加速，而当前无人机的控制模式（ACCBR，6维）在高 body_rate 下自然产生俯冲分量。upright_penalty_weight=2.0 + body_rate=2.0（baseline 值）在追赶时形成持续的大梯度，策略学到追赶但无法同时维持高度。
+
+**建议验证：** Run 28 最末段 ep_len=194（vs Q5=120）表明策略有自发改善趋势，但受限于 fly_low_penalty saturation 无法继续改进。需要调整：
+
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 考虑降低 `upright_penalty_weight`: 2.0 → **1.0**（Run 26 恢复 baseline 过于激进；Run 21 成功配置是 0.5，baseline 的 2.0 在追赶场景中代价过高）
+- 考虑降低 `body_rate_penalty_weight`: 2.0 → **1.0**（同上）
+- 保留 `fly_low_penalty=10.0`（不提高，已 saturated）
+
+---
+
+#### Priority 2 (HIGH)：dist_progress 增长为正面信号，需保护
+
+**观察：** dist_progress 从 Run 27 Q5=18.09（但末值=−5.41，不稳定）变为 Run 28 Q5=4.42（末值=9.62，持续增长）。step_dt 修复使 progress_reward 量级正常化，无人机确实在向目标移动。
+
+**注意：** dist_progress 高并不等于任务成功——无人机在俯冲追赶时也能累积 dist_progress（XY 方向移近），只是同时触发 fly_low。这解释了 dist_progress 增长与 crash 率同步上升的共存现象。
+
+**建议：** 不需要修改 progress_reward_weight（30.0 在修复后量级正常），但需确保追赶行为不以牺牲高度为代价。
+
+---
+
+#### Priority 3 (HIGH)：policy_std 控制
+
+**观察：** std=0.92，高于 Run 21 的 0.72。当前 entropy_loss_scale=0.001 配置下，Run 21 产生 std=0.72（合格），但 Run 28 引入了更多高权重惩罚（upright/body_rate 均 2.0），可能改变了 loss landscape。
+
+**建议：** 若 Priority 1 调整后 std 仍高于 0.85，考虑将 entropy_loss_scale 微调至 0.002（Run 11 的值；注意 Run 19-21 反复证明 entropy 调整必须与 success_reward 联动）。
+
+---
+
+#### Priority 4 (MEDIUM)：目标 x 速度观测的有效性验证（Run 29 特性）
+
+**观察：** Run 28 加入了目标 x 速度（+4 dims），但训练时长仅 298k 步（未完成 400k）且 crash 率极高，无法有效评估这一观测的贡献。
+
+**建议：** 在 Run 29 中继续保留此观测（已提交），但需确保 Run 29 能够产生足够长的 episode（ep_len > 200 步）才能有意义地评估目标速度信息的价值。
+
+---
+
+### Run 29 是否需要调整
+
+**Run 29 已提交的变更（来自 commit 9f1269f）：**
+- 目标分配改为 y 排序固定 assignment（同一 episode 内 assignment 不变）
+- 观测新增 assigned_target_onehot（+4 dims），obs 53 → 57，总 obs 171（3 步历史）
+
+**评估：**
+
+Run 29 的变更是纯架构改进（固定 assignment 减少多智能体混淆，onehot 给出身份信息），理论上有助于减少策略学习难度。**但这些改进无法解决 Run 28 暴露的根本问题：crash/fly_low=0.814 的结构性失败**。
+
+如果 Run 29 按现有参数（upright=2.0, body_rate=2.0, height_reward=2.0）启动，将面临与 Run 28 相同的追赶→俯冲→fly_low 循环，目标分配改进的价值无法被观测到。
+
+**建议：Run 29 启动前应做以下参数调整：**
+
+| 参数 | 当前（Run 28） | 建议（Run 29） | 理由 |
+|------|----------------|----------------|------|
+| `upright_penalty_weight` | 2.0 | **1.0** | 2.0 在追赶阶段代价过高；Run 21 成功值 0.5，1.0 是折中 |
+| `body_rate_penalty_weight` | 2.0 | **1.0** | 同上；大角速率是追赶的物理必然，过重惩罚导致策略退缩 |
+| `height_reward_weight` | 2.0 | **2.0（保留）** | height_penalty 已从 −29.56 降至 −2.36，height_reward 对高度锚定有积极作用，暂保留 |
+| `fly_low_penalty` | 10.0 | **10.0（保留）** | 已 saturated，不提高也不降低 |
+| `entropy_loss_scale` | 0.001 | **0.001（保留）** | 先调整姿态权重，再评估 std 是否需要调整 |
+
+**Run 29 中止标准（100k 步）：**
+- crash+fly_low 终止率 > 0.80（未改善于 Run 28 → 参数调整无效）
+- ep_len Q2 < 100 步
+- bounding_box 终止率 > 0.50（排查边界问题）
+
+**Run 29 成功标准（400k 步）：**
+- crash+fly_low Q5 < 0.60
+- ep_len Q5 > 200 步
+- all_targets_captured Q5 > 0.30（初步突破零）
+
+---
+
+### Changelog
+
+- 2026-04-10: Run 28 分析（progress_reward step_dt 修复验证，crash/fly_low 根因重新定位为追赶俯冲，建议 Run 29 降低 upright/body_rate 权重至 1.0）
