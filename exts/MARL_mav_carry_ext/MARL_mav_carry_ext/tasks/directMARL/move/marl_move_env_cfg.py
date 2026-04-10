@@ -167,9 +167,9 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
             "falcon3": action_dim_accbr,
         }
         if partial_obs:
-            obs_dim_accbr = 49 * history_len
+            obs_dim_accbr = 53 * history_len  # Run28: +4(target_vel_x)，49→53
         else:
-            obs_dim_accbr = 49
+            obs_dim_accbr = 53  # Run28: +4(target_vel_x)
         observation_spaces = {
             "falcon1": obs_dim_accbr,
             "falcon2": obs_dim_accbr,

@@ -641,6 +641,7 @@ class MARLMoveEnv(DirectMARLEnv):
                     target_rel_pos.view(self.num_envs, -1),  # 12
                     self.target_captured.float().view(self.num_envs, -1),  # 4
                     self.target_values,  # 4
+                    self.target_velocities[:, :, 0],  # 4 — x方向速度（±0.3），用于预判目标运动方向
                 ],
                 dim=-1,
             )
