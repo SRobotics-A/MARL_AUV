@@ -95,26 +95,25 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 所有正奖励乘 step_dt，指数衰减上界为 1.0
 
     # Distance Reward: w * exp(-dist * scale) * step_dt
-    dist_reward_weight = 0.8  # 降低：避免高度锁定时dist_reward主导
-    dist_reward_scale = 0.5  # 衰减速率减小，扩大吸引范围
+    dist_reward_weight = 1.5  # Run30: 恢复baseline值
+    dist_reward_scale = 0.5
 
     # Progress Reward: w * Σ(dist_decrease * target_value) * step_dt per step
-    # Run28: 加上step_dt归一化（修复：原来缺dt导致100x超出姿态惩罚量级，姿态完全失控）
-    # 重新校准weight：30 * 0.09 * 0.01 = 0.027/step，约为舒适奖励0.07的40%（足够激励趋近）
-    progress_reward_weight = 30.0
+    # Run30: 设为0，baseline无此项，与姿态约束冲突导致乱飞
+    progress_reward_weight = 0.0
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
-    success_reward_weight = 0.3  # Run21：削减success梯度根因（必须与entropy同步降低）
+    success_reward_weight = 0.0  # Run30: 恢复baseline值（0.0）
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
-    tracking_reward_weight = 5.0  # Run17：提升，结构性稀释 success 的相对占比
+    tracking_reward_weight = 1.0  # Run30: 恢复baseline值
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
-    action_smoothness_weight = 1.0  # Run24：恢复baseline值（Run23bbox=24m后安全）
+    action_smoothness_weight = 1.0  # baseline值
 
     # Body Rate Penalty: w * exp(-||body_rates||) * step_dt — 新增
-    body_rate_penalty_weight = 1.0  # Run29：2.0→1.0，追赶场景下高速XY加速必然产生大角速率
+    body_rate_penalty_weight = 2.0  # Run30: 恢复baseline值
 
     # Time Penalty: fixed penalty per step to encourage speed
     time_penalty = 0.0
@@ -126,23 +125,23 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 1.0  # Run29：2.0→1.0，过强约束阻止必要倾斜导致俯冲fly_low
+    upright_penalty_weight = 2.0  # Run30: 恢复baseline值
     upright_penalty_threshold = 0.766  # cos(40°)，放宽至40°才触发惩罚
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
-    height_reward_weight = 2.0  # Run26：恢复baseline值（0.5→2.0，高度锚点弱是姿态不稳根因）
+    height_reward_weight = 2.0  # baseline值
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 1.0
-    height_penalty_threshold = 1.5  # Run14：放宽至1.5m，避免接近捕获时误触发
+    height_penalty_threshold = 1.5
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
     crash_penalty_scale = 1.0
-    collision_penalty_scale = 2.0  # Run13：加强无人机分散激励，减少 drones_collide
-    illegal_contact_penalty = 0.05  # Run17：降低单次接触梯度冲击
-    fly_low_penalty = 10.0  # Run22：std已压制至0.72，10.0应对主动俯冲有效
+    collision_penalty_scale = 2.0
+    illegal_contact_penalty = 0.05
+    fly_low_penalty = 1.0  # Run30: 恢复baseline值（10.0→1.0）
 
     # action和observation配置
     if control_mode == "geometric":

@@ -633,12 +633,14 @@ class MARLMoveEnv(DirectMARLEnv):
                 )
 
             # 3. Targets (Rel Pos + State)
-            # Fix: zero out z component so policy only sees XY offset to targets.
-            # Targets sit at z=0.25m; including z caused policy to dive toward them
+            # Zero out z component: targets are at z=0.25m (ground), drone at z=2.5m.
+            # Including z=-2.25 causes policy to dive toward targets to minimize 3D distance,
             # even though capture and distance rewards are purely XY-plane.
             target_rel_pos = self.target_positions - self.drone_positions[
                 :, drone_idx
             ].unsqueeze(1)
+            target_rel_pos = target_rel_pos.clone()
+            target_rel_pos[:, :, 2] = 0.0  # XY-only: prevent policy from diving toward ground targets
 
             obs_targets = torch.cat(
                 [
