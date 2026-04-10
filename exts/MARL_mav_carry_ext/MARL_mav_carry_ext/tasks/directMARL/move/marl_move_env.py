@@ -224,6 +224,10 @@ class MARLMoveEnv(DirectMARLEnv):
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self._sustained_follow_timer = torch.zeros(self.num_envs, device=self.device)
+        # Target assignment buffer: drone_assigned_target[env, drone] = target_idx (fixed per episode)
+        self.drone_assigned_target = torch.zeros(
+            self.num_envs, self._num_drones, dtype=torch.long, device=self.device
+        )
         # Progress reward buffer: -1.0 = first-step sentinel (skip progress on reset step)
         self._prev_min_dists = torch.full(
             (self.num_envs, self.cfg.num_targets), fill_value=-1.0, device=self.device
@@ -650,6 +654,11 @@ class MARLMoveEnv(DirectMARLEnv):
             obs_distances = drone_to_target_distances[:, drone_idx]  # 4
             is_closest = (closest_drone_to_target == drone_idx).float()  # 4
 
+            # 5. Assigned Target (fixed per episode, one-hot) — stable coordination signal
+            assigned_idx = self.drone_assigned_target[:, drone_idx]  # (N,)
+            assigned_onehot = torch.zeros(self.num_envs, self.cfg.num_targets, device=self.device)
+            assigned_onehot.scatter_(1, assigned_idx.unsqueeze(1), 1.0)  # (N, 4)
+
             # Combine
             obs_t = torch.cat(
                 [
@@ -658,6 +667,7 @@ class MARLMoveEnv(DirectMARLEnv):
                     obs_targets,
                     obs_distances,
                     is_closest,
+                    assigned_onehot,  # 4 — 告知无人机本 episode 负责哪个目标
                 ],
                 dim=-1,
             )
@@ -1033,6 +1043,21 @@ class MARLMoveEnv(DirectMARLEnv):
             robot.write_root_velocity_to_sim(
                 torch.zeros_like(default_root_state[:, 7:]), env_ids=env_ids
             )
+
+        # ===== Target Assignment (fixed for entire episode) =====
+        # Assign each drone to a target by y-rank: highest-y drone → highest-y target (highest value).
+        # drone spawn y: center_y + radius * sin(phase[i]), radius=2.0
+        radius = 2.0
+        drone_spawn_y = center_y.unsqueeze(1) + radius * torch.sin(phases).unsqueeze(0)  # (B, D)
+        # drone_y_rank[b, r] = drone_idx with r-th highest y in batch b
+        drone_y_rank = drone_spawn_y.argsort(dim=1, descending=True)  # (B, D)
+        # assignment[b, drone_idx] = target_idx (0=highest-value/y, 1, 2; target 3 unassigned)
+        target_indices = torch.arange(self._num_drones, device=self.device).unsqueeze(0).expand(
+            len(env_ids), -1
+        )
+        assignment = torch.zeros(len(env_ids), self._num_drones, dtype=torch.long, device=self.device)
+        assignment.scatter_(1, drone_y_rank, target_indices)
+        self.drone_assigned_target[env_ids] = assignment
 
         for agent in self.cfg.possible_agents:
             self._observation_buffers[agent].reset(env_ids)
