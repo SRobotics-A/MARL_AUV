@@ -10276,3 +10276,401 @@ Run 29 的变更是纯架构改进（固定 assignment 减少多智能体混淆�
 ### Changelog
 
 - 2026-04-10: Run 28 分析（progress_reward step_dt 修复验证，crash/fly_low 根因重新定位为追赶俯冲，建议 Run 29 降低 upright/body_rate 权重至 1.0）
+- 2026-04-11: Run 31 分析（lin_vel=1.5/vel_pen=1.5 严重压制移动行为，tracking_r 归零，建议 Run 32 关注移动能力恢复）
+
+---
+
+## Run 31 训练分析报告
+
+**Run:** 2026-04-10_23-36-24_mappo_torch_mappo
+**分析日期:** 2026-04-11
+**任务:** Isaac-marl-move-v0
+**算法:** MAPPO
+**总步数:** 271,500 steps（约 68% of 400k budget，训练仍在进行或提前终止）
+
+### 参数核查（env.yaml 与 cfg 文件对照）
+
+| 参数 | Run29 (10-56-49) | Run31 (23-36-24, this run) | Run32 (cfg 现值，未训练) |
+|------|------------------|---------------------------|--------------------------|
+| `lin_vel_max` | 3.0 | **1.5** | 1.5（保留） |
+| `lin_acc_max` | 5.0 | **3.0** | 3.0（保留） |
+| `velocity_penalty_weight` | 0.3 | **1.5** | 1.5（保留） |
+| `upright_penalty_weight` | 1.0 | **2.0** | 2.0（保留） |
+| `upright_penalty_threshold` | 0.766 (cos40°) | 0.766 (cos40°) | **0.906 (cos25°)** |
+| `height_penalty_threshold` | 1.5 | 1.5 | **0.8** |
+| `height_penalty_weight` | 1.0 | 1.0 | **2.0** |
+| `fly_low_penalty` | **10.0** | **1.0**（恢复 baseline） | 1.0 |
+| `obs_dim_accbr` | 171 | 171 | 171 |
+
+注意：本 run 同时合并了 Run30（z_fix + 恢复 baseline 参数）与 Run31（lin_vel/vel_pen 调整）两组变更，实为一次运行。
+
+---
+
+### 训练指标汇总
+
+| 指标 | 早期 (Q1, 0~15%) | 后期 (Q5, 85~100%) | 末值 (last5) | Baseline 参考 |
+|------|-----------------|---------------------|--------------|---------------|
+| Total reward (mean) | −87.4 | −27.6 | **−16.1** | +896 |
+| ep_len (mean steps) | 181 | 131 | **120** | 1639 |
+| crash 终止率 | 0.005 | 0.546 | **0.584** | 0.000 |
+| falcon_fly_low 终止率 | 0.000 | 0.533 | **0.584** | 0.000 |
+| all_targets_captured | 0.000 | 0.000 | **0.000** | 1.163 |
+| bounding_box 终止率 | 0.905 | 0.455 | 0.416 | 0.000 |
+| distance_reward | 0.752 | 0.228 | **0.148** | 191 |
+| tracking_reward | 0.021 | 0.003 | **0.000** | 36.6 |
+| upright_penalty | −0.773 | −2.289 | −2.180 | −2.025 |
+| height_penalty | −29.18 | −6.31 | −2.39 | −0.12 |
+| policy_std | 0.832 | 0.957 | **0.973** | 0.162 |
+
+---
+
+### 问题诊断
+
+#### 1. lin_vel=1.5 + vel_penalty=1.5 严重压制移动行为 — 严重性：CRITICAL
+
+**症状：**
+- tracking_reward 自早期便趋近于零（Q1=0.021 → Q5=0.003 → 末=0.000），在 Run29 中该值为 0.38；
+- distance_reward 从早期 0.752 持续下降至末值 0.148，Run29 中该值稳定于 0.82；
+- dist_progress 全程为 0.000（Run28/29 中均有正值，说明无人机有向目标移动的趋势）；
+- ep_len 持续下降（181 → 120 步），终止以 crash（58.4%）和 bounding_box（41.6%）平分，二者之和 =1.0，说明每个 episode 都以提前终止结束。
+
+**根因分析：**
+
+`lin_vel_max=1.5 m/s` + `velocity_penalty_weight=1.5`（原为 0.3）的组合产生了双重抑制：
+
+1. 动作空间上限收窄（1.5 m/s vs 目标小车 0.3 m/s 的相对追赶能力实际足够），但结合 ACCBR 控制器的速度饱和特性，低 lin_vel 使得策略无法完成高速追赶动作；
+2. velocity_penalty 量级提升 5× 后，正的 velocity_penalty_weight 实际上产生的是 `w * exp(-||vel||) * step_dt` 形式的奖励（vel 越小，exp 越大），这本质上是**鼓励低速甚至静止**的信号；
+3. 两者叠加造成策略选择接近悬停而非追赶，导致 tracking_reward 归零（因为无人机不再靠近目标）；
+4. 同时 upright_penalty_weight 从 Run29 的 1.0 回升至 2.0，进一步压制追赶期间的正常姿态倾斜。
+
+**对比 Run29（upright=1.0, vel_pen=0.3, lin_vel=3.0）：**
+- crash late=0.591，fly_low=0.581（仍高，追赶俯冲问题）
+- 但 tracking_r late=0.380，distance_r=0.824，dist_progress > 0
+- 说明 Run29 的无人机虽然频繁坠毁，但**在坠毁前确实接近了目标**
+
+Run31 的无人机则**不再尝试接近目标**——这是从"追赶但俯冲"退化为"悬停后坠毁"的根本性倒退。
+
+**证据：**
+- dist_progress 全程 0.000（无任何向目标移动的累积奖励）
+- tracking_reward 末=0.000（从未进入 capture_distance=3m）
+- velocity_penalty 末=0.082，run29 末=0.077（两者接近，说明策略已主动降速，velocity_penalty 未能区分行为）
+
+---
+
+#### 2. crash/fly_low 恶化模式与 Run29 不同 — 严重性：CRITICAL
+
+**症状：**
+- Run31 crash 在 step ~13,600 开始（20-window 分析中 window 4/20 = 0.717），此前几乎为零（window 0/20=0.001, 1-3/20=0.000）；
+- bounding_box 早期占主导（0.905），随后 crash 取代 bounding_box 成为主要终止原因；
+- 终末段 crash（Q5=0.546）和 bounding_box（Q5=0.455）并存，但 crash 占优。
+
+**根因：** 早期策略选择逃离边界（高速，bounding_box 主导）→ 速度被压制后策略转向随机振荡 → 振荡触发 fly_low 终止。这是一个典型的"逃避惩罚→找不到出路→随机崩溃"的局部行为。
+
+**关键证据：**
+- crash onset 出现在 step 13,600，与 height_penalty 大幅改善（early −29.18 → 该步附近 −2.7）**同时出现**，说明高度问题缓解后策略开始随机探索 XY 平面，触发了 fly_low；
+- upright_penalty 在 crash onset 同期恶化（window 4/20: −4.02）；
+- 末段 crash 中位数（Q50=0.985）远高于均值（0.677），说明有大量步是 crash=1.0（完全 fly_low），但也有间歇性 crash=0.000 的步（Q10=0.000），说明策略未完全固化为 fly_low 行为，仍在波动探索。
+
+---
+
+#### 3. height_penalty 显著改善，但功劳不在 lin_vel/vel_pen 变更 — 严重性：MEDIUM（正面）
+
+**症状：** height_penalty early=−29.18 → late=−6.31 → 末=−2.39（改善约 92%）
+
+**解读：** 这是 target_rel_pos z=0 修复（Run30 引入的结构性变更）的效果。之前无人机观测到 rel_pos.z（负值，因为目标在地面而无人机在空中），policy 将这一信号解读为"需要下降"，导致系统性俯冲。z 清零后，这个错误的下降信号被消除，高度惩罚大幅改善。
+
+这是迄今为止 run 中**唯一被明确验证有效的结构性修复**。Run29（10-56-49）的 height_penalty early=−14.63 已经反映了该修复的部分效果，Run31 进一步确认。
+
+---
+
+#### 4. policy_std 持续升高，接近饱和 — 严重性：HIGH
+
+**症状：** policy_std 从 early=0.832 单调升至 末=0.973（接近 1.0 上限），远高于 baseline=0.162
+
+**解读：** policy_std=0.97 意味着策略几乎处于最大熵状态，接近随机策略。这与以下现象一致：
+- 奖励信号主要为惩罚（负值主导），策略无法找到正向梯度方向；
+- velocity_penalty + lin_vel 限制压制了有效动作空间，策略在有限动作范围内随机探索；
+- crash 在 Q50=0.985 的同时又有 Q10=0.000，印证了策略随机性高。
+
+当 std 接近 1.0 时，entropy 项无法继续提供有用的正则化信号。这是策略探索失败的症状，而非原因。
+
+---
+
+#### 5. bounding_box 持续问题，未随训练改善 — 严重性：MEDIUM
+
+**症状：** bounding_box 早期=0.905（策略逃跑），中期=0.455（与 crash 共存），末期=0.416（未继续下降）
+
+**解读：** bounding_box 在 Run29 末=0.152，Run31 末=0.416，反而**回退**。原因是 vel_pen=1.5 压制了有效追赶，策略既不能追目标又不能悬停，被动走到边界。bounding_box_threshold=24m 是足够的，问题在于策略行为退化。
+
+---
+
+### Run32 参数评估
+
+Run32 对应 cfg 文件当前值（`upright_penalty_threshold=0.906`，`height_penalty_threshold=0.8`，`height_penalty_weight=2.0`），尚未训练。
+
+#### 评估：Run32 变更方向正确，但无法解决根本问题
+
+| Run32 变更 | 效果预期 | 风险 |
+|-----------|---------|------|
+| `upright_threshold`: cos40°→cos25° | 收紧倾斜容忍，触发更多 upright_penalty | 在移动能力已被压制的情况下，进一步限制追赶姿态，可能加剧悬停行为 |
+| `height_penalty_threshold`: 1.5→0.8m | 收紧高度容忍（离 2.5m 超过 0.8m 即触发） | target_rel_pos z 修复后高度问题已基本解决，可能过度收紧 |
+| `height_penalty_weight`: 1.0→2.0 | 加强高度约束 | 与 height_penalty_threshold=0.8 叠加，产生密集负梯度 |
+
+**核心问题：Run32 未解决 tracking_reward=0.000 的根本问题（lin_vel=1.5 + vel_pen=1.5 的双重抑制）。**
+
+在策略完全停止接近目标的状态下，收紧 upright/height 约束只会产生更多的负奖励信号，不会重新激活追赶行为。Run32 按当前参数运行的预期结果：
+- tracking_reward 继续为 0
+- crash 略有变化（upright 触发窗口改变）
+- height_penalty 略微改善（threshold 收紧，高度锚定更精确）
+- **不会出现 captured > 0**
+
+---
+
+### 改进建议
+
+#### Priority 1 (CRITICAL)：恢复移动能力，撤销 vel_penalty=1.5 的过度约束
+
+**问题：** `velocity_penalty_weight=1.5` 实质上是"低速奖励"（`exp(-||vel||) * w * dt`），配合 `lin_vel_max=1.5` 使策略学会悬停而非追赶。
+
+**建议变更：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `velocity_penalty_weight`: 1.5 → **0.3**（恢复 Run29 值，低速奖励不能过重）
+- `lin_vel_max`: 1.5 → **2.0**（折中值：比 Run29 的 3.0 保守，但比 1.5 给策略更多空间）
+- `lin_acc_max`: 3.0 → **4.0**（与 lin_vel_max=2.0 匹配，保持合理加速能力）
+
+**理由：** target 小车速度 0.3 m/s，无人机需要至少 1.0~2.0 m/s 来完成追赶和维持 capture_distance=3m。lin_vel_max=1.5 理论上够，但配合 velocity_penalty 的"低速奖励"信号，策略选择持续低速，无法建立有效追赶动作。
+
+---
+
+#### Priority 2 (CRITICAL)：恢复 upright_penalty_weight=1.0
+
+**问题：** Run31 将 upright_penalty_weight 从 Run29 的 1.0 回调至 2.0，与 Run28 失败模式一致。
+
+**建议变更：**
+- `upright_penalty_weight`: 2.0 → **1.0**（恢复 Run29 值；2.0 在追赶场景中产生过大梯度冲突，已在 Run28 中验证失败）
+- `upright_penalty_threshold`: 保留 0.906（Run32 的收紧值是合理的，cos25° 比 cos40° 更精准描述"允许追赶倾斜"的边界）
+
+**理由：** upright=2.0 在 Run28 和 Run31 中均导致 crash 恶化（Run28 late=0.814，Run31 late=0.546），而 Run29（upright=1.0）虽然 crash 率也高（0.591），但至少保持了 tracking_r=0.38 的移动行为。
+
+---
+
+#### Priority 3 (HIGH)：height_penalty_weight 慎重收紧
+
+**问题：** Run32 将 height_penalty_weight: 1.0→2.0，height_penalty_threshold: 1.5→0.8，两者同时收紧。
+
+**建议：** 仅保留 threshold 收紧（1.5→0.8），weight 暂维持 1.0，待 tracking_r 恢复后再评估是否需要加强：
+- `height_penalty_threshold`: 0.8（保留 Run32 值）
+- `height_penalty_weight`: **1.0**（不升至 2.0，先确保追赶行为恢复）
+
+**理由：** target_rel_pos z 修复后 height_penalty 已从 −29 降至 −2.4，高度基本可控。过早双倍加强可能在追赶倾斜时累积过多负梯度，干扰追赶梯度方向。
+
+---
+
+#### Priority 4 (MEDIUM)：dist_progress_weight 重新激活
+
+**问题：** Run31 将 `progress_reward_weight=0.0`（env.yaml 显示值为 0.0），导致 dist_progress 全程 0.000。
+
+**建议：**
+- `progress_reward_weight`: 0.0 → **5.0**（比 Run28 的 30.0 保守，因为当前 lin_vel=2.0 m/s 对应的位移梯度更小）
+
+**理由：** dist_progress（位移方向进度）是唯一能区分"靠近目标"和"随机游走"的密集奖励信号。关闭它使策略无法感知"向目标移动"的方向，只能依赖 distance_reward（exponential，远距离梯度极弱）。
+
+---
+
+#### Priority 5 (LOW)：fly_low_penalty 维持 baseline=1.0
+
+**观察：** fly_low_penalty 从 Run29 的 10.0 恢复至 baseline=1.0，与 crash 终止率（0.584 vs Run29 的 0.648）相比未见明显恶化。1.0 是合理值，不建议调整。
+
+---
+
+### Run32 综合建议
+
+当前 Run32 仅调整了 upright_threshold 和 height 约束，**未解决 tracking_reward=0 的根本问题**。建议在 Run32 中同步应用以下变更：
+
+| 参数 | 当前 cfg (Run32) | 建议值 | 优先级 |
+|------|-----------------|--------|--------|
+| `velocity_penalty_weight` | 1.5 | **0.3** | P1 |
+| `lin_vel_max` | 1.5 | **2.0** | P1 |
+| `lin_acc_max` | 3.0 | **4.0** | P1 |
+| `upright_penalty_weight` | 2.0 | **1.0** | P2 |
+| `upright_penalty_threshold` | 0.906 (cos25°) | **0.906**（保留） | — |
+| `height_penalty_weight` | 2.0 | **1.0** | P3 |
+| `height_penalty_threshold` | 0.8 | **0.8**（保留） | — |
+| `progress_reward_weight` | 0.0 | **5.0** | P4 |
+
+---
+
+### 实验计划
+
+1. 应用上述参数变更到 `marl_move_env_cfg.py`
+2. 训练指令：`python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"`
+3. 100k 步中止标准：
+   - crash+fly_low > 0.80 且 tracking_r < 0.05 → 速度限制仍过低，lin_vel_max 再提至 2.5
+   - bounding_box > 0.70 → lin_vel_max 过高，回调至 1.8
+4. 400k 步成功标准：
+   - crash+fly_low < 0.50（改善于 Run29 的 0.59）
+   - tracking_r late > 0.10（恢复接近目标行为）
+   - all_targets_captured late > 0.10（首次突破零）
+   - ep_len late > 200 步
+
+---
+
+### Changelog
+
+- 2026-04-10: Run 28 分析（progress_reward step_dt 修复验证，crash/fly_low 根因重新定位为追赶俯冲，建议 Run 29 降低 upright/body_rate 权重至 1.0）
+- 2026-04-11: Run 31 分析（lin_vel=1.5/vel_pen=1.5 压制追赶行为，tracking_r 归零，distance_r 单调下降；target_rel_pos z=0 修复确认有效；建议 Run 32 撤销 vel_pen=1.5 抑制，恢复 lin_vel=2.0，upright→1.0，progress_reward→5.0）
+- 2026-04-11: Run 32 分析（upright_threshold cos25°=0.906 无效，gradient 过载根因定位：5个高权重惩罚叠加推向零动作悬停；建议 Run 33 降 upright/body_rate/velocity 权重，恢复 fly_low_penalty=8.0 和 height_threshold=1.5m）
+
+---
+
+## Run 32 训练分析报告
+
+**Run:** `2026-04-11_12-26-25_mappo_torch_mappo`
+**日期：** 2026-04-11
+**任务：** Isaac-marl-move-v0
+**算法：** MAPPO
+**步数：** 238,400 步（~60% 训练预算）
+
+---
+
+### 训练指标摘要
+
+| 指标 | Q1 | Q3 | Q5 | 最后值 |
+|------|----|----|-----|--------|
+| total_reward (mean/ep) | −89.5 | −17.7 | −25.8 | −18.0 |
+| ep_len (steps) | 137 | 91 | 110 | 90 |
+| crash 率 | 0.340 | 0.953 | 0.877 | 1.000 |
+| falcon_fly_low 率 | 0.332 | 0.950 | 0.863 | 1.000 |
+| upright_penalty (ep) | −2.37 | −3.20 | −3.99 | −3.20 |
+| height_penalty (ep) | −40.7 | −2.80 | −4.84 | −0.78 |
+| body_rate_penalty (ep) | +1.11 | +0.35 | +0.44 | +0.34 |
+| distance_reward (ep) | +0.90 | +0.32 | +0.19 | +0.26 |
+| tracking_reward (ep) | +0.039 | +0.007 | +0.001 | 0.000 |
+| policy_std | 0.847 | 0.870 | 0.892 | 0.900 |
+| all_targets_captured | 0.000 | 0.000 | 0.000 | 0.000 |
+
+**Baseline 参考（2026-03-20）：** crash≈0.004，fly_low≈0.002，ep_len=1290，upright/ep=−2.26（per-step=−0.00175）
+
+---
+
+### 发现与诊断
+
+#### 1. upright_penalty 实际量级分析 — CRITICAL
+
+upright_penalty 的 episode 累积值（Q5=−3.99/ep）与 baseline（−2.26/ep）表面相近，但 per-step 归一化后暴露真相：
+
+| 期段 | crash 率 | per-step upright | 推算倾斜角 |
+|------|----------|-----------------|-----------|
+| Q1 | 0.249 | −0.0215 | 56.8° |
+| Q2 | 0.957 | −0.0494 | 85.3° |
+| Q3 | 0.945 | −0.0416 | 77.7° |
+| Q4 | 0.988 | −0.0301 | 66.2° |
+| Q5 | 0.871 | −0.0409 | 77.0° |
+| **Baseline** | **≈0** | **−0.00175** | **42.5°** |
+
+upright_penalty 梯度确实存在且持续（penalize signal 是活跃的），但无人机倾斜角从未改善——Q2–Q5 稳定在 66°–85°（接近水平）。
+
+#### 2. crash/fly_low 率 — CRITICAL
+
+crash+fly_low 联合率：Q1=0.33 → Q2=0.96 → Q3–Q5 维持 0.86–0.99/rollout。每轮几乎每个 episode 以撞地结束。ep_len Q2–Q5 = 82–110 步（0.8–1.1 秒）。与 Baseline（crash≈0.004，ep_len=1290）差距 200x。
+
+#### 3. 与 Baseline upright_penalty 量级对比
+
+- Baseline per-step = −0.00175（tilt_excess/drone=0.029，z_axis_body=0.737，倾斜约 42°，barely 超 cos40°=0.766 阈值）
+- Run32 per-step Q5 = −0.037（21× 大），但原因是**坠机物理翻滚**（z 从 2.5m 降到 0.5m 期间的必然倾斜），不是策略选择的持续倾斜
+
+#### 4. body_rate / height_reward / height_penalty 收敛趋势
+
+- **body_rate_penalty：** Q1=+1.11 → Q5=+0.44（−60%）。无人机确实减少了角速度，但这是因为它不再机动，而非稳定飞行的学习。
+- **height_reward：** Q1=+0.81 → Q5=+0.92（轻微改善）。策略学会悬停在 z=2.5m。
+- **height_penalty：** Q1=−40.7（随机策略飞到高空）→ Q2–Q5 稳定在 −2.8 至 −4.8。后期的 height_penalty 来自每次坠机穿越 z=1.7m→0.5m 的 1.2m 区间——是 crash 的**附带惩罚**，不是独立的高度失控。threshold=0.8m（触发 z=1.7m）比 threshold=1.5m（触发 z=1.0m）使每次坠机多累积 2.4× 的 height_penalty。
+
+#### 5. 姿态失控根本原因 — CRITICAL
+
+提高 upright_penalty_threshold 从 cos(40°)→cos(25°) **为何无效**：
+
+**根因 1：gradient 过载（dominant cause）**
+
+Run32 同时叠加了 5 个高权重惩罚：
+- `upright_penalty_weight=2.0`（threshold=cos25°，任何>25°倾斜即触发）
+- `body_rate_penalty_weight=2.0`
+- `velocity_penalty_weight=1.5`
+- `height_penalty_weight=2.0`（threshold=0.8m）
+- `height_reward_weight=2.0`
+
+这 5 个信号共同指向唯一最优策略：**零动作悬停**。而 ACCBR 随机策略会立即产生随机角速度命令，导致翻滚→坠机。ep_len=90 步意味着几乎没有任何时间步用于学习有效机动。
+
+**根因 2：upright_penalty 无法区分"主动倾斜"与"坠机翻滚"**
+
+cos(25°)=0.906 阈值使更多时间步产生惩罚，但坠机过程中的翻滚是物理必然，不是策略选择。更高阈值只加快了惩罚积累，没有改变实际行为。相比之下，Baseline 以 cos(40°)=0.766 成功运行——baseline 无人机保持 ~42° 倾斜范围，barely 超过阈值。
+
+**根因 3：历史验证结论被忽视**
+
+Run 28（2026-04-10）已明确确认：
+- `upright_penalty_weight=2.0` 在 NovaCarter 追踪场景中**直接导致 pursuit-dive 冲突**（"safe range for NovaCarter pursuit: 0.5–1.0"）
+- `body_rate_penalty_weight=2.0` 同样产生崩溃
+
+Run 32 在这两个权重保持 2.0 的基础上还加了 `velocity_penalty_weight=1.5`，等于将已知的冲突因素强化了。
+
+**根因 4：fly_low_penalty=1.0 无法阻止坠机**
+
+Run 19 验证的关键修复是 `fly_low_penalty=8.0` + `fly_low_threshold=0.5m` 组合（−68% crash+fly_low）。Run 30 的"baseline 恢复"将 fly_low_penalty 回退到 1.0。当前 1.0 不产生有效梯度（reward 为 −1.0/step vs 所有其他正奖励，不足以改变策略）。
+
+---
+
+### 改进建议（Run 33）
+
+#### Priority 1 (CRITICAL): 降低 gradient 过载
+
+- 文件：`marl_move_env_cfg.py`
+- `upright_penalty_weight`: 2.0 → **0.5**（Run21 三次验证有效值）
+- `body_rate_penalty_weight`: 2.0 → **0.5**（Run28 确认 2.0 是追踪冲突直接原因）
+- `velocity_penalty_weight`: 1.5 → **0.3**（Run31 引入，未在 crash 受控条件下测试）
+
+#### Priority 2 (CRITICAL): 恢复 fly_low_penalty
+
+- 文件：`marl_move_env_cfg.py`
+- `fly_low_penalty`: 1.0 → **8.0**（Run19 验证：与 z_threshold=0.5m 组合，−68% crash+fly_low）
+
+#### Priority 3 (HIGH): 恢复 height_penalty_threshold
+
+- 文件：`marl_move_env_cfg.py`
+- `height_penalty_threshold`: 0.8m → **1.5m**（Run 8+10 验证，0.8m 使每次坠机 height_penalty 扩大 2.4×）
+- `height_penalty_weight`: 2.0 → **1.0**（Run 10-13 验证值）
+
+#### Priority 4 (HIGH): 恢复 upright_penalty_threshold
+
+- 文件：`marl_move_env_cfg.py`
+- `upright_penalty_threshold`: 0.906 (cos25°) → **0.766 (cos40°)**（Baseline 原始值；提高阈值没有改善物理倾斜，只加重 gradient 过载）
+
+---
+
+### 实验计划（Run 33）
+
+| 参数 | Run 32 | Run 33 |
+|------|--------|--------|
+| `upright_penalty_weight` | 2.0 | **0.5** |
+| `upright_penalty_threshold` | 0.906 (cos25°) | **0.766 (cos40°)** |
+| `body_rate_penalty_weight` | 2.0 | **0.5** |
+| `velocity_penalty_weight` | 1.5 | **0.3** |
+| `fly_low_penalty` | 1.0 | **8.0** |
+| `height_penalty_threshold` | 0.8m | **1.5m** |
+| `height_penalty_weight` | 2.0 | **1.0** |
+
+保持不变：`height_reward_weight=2.0, dist_reward_weight=1.5, tracking_reward_weight=1.0, action_smoothness_weight=1.0, fly_low z_threshold=0.5m（代码已正确）, bounding_box_threshold=24.0m`
+
+**训练指令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**100k 步中止标准：**
+- crash+fly_low Q2 > 0.90 AND ep_len Q2 < 100 → upright/body_rate 仍过重，再各降至 0.3
+- ep_len Q2 > 200 步 → 修复有效，继续全程
+
+**400k 步成功标准：**
+- crash+fly_low Q5 < 0.50（Run32 约 0.87）
+- ep_len Q5 > 300 步（Run32 约 110）
+- upright_penalty per-step < −0.010（Run32 约 −0.037）
+- tracking_reward Q5 > 0.05（Run32 ≈ 0.001，接近零）
+

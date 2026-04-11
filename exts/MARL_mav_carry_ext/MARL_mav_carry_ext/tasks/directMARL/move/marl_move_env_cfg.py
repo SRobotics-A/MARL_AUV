@@ -113,35 +113,35 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     action_smoothness_weight = 1.0  # baseline值
 
     # Body Rate Penalty: w * exp(-||body_rates||) * step_dt — 新增
-    body_rate_penalty_weight = 2.0  # Run30: 恢复baseline值
+    body_rate_penalty_weight = 0.5  # Run33: 2.0→0.5（Run21验证值，2.0与追踪冲突）
 
     # Time Penalty: fixed penalty per step to encourage speed
     time_penalty = 0.0
 
     # Velocity Penalty: w * exp(-||vel||) * step_dt — 新增：抑制高速
-    velocity_penalty_weight = 1.5  # Run31: 0.3→1.5，与body_rate同量级，强制低速稳定飞行
+    velocity_penalty_weight = 0.3  # Run33: 1.5→0.3（Run31证明1.5压制tracking至0）
 
     # Force Penalty: w * exp(-max_thrust) * step_dt — 新增
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 2.0
-    upright_penalty_threshold = 0.906  # Run32: cos(25°)，25°以上倾斜即触发惩罚（原40°太宽松）
+    upright_penalty_weight = 0.5  # Run33: 2.0→0.5（Run21三次验证，gradient过载根因）
+    upright_penalty_threshold = 0.766  # Run33: cos(40°)，恢复baseline宽松值
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
     height_reward_weight = 2.0
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
-    height_penalty_weight = 2.0  # Run32: 1.0→2.0，加强高度约束
-    height_penalty_threshold = 0.8  # Run32: 1.5→0.8，z>3.3m或z<1.7m即触发（原4.0m太高）
+    height_penalty_weight = 1.0  # Run33: 2.0→1.0（历史验证值）
+    height_penalty_threshold = 1.5  # Run33: 0.8→1.5（0.8m使坠机时height_penalty扩大2.4×）
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0
     illegal_contact_penalty = 0.05
-    fly_low_penalty = 1.0  # Run30: 恢复baseline值（10.0→1.0）
+    fly_low_penalty = 8.0  # Run33: 1.0→8.0（Run19验证：8.0减少crash/fly_low −68%）
 
     # action和observation配置
     if control_mode == "geometric":
