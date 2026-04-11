@@ -10674,3 +10674,233 @@ python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=20
 - upright_penalty per-step < −0.010（Run32 约 −0.037）
 - tracking_reward Q5 > 0.05（Run32 ≈ 0.001，接近零）
 
+---
+
+## Run 33 训练分析报告
+
+**Run:** 2026-04-11_22-33-39_mappo_torch_mappo
+**Date:** 2026-04-12
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**总步数:** 322,200 步
+**Baseline 参考:** 2026-03-20（crash=0.000, per-step≈0.544, ep_len≈1658）
+
+---
+
+### 训练指标摘要
+
+| 指标 | 早期均值 | 近期均值 | 最终值 | Baseline |
+|------|----------|----------|--------|----------|
+| Total reward (mean) | −40.52 | −33.10 | −31.13 | +892.56 |
+| Episode timesteps (mean) | 146.8 | 134.4 | 155.0 | 1641.5 |
+| upright_penalty | −0.746 | −1.190 | −1.226 | −2.031 |
+| crash rate | 0.128 | 0.762 | 0.000 | 0.000 |
+| falcon_fly_low rate | 0.126 | 0.757 | 0.000 | 0.000 |
+| bounding_box rate | 0.851 | 0.227 | 1.000 | — |
+| height_penalty | −12.18 | −4.88 | −6.33 | −0.037 |
+| fly_low reward | −1.007 | −6.054 | 0.000 | ≈0.000 |
+| tracking_reward | 0.005 | 0.033 | 0.000 | 37.38 |
+| policy_std | 0.837 | 1.008 | 1.060 | — |
+
+---
+
+### 问题分析
+
+#### 问题一：upright 连续梯度修复 — 部分有效，但根因未解 — 严重性：HIGH
+
+**症状：**
+- upright_penalty 从早期 −0.746 → 近期 −1.190（恶化 −59%）
+- Baseline 的 upright_penalty 稳定在 −2.0 附近，episode_len=1641 步，crash≈0
+- Run 33 的 upright_penalty 绝对值（−1.19）小于 baseline（−2.03），但 episode 极短（134 步 vs 1641 步）
+
+**连续梯度是否有效：**
+连续梯度公式 `w * (z_body - 1.0).sum(-1) * dt` 在形式上与 baseline 一致，梯度覆盖所有倾角，不再存在 cos(40°) 以下的"零梯度死区"。从这个角度看，阈值问题已修复。
+
+**但根因是物理冲突，不是梯度形式：**
+关键对比是 per-step upright_penalty 的量级。Run 33 共 322k 步，episode_len=134 步，因此 per-episode upright 约为 −1.19。Baseline episode_len=1641 步，per-episode upright=−2.03。折算到单步：Run33=−0.0089/step，Baseline=−0.0012/step。Run 33 的单步倾角惩罚是 baseline 的 7.4 倍，说明 Run 33 的无人机飞行时倾角持续偏大——这不是梯度问题，是物理强制的（高速追踪 + lin_vel_max=1.5m/s + 目标相对速度要求倾斜）。
+
+**upright_penalty 与 crash 相关性：−0.19（弱负相关）**
+upright_penalty 越小（倾角越大），crash 概率轻微增加，但相关性很弱，说明 crash/fly_low 的主驱动力不是姿态倾斜，而是高度失控（见问题二）。
+
+---
+
+#### 问题二：crash/fly_low 是 Run 33 的主要杀手 — 严重性：CRITICAL
+
+**症状（最严重）：**
+- crash rate：早期 0.128 → 近期 0.762（上升 5.9×）
+- falcon_fly_low rate：早期 0.126 → 近期 0.757（几乎与 crash 完全相同）
+- 3181/3222 个数据点中 crash 与 fly_low 完全相同（98.7%），说明 crash 的定义就是 fly_low（z<0.5m）
+- fly_low 惩罚：早期 −1.007 → 近期 −6.054（6× 增大）
+
+**crash/fly_low 随时间恶化是 Run 33 最核心的失败模式。**
+
+**根因：fly_low_penalty=8.0 与 height_penalty 形成双重下拉冲突**
+
+1. fly_low_penalty=8.0 作用于 z<0.5m 阈值，正确。
+2. height_penalty：早期均值 −12.18，近期均值 −4.88。height_penalty_threshold=1.5m（正确），但 height_penalty_weight=1.0。
+   - 当 desired_height=2.5m，触发 height_penalty 的区间是 z<1.0m 或 z>4.0m。
+   - 坠机（z<0.5m）会同时触发 fly_low（−8.0 固定）+ height_penalty（线性，约 −1.0×2.0=−2.0/step）。
+   - 两者叠加构成极强的负梯度，策略学会了"避免进入坠机区域"但代价是整体 episode 很短。
+
+3. **真正的根因：height_penalty 初期极大（−12.18）说明策略初始化后无人机根本不在 desired_height±1.5m 范围内。** 这意味着初始状态下无人机 z 坐标超出 [1.0m, 4.0m] 范围，奖励信号几乎全为负，策略找不到正向梯度。
+
+4. **与 bounding_box 的交替模式：** crash（0.64）与 bounding_box（0.34）几乎互补，说明两类策略轮流主导：一些 envs 坠机，一些 envs 飞出边界。bounding_box 从早期 0.85 降至近期 0.23，说明策略逐渐从"飞出边界"模式切换到"坠机"模式，即学会了不飞出边界但付出代价是高度失控。
+
+---
+
+#### 问题三：gradient norm 饱和——策略更新效率低 — 严重性：HIGH
+
+**症状：**
+- Actor gradient norm 全程稳定在 0.908～0.979，接近饱和（clip=1.0）
+- Critic gradient norm 仅 0.093～0.153，非常低
+
+**含义：**
+Actor gradient 几乎每步都在 clip 上限，说明梯度过大被持续截断，实际更新方向被压缩。这是多个强惩罚项（height_penalty −12/ep、fly_low −6/ep）同时产生大梯度的典型症状，不是神经网络架构问题。
+
+Critic 梯度极低说明价值函数拟合较容易（reward 高度负相关，主要是惩罚项），但也意味着价值估计的精度限制了 actor 优势函数的质量。
+
+---
+
+#### 问题四：height_penalty 主导负奖励 — 严重性：HIGH
+
+**量化：**
+- height_penalty 早期 −12.18/ep，近期 −4.88/ep
+- fly_low −1.007 → −6.054/ep
+- 两者合计近期：约 −11.0/ep
+- 正向奖励合计：distance_reward(0.75) + height_reward(0.95) + body_rate(0.07) + velocity(0.02) + force(0.27) + tracking(0.03) ≈ +2.09/ep
+- **惩罚/正向比约 5:1，策略在惩罚主导的奖励景观下训练**
+
+height_penalty 在本 run 中代表了一个逻辑矛盾：drone 追踪地面目标需要俯冲，但 height_penalty 要求维持 z∈[1.0, 4.0]m。lin_vel_max=1.5m/s 限制了水平速度，导致相对速度跟踪需要非常精确的高度控制，而这种精度在训练早期是不具备的。
+
+---
+
+#### 问题五：个体奖励 vs 群体奖励分离的分析 — 严重性：LOW（不是当前瓶颈）
+
+**当前机制：**
+```python
+total_reward = sum(rewards.values())  # 所有惩罚和奖励求和
+return {agent: total_reward for agent in self.cfg.possible_agents}  # 所有 agent 共享
+```
+
+**Baseline 也是共享奖励：**
+```python
+shared_rewards = reward_position + reward_orientation + ...
+return {agent: shared_rewards for agent in self.cfg.possible_agents}
+```
+Baseline 同样是共享奖励，且性能优秀（ep_len=1641, crash=0）。因此共享奖励本身不是当前失败原因。
+
+**"好 agent 掩盖坏 agent"的分析：**
+理论上，当某个 agent 姿态差（upright_penalty=-0.8/step），但另外两个 agent 表现好（+0.3/step each），total_reward 被抬高，信号稀释。这在 hover 任务中不是问题（因为三个 drone 的奖励方差小），但在 move 任务中，追踪目标的 drone 和未追踪目标的 drone 奖励差距可能较大。
+
+**当前条件下个体奖励是否值得引入：**
+当前 crash rate=0.76，说明几乎所有 envs 都在坠机，不存在"某个 agent 表现好掩盖坏 agent"的情况——三个 agent 集体表现差。在 crash 问题解决之前引入个体奖励会增加实现复杂度而不带来收益。
+
+**建议：** 先解决 crash/height_penalty 问题，等 crash<0.1、ep_len>300 步后，再评估是否需要个体奖励分离。届时可以考虑：`per_agent_reward = global_reward + alpha * individual_upright_penalty`（alpha=0.2-0.5）。
+
+---
+
+#### 问题六：obs_dim 扩展（49→57）的影响 — 严重性：LOW
+
+**变化：** +4 维（assigned_target_onehot）+ +4 维（目标 x 速度）
+**分析：**
+- policy_std 从 0.837 → 1.008（上升 20%），说明策略在更大 obs 空间中探索更充分，无坍缩。
+- 新增的 assigned_target_onehot（one-hot）是稳定的，不随时间变化，policy 可以快速利用。
+- 目标 x 速度是有用的前馈信息，有助于预测目标运动，减少追踪滞后。
+- obs_dim 扩展本身对训练稳定性影响为 LOW，无需改动。
+
+---
+
+### 改进建议
+
+#### Priority 1 (CRITICAL): 解决高度失控根因——调整 height_penalty 的作用域
+
+**问题：** height_penalty_threshold=1.5m 设定下，drone spawn z∈(1.5,2.5)m，当 z=1.5m 时已经触发 height_penalty（|z-2.5|=1.0 < 1.5m 不触发，OK）。但训练中 height_penalty 早期均值高达 −12.18，说明大量 drone 超出 [1.0, 4.0]m 范围。
+
+**检查：** drone_spawn_z_range 当前设定是否与 desired_height±threshold 匹配？如果 drone_spawn_z_range=(1.5, 2.5)，理论上不应触发 height_penalty。这表明存在物理模拟后的高度漂移或控制器高度不稳定。
+
+**建议修改：**
+- 文件：`marl_move_env_cfg.py`
+- `height_penalty_threshold`: 1.5m → **2.0m**（z∈[0.5, 4.5]m 无惩罚，与 fly_low z<0.5m 无缝衔接）
+- `height_penalty_weight`: 1.0 → **0.5**（降低斜率，减少 gradient 干扰）
+- 理由：height_penalty 近期仍 −4.88/ep，说明 1.5m 阈值仍然过窄。Baseline 的 height_penalty 近期仅 −0.037/ep（极小），说明 baseline 的阈值对自然飞行高度变化足够宽松。
+
+#### Priority 2 (CRITICAL): 降低 crash/fly_low 根本原因——重新审视 fly_low 终止逻辑
+
+**问题：** fly_low z<0.5m 阈值正确，fly_low_penalty=8.0 已验证有效（Run19 −68%），但 Run 33 的 crash rate 从 0.13 恶化到 0.76，说明 fly_low_penalty=8.0 在当前配置下不足以阻止坠机。
+
+**假设：** crash 恶化的机制是策略学会在 height_penalty 压力下降低高度，逐渐接近 0.5m 边界，最终触发 fly_low 终止。策略无法区分"为了追踪目标而下降"和"坠机下降"。
+
+**建议修改：**
+- 文件：`marl_move_env_cfg.py`
+- `fly_low_penalty`: 8.0 → **12.0**（强化即时惩罚，阻止接近 0.5m）
+- 同时将 fly_low 惩罚区域从 z<0.5m 扩展到 z<0.8m（渐变惩罚：越低越重）
+
+**代码修改（`marl_move_env.py` 约第 878 行）：**
+```python
+# 渐变 fly_low 惩罚：z<0.8m 开始惩罚，z<0.5m 触发终止
+fly_low_soft = (0.8 - self.drone_positions[:, :, 2]).clamp(min=0.0)  # (N, D)
+rewards["fly_low"] = -fly_low_soft.sum(dim=-1) * self.cfg.fly_low_penalty
+```
+- 新参数：`fly_low_penalty=12.0`（每米梯度），z=0.8m 惩罚=0，z=0.5m 惩罚=−3.6/step，z=0.3m 惩罚=−6.0/step
+
+#### Priority 3 (HIGH): 降低总惩罚规模，让正向奖励能够主导
+
+**问题：** 正向/负向奖励比约 1:5，策略梯度全被负惩罚控制。
+
+**建议修改：**
+- 文件：`marl_move_env_cfg.py`
+- `dist_reward_weight`: 1.5 → **2.5**（加大正向距离奖励权重，对抗 height_penalty）
+- `tracking_reward_weight`: 1.0 → **1.5**（鼓励真正的追踪成功）
+- `height_reward_weight`: 2.0 保持（不动，已是正向稳定项）
+
+#### Priority 4 (MEDIUM): upright_penalty 调整
+
+**当前：** `w * (z_body - 1.0).sum(-1) * dt`，weight=0.5，连续梯度已恢复。
+**分析：** 单步 upright 惩罚 7.4× Baseline，但与 crash 相关性弱（−0.19）。连续梯度本身正确，weight=0.5 也合理。
+
+**建议：** 不调整 upright_penalty_weight，但把 `.sum(-1)` 改为 `.mean(-1)`（3个 drone 求均值而非求和），避免多 drone 叠加放大惩罚。
+
+**代码修改（`marl_move_env.py` 第 840 行）：**
+```python
+rewards["upright_penalty"] = (
+    self.cfg.upright_penalty_weight * (z_axis_body - 1.0).mean(-1) * step_dt  # sum→mean
+)
+```
+
+#### Priority 5 (LOW): 个体奖励分离（暂缓）
+
+暂不引入，待 crash<0.1 后再评估。当前三个 agent 集体失败，个体信号分离无实际收益。
+
+---
+
+### 实验计划（Run 34）
+
+| 参数 | Run 33 | Run 34 |
+|------|--------|--------|
+| `height_penalty_threshold` | 1.5m | **2.0m** |
+| `height_penalty_weight` | 1.0 | **0.5** |
+| `fly_low_penalty` | 8.0 | **12.0** |
+| fly_low 惩罚区域 | z<0.5m（阈值） | **z<0.8m（渐变）** |
+| `dist_reward_weight` | 1.5 | **2.5** |
+| `tracking_reward_weight` | 1.0 | **1.5** |
+| upright `.sum` → `.mean` | sum（当前） | **mean** |
+| 个体奖励分离 | 否 | 否（暂缓） |
+
+保持不变：`upright_penalty_weight=0.5`，`body_rate_penalty_weight=0.5`，`velocity_penalty_weight=0.3`，`lin_vel_max=1.5m/s`，`obs_dim=57`（不变），`entropy_loss_scale=0.005`
+
+**训练指令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**100k 步中止标准：**
+- crash+fly_low Q2 > 0.70 AND ep_len Q2 < 130 → height_penalty_threshold 仍需扩大至 2.5m，fly_low_penalty 继续加强
+- ep_len Q2 > 200 步，crash Q2 < 0.30 → 修复方向正确，继续全程
+
+**400k 步成功标准：**
+- crash+fly_low Q5 < 0.20（Run33 约 0.76）
+- ep_len Q5 > 400 步（Run33 约 134）
+- height_penalty Q5 < −2.0/ep（Run33 约 −4.88）
+- tracking_reward Q5 > 0.10/ep（Run33 约 0.033）
+- total_reward Q5 > −10（Run33 约 −33）
+

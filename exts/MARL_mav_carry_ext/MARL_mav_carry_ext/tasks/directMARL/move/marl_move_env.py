@@ -837,8 +837,9 @@ class MARLMoveEnv(DirectMARLEnv):
         # Previous threshold-based approach had zero gradient below 40°, allowing
         # persistent 30-35° tilt with no correction signal.
         z_axis_body = self.drone_rot_matrices[:, :, 2, 2]  # (N, D), 1.0=upright, 0.0=90°tilt
+        # Run34 fix: use mean(-1) not sum(-1) to avoid 3x amplification with 3 drones
         rewards["upright_penalty"] = (
-            self.cfg.upright_penalty_weight * (z_axis_body - 1.0).sum(-1) * step_dt
+            self.cfg.upright_penalty_weight * (z_axis_body - 1.0).mean(-1) * step_dt
         )
 
         # ====== Safety Penalties (kept unchanged) ======
