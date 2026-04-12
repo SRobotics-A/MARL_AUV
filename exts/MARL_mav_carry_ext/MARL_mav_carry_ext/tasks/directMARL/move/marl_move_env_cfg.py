@@ -133,8 +133,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     height_reward_weight = 2.0
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
-    height_penalty_weight = 0.3  # Run35: 0.5→0.3
-    height_penalty_threshold = 2.0  # 保持
+    height_penalty_weight = 0.5  # Run36: 0.3→0.5，上方约束需要更强梯度
+    height_penalty_threshold = 1.0  # Run36: 2.0→1.0，z>3.5m即触发（对称fly_low软惩罚）
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0

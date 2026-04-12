@@ -893,8 +893,18 @@ class MARLMoveEnv(DirectMARLEnv):
         # --- 11. Time Penalty (Removed) ---
         # rewards["time_penalty"] = ...
 
-        # --- Total Reward ---
+        # --- Total Reward (shared) + per-agent upright bonus ---
+        # Run36: Add small individual upright penalty per agent so the unstable drone
+        # gets its own corrective gradient instead of being averaged with stable drones.
         total_reward = sum(rewards.values())
+
+        agent_rewards = {}
+        for drone_idx, agent_name in enumerate(self.cfg.possible_agents):
+            z_body_i = self.drone_rot_matrices[:, drone_idx, 2, 2]  # (N,)
+            individual_upright = (
+                self.cfg.upright_penalty_weight * (z_body_i - 1.0) * step_dt
+            )
+            agent_rewards[agent_name] = total_reward + individual_upright
 
         # Logging
         for key, val in rewards.items():
@@ -902,7 +912,7 @@ class MARLMoveEnv(DirectMARLEnv):
                 self._episode_sums[key] = torch.zeros_like(val)
             self._episode_sums[key] += val
 
-        return {agent: total_reward for agent in self.cfg.possible_agents}
+        return agent_rewards
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """终止条件"""
