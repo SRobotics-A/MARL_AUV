@@ -876,10 +876,13 @@ class MARLMoveEnv(DirectMARLEnv):
         soft_penalty = soft_excess.sum(dim=(1, 2))  # (N,)
         rewards["boundary_soft"] = -self.cfg.boundary_soft_penalty_weight * soft_penalty * step_dt
 
-        # --- 9. Fly Low Penalty ---
-        # Run19 fix: raise threshold 0.1→0.5m to close the 0.9m unprotected dive zone
-        fly_low = (self.drone_positions[:, :, 2] < 0.5).any(dim=-1)
-        rewards["fly_low"] = -fly_low.float() * self.cfg.fly_low_penalty
+        # --- 9. Fly Low Penalty (Run35: soft gradient penalty) ---
+        # Previous: step penalty only at z<0.5m → dead zone z=0.5~1.5m with zero gradient,
+        # drone could freely descend into termination region with no corrective signal.
+        # Fix: linear penalty starting at z<1.5m, providing continuous upward gradient.
+        # z=1.5m: penalty=0, z=1.0m: -0.5*weight, z=0.5m: -1.0*weight (termination boundary)
+        fly_low_deficit = (1.5 - self.drone_positions[:, :, 2]).clamp(min=0.0)  # (N, D)
+        rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty
 
         # --- 10. Illegal Contact Penalty (Run23: disabled) ---
         # NovaCarter CollisionAPI was never fully disabled; contact readings are noise.

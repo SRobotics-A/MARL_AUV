@@ -10904,3 +10904,209 @@ python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=20
 - tracking_reward Q5 > 0.10/ep（Run33 约 0.033）
 - total_reward Q5 > −10（Run33 约 −33）
 
+---
+
+## Run 34 训练分析报告
+
+**Run:** 2026-04-12_06-28-43_mappo_torch_mappo
+**日期：** 2026-04-12
+**Task:** Isaac-marl-move-v0
+**Algorithm:** MAPPO
+**Steps:** 324,100（约 81% 预算）
+
+### 主要变更（相对 Run 33）
+
+| 参数 | Run 33 | Run 34 |
+|------|--------|--------|
+| `upright_penalty` | `.sum(-1)` | `.mean(-1)` (bug fix) |
+| `dist_reward_weight` | 1.5 | **2.5** |
+| `tracking_reward_weight` | 1.0 | **1.5** |
+| `height_penalty_weight` | 1.0 | **0.5** |
+| `height_penalty_threshold` | 1.5m | **2.0m** (z>4.5m 或 z<0.5m 触发) |
+| `upright_weight` | 0.5 | **0.5** (不变) |
+| `body_rate_penalty_weight` | 0.5 | **0.5** (不变) |
+| `fly_low_penalty` | 8.0 | **8.0** (不变，实际代码未用渐变) |
+
+### 训练指标汇总
+
+| 指标 | Q1 均值 | Q5 均值 | 最后值 |
+|------|---------|---------|--------|
+| total_reward_mean | −30.78 | −17.04 | −24.80 |
+| ep_len (steps) | 172.5 | 153.4 | 195.0 |
+| crash 终止率 | 0.316 | 0.701 | 0.730 |
+| fly_low 终止率 | 0.313 | 0.699 | 0.730 |
+| bounding_box 终止率 | 0.679 | 0.291 | 0.270 |
+| distance_reward | 1.559 | 3.082 | 6.542 |
+| tracking_reward | 0.077 | 0.159 | 0.567 |
+| height_penalty | −7.548 | −3.512 | −8.183 |
+| fly_low 奖励 | −2.501 | −5.593 | −5.840 |
+| upright_penalty | −0.308 | −0.494 | −0.571 |
+| all_targets_captured | 0 | 0 | 0 |
+| success_reward | 0 | 0 | 0 |
+| policy_std | 0.830 | 0.797 | 0.795 |
+
+### 观测与发现
+
+#### 1. crash/fly_low 率的变化趋势 — 严重度: CRITICAL
+
+**症状：** crash+fly_low Q1=0.316 → Q5=0.701（worsening），与 Run 33 recent=0.762 相比改善极小。Run 33 计划的 fly_low 渐变惩罚（z<0.8m gradual）实际上**未在代码中实现**——env.py 第 881 行仍是 `z < 0.5` 阈值判断（非渐变）。fly_low_penalty 也保持 8.0 未变。
+
+**关键发现：** 99.4% 的 crash 事件与 fly_low 完全重合（mean_diff=0.006），确认"crash = z<0.5m 触发"。这是 fly_low 终止设计，不是真正的碰撞。
+
+**趋势分析（五分位）：**
+- Q1: crash=0.316, bbox=0.679 → 早期以 bounding_box 为主要终止
+- Q2: crash=0.746, bbox=0.265 → 快速转向 crash 主导（bbox 被修复，crash 爆发）
+- Q3-Q5: crash 稳定在 0.70-0.74（高位平台），未见下降
+
+**与 Run 33 对比：** Run 33 crash Q5 recent=0.762，Run 34 Q5=0.701（改善 −8%）。改善幅度很小，说明本次修改对 crash 根因的影响有限。
+
+**根因：** fly_low 终止阈值 z=0.5m 与 height_penalty 阈值 2.0m（z∈[0.5, 4.5m] 无惩罚）之间缺乏梯度引导——策略在无惩罚区间内自由下降，直到触发 z<0.5m 硬终止。高早期 height_penalty（Q1=−7.548/ep，/step=−0.0516）说明训练初期大量触发高空惩罚，策略选择降低高度来规避，反而坠入低空。
+
+#### 2. upright_penalty per-step 量级（sum→mean 修复效果）— 严重度: HIGH
+
+**修复效果已验证：**
+- Run 33: upright per-step = −0.0089/step
+- Run 34: upright per-step Q5 = **−0.00361/step**（改善 **2.46×**）
+
+`.sum(-1)` → `.mean(-1)` 修复有效消除了 3 drone 叠加放大效应。upright_penalty 从 Run 33 中对总奖励的 ~27% 贡献下降至合理范围。
+
+**但仍高于 Baseline：** Baseline 约 −0.00175/step，Run 34 Q5=−0.00361（仍 2.1× Baseline）。差距反映 NovaCarter 高速追踪本身需要更大倾角，属于任务物理特性，不是配置问题。
+
+**结论：** sum→mean 修复已生效，upright 不再是主要瓶颈。weight=0.5 可维持。
+
+#### 3. 翻滚触发时机 — 严重度: MEDIUM
+
+**从数据判断触发时机：** 
+- 第一次 crash 出现在 record index 73（约步数 7,300），此时 crash=0.740——几乎一步从 0 跳到 0.74，说明是**追踪阶段初期**即大规模触发，而非随机扰动逐渐积累。
+- Q1 阶段（前 20% 训练）：bbox 主导终止（0.679）而非 crash（0.316）——这说明早期 bbox 主导（策略越界），随后 bbox 被修复（策略学会留在边界内），但代价是策略降低飞行高度，导致 crash 爆发（Q2 crash=0.746）。
+- upright_penalty Q5=−0.494/ep vs Q1=−0.308/ep（增加 61%），与 crash 上升趋势一致——随着追踪行为变强，倾角增大，fly_low 风险增大。
+
+**结论：** 翻滚/坠机发生在**追踪学习阶段中期**（bbox 解决后），由追踪引起的高速 XY 加速导致无人机自然下降至 fly_low 阈值，而非起飞阶段或随机扰动。
+
+#### 4. height_penalty 是否不再主导 — 严重度: HIGH
+
+**per-step 分析：**
+- Run 33 height_penalty per-step（估算）= −4.88/134 = −0.0364/step
+- Run 34 height_penalty per-step Q1 = **−0.0516/step**（比 Run33 更高！）
+- Run 34 height_penalty per-step Q5 = **−0.0133/step**（改善显著，−63%）
+
+**结论：** height_penalty 在 Q5 已大幅改善（Q5 = −3.512/ep vs Run 33 −4.88/ep），threshold=2.0m 扩展有效。但 Q1 per-step 更高，说明训练初期 height_penalty 仍在早期大量触发——策略刚启动时在高度大幅波动。Q5 改善说明策略逐渐学会维持高度带。
+
+**height_penalty 仍是第二大负向项**（Q5 −3.512/ep），仅次于 fly_low（Q5 −5.593/ep）。threshold=2.0m 有效但还需辅以梯度引导（软惩罚）来填补 fly_low 上方的无惩罚死区。
+
+#### 5. 正/负奖励比 — 严重度: CRITICAL
+
+| 分位 | 正向 (dist+track) | 负向 (height+fly_low+upright) | 比率 |
+|------|-------------------|-------------------------------|------|
+| Q1 | +1.636 | −10.358 | **0.16x** |
+| Q2 | +1.177 | −9.076 | **0.13x** |
+| Q3 | +1.852 | −9.103 | **0.20x** |
+| Q4 | +2.694 | −10.083 | **0.27x** |
+| Q5 | +3.241 | −9.599 | **0.34x** |
+
+**目标 1:1，实际最好 0.34:1（仍差 3×）。**
+
+Run 33 的估算比率约 0.19:1（2.09/11.0），Run 34 Q5 改善至 0.34:1（+79%）。但仍严重失衡。
+
+**主要原因：** fly_low 负向贡献 Q5=−5.593/ep，占全部负向的 58%，是最大单一惩罚项。只要 crash rate=0.70，正向奖励永远无法追上。
+
+#### 6. 与 Baseline 差距评估
+
+**Baseline（2026-03-20）：** crash=0.000，per-step≈0.544，ep_len≈1658
+
+- ep_len: 153 vs 1658（**差距 10.8×**）
+- per-step instant_reward: Run 34 Q5 instant_reward recent=−0.113/step vs Baseline +0.544/step（方向相反）
+- crash: 0.70 vs 0.000
+- total_reward: −17.04（Q5 mean）vs Baseline 约 +500-900 range（cumulative）
+
+**差距来源 100% 是 crash/fly_low 问题导致的 ep_len 截断**。per-step 奖励质量差异是结果，不是原因。Root fix 是解决 fly_low 触发机制。
+
+### 改进建议
+
+#### Priority 1 (CRITICAL): 填补 fly_low 死区——引入软梯度惩罚
+
+**问题：** z∈[0.5m, 2.5m−threshold=2.0m=0.5m] 理论上全程无惩罚（height_penalty threshold=2.0m，即 z∈[0.5, 4.5m] 全部无惩罚），而 fly_low 在 z<0.5m 才触发。策略在 z=0.5~1.0m 区间完全无梯度信号，自然滑入 fly_low 区。
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在第 879-882 行附近，将阈值惩罚改为渐变惩罚：
+
+```python
+# 渐变 fly_low 惩罚（代替原阶跃）：z<1.5m 开始渐增，引导无人机远离地面
+fly_low_soft_zone = 1.5  # 开始施加渐变惩罚的高度（m）
+fly_low_deficit = (fly_low_soft_zone - self.drone_positions[:, :, 2]).clamp(min=0.0)  # (N, D)
+rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty
+```
+- `fly_low_penalty = 8.0`（保持，配合渐变公式后梯度变连续）
+- 理论效果：z=1.5m → 0 惩罚，z=1.0m → −4.0/step，z=0.5m → −8.0/step（提供持续向上梯度）
+- 终止条件保持 z<0.5m 不变（`marl_move_env.py` 第 907 行）
+
+**预期改善：** crash/fly_low Q5 从 0.701 降至 <0.35。
+
+#### Priority 2 (CRITICAL): 降低初期 height_penalty 触发——分段阈值或早期热身
+
+**问题：** Q1 height_penalty per-step=−0.0516（比 Q5 的 −0.0133 高 3.9×），说明训练初期策略高度波动大，height_penalty 集中触发，干扰早期学习信号。
+
+**建议修改（二选一）：**
+
+方案 A（推荐）— 保持 threshold=2.0m，降低 weight：
+- 文件：`marl_move_env_cfg.py`
+- `height_penalty_weight`: 0.5 → **0.3**（进一步降低斜率，让训练初期高度偏移代价更低）
+- 理由：threshold 已足够宽（z∈[0.5, 4.5m]），weight=0.5 在初期高度大幅波动时仍产生较大绝对值
+
+方案 B — 保持 weight=0.5，添加早期热身（curriculum）：
+- 最初 50k 步将 `height_penalty_weight` 线性从 0.1 升至 0.5
+- 实现复杂度较高，不推荐当前阶段
+
+#### Priority 3 (HIGH): 增大正向奖励压倒负向
+
+**问题：** Q5 正/负比 0.34:1，目标 ≥1:1。主要正向项 dist_reward 已在 Run 34 增至 2.5，但仍不足。
+
+**建议修改：**
+- 文件：`marl_move_env_cfg.py`
+- `dist_reward_weight`: 2.5 → **3.5**（进一步提升正向梯度；Run 34 Q5 dist=3.08/ep 已是提升方向，继续加强）
+- `tracking_reward_weight`: 1.5 → **2.0**（Run 34 tracking Q5=0.159/ep 极低，表明接近目标后仍难以维持；提升权重鼓励策略进入追踪区域）
+- 理由：计算 Q5 比率目标：设负向总量≈−9.6/ep（维持），正向需≥9.6/ep。当前 3.24/ep，需要约 3× 增幅。dist_reward 3.5→∼4.3/ep，tracking 2.0→∼0.2/ep，合计≈4.5/ep（比率≈0.47，接近 0.5:1 可接受阈值）。
+
+#### Priority 4 (MEDIUM): success_reward 代码仍为 0——确认是否启用
+
+**问题：** `success_reward` 全程 = 0（nonzero_count=0）。检查 `marl_move_env_cfg.py` 第 106 行：`success_reward_weight = 0.0`（已注释为 Run30 恢复 baseline 值 0.0）。
+
+**建议：** 暂维持 0.0（当前 all_targets_captured=0，无法产生 success_reward；先解决 crash 后再激活）。确认目前 env.py 中 success_reward 代码是否已取消注释——如果 Run 13 的 bug 仍然存在，需要先修复代码。
+
+#### Priority 5 (LOW): upright_penalty weight 维持
+
+Run 34 `.mean(-1)` 修复已生效（per-step Q5=−0.00361，改善 2.46×）。weight=0.5 合理，upright 不再是主要瓶颈。**不需要调整。**
+
+### 实验计划（Run 35）
+
+| 参数 | Run 34 | Run 35 | 理由 |
+|------|--------|--------|------|
+| `fly_low_penalty` 机制 | 阶跃 z<0.5m | **渐变 z<1.5m 开始** | 消除死区，提供连续梯度 |
+| `fly_low_penalty` weight | 8.0 | **8.0**（保持） | 渐变后 8.0/m 梯度已足够 |
+| `height_penalty_weight` | 0.5 | **0.3** | 降低初期 Q1 触发量级 |
+| `dist_reward_weight` | 2.5 | **3.5** | 正向提升，目标比率 0.5:1 |
+| `tracking_reward_weight` | 1.5 | **2.0** | 进入追踪区后留存激励 |
+| 其他所有参数 | — | **保持不变** | 单变量原则：仅改以上 3 项 |
+
+保持不变：`upright_penalty_weight=0.5`（.mean(-1) 已修复），`height_penalty_threshold=2.0m`，`body_rate_penalty_weight=0.5`，`fly_low_termination z=0.5m`，`entropy_loss_scale=0.005`，`obs_dim=57`
+
+**训练指令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**100k 步中止标准：**
+- crash+fly_low Q2 > 0.70 → fly_low 渐变方案无效，需再扩大软惩罚区至 2.0m
+- ep_len Q2 > 180 步 AND crash Q2 < 0.40 → 方向正确，继续
+
+**400k 步成功标准：**
+- crash+fly_low Q5 < 0.35（Run34 Q5=0.701，目标减半）
+- ep_len Q5 > 300 步（Run34 Q5=153）
+- height_penalty Q5 per-step < −0.010/step（Run34 Q5=−0.0133，目标改善 25%）
+- 正/负奖励比 Q5 ≥ 0.50:1（Run34 Q5=0.34:1）
+- total_reward Q5 > −10（Run34 Q5=−17.04）
+
+### Changelog
+- 2026-04-12: Run 34 分析。主要发现：(1) sum→mean upright 修复生效（2.46× 改善）；(2) crash 仍主导（Q5=0.70），根因是 z=0.5~1.5m 死区无梯度引导；(3) height_penalty Q5 per-step 改善 63%；(4) 正/负比仍 0.34:1，fly_low 负向占 58%；(5) 翻滚触发在追踪学习中期（Q2 bbox→crash转换点）。Run 35 核心改动：fly_low 阶跃→渐变（z<1.5m），dist_reward 2.5→3.5，tracking_reward 1.5→2.0。
+

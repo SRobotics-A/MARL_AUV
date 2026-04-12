@@ -95,7 +95,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 所有正奖励乘 step_dt，指数衰减上界为 1.0
 
     # Distance Reward: w * exp(-dist * scale) * step_dt
-    dist_reward_weight = 2.5  # Run34: 1.5→2.5，正向奖励需压过penalty（当前1:5失衡）
+    dist_reward_weight = 3.5  # Run35: 2.5→3.5，增强正向梯度
     dist_reward_scale = 0.5
 
     # Progress Reward: w * Σ(dist_decrease * target_value) * step_dt per step
@@ -106,7 +106,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     success_reward_weight = 0.0  # Run30: 恢复baseline值（0.0）
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
-    tracking_reward_weight = 1.5  # Run34: 1.0→1.5，增强正向奖励
+    tracking_reward_weight = 2.0  # Run35: 1.5→2.0
     tracking_reward_scale = 1.0
 
     # Action Smoothness: w * exp(-||Δaction||²) * step_dt
@@ -133,8 +133,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     height_reward_weight = 2.0
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
-    height_penalty_weight = 0.5  # Run34: 1.0→0.5，降低斜率减少penalty主导
-    height_penalty_threshold = 2.0  # Run34: 1.5→2.0，z>4.5m或z<0.5m才触发，避免早期大量触发
+    height_penalty_weight = 0.3  # Run35: 0.5→0.3
+    height_penalty_threshold = 2.0  # 保持
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
