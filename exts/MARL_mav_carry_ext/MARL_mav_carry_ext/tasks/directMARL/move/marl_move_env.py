@@ -228,9 +228,10 @@ class MARLMoveEnv(DirectMARLEnv):
         self.drone_assigned_target = torch.zeros(
             self.num_envs, self._num_drones, dtype=torch.long, device=self.device
         )
-        # Progress reward buffer: -1.0 = first-step sentinel (skip progress on reset step)
+        # Progress reward buffer: (N, D) — per-drone distance to assigned target
+        # -1.0 = first-step sentinel (skip progress on reset step)
         self._prev_min_dists = torch.full(
-            (self.num_envs, self.cfg.num_targets), fill_value=-1.0, device=self.device
+            (self.num_envs, self.cfg.num_drones), fill_value=-1.0, device=self.device
         )
         self.targets_out_of_bounds = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
@@ -707,33 +708,45 @@ class MARLMoveEnv(DirectMARLEnv):
         rewards = {}
         step_dt = self.step_dt
 
-        # --- 1. Distance Reward (XY plane, exp decay) ---
+        # --- 1. Distance / Tracking Reward (per assigned target, no cross-interference) ---
+        # Run37: Each drone only earns reward for its own assigned target.
+        # Previous: min over all drones → drone A benefits from drone B approaching B's target,
+        # causing path interference. Now each drone has an exclusive reward lane.
         d_pos = self.drone_positions[:, :, :2].unsqueeze(2)  # (N,D,1,2)
         t_pos = self.target_positions[:, :, :2].unsqueeze(1)  # (N,1,T,2)
         dist_matrix = torch.norm(d_pos - t_pos, dim=-1)  # (N, D, T)
-        min_dists, closest_drone_indices = torch.min(dist_matrix, dim=1)  # (N, T)
 
-        # Weighted exp-decay distance reward
-        dist_per_target = torch.exp(-min_dists * self.cfg.dist_reward_scale)  # (N, T)
-        dist_reward = torch.sum(dist_per_target * self.target_values, dim=-1)
+        # Per-drone distance to its assigned target
+        env_idx = torch.arange(self.num_envs, device=self.device)
+        assigned_dists = torch.stack([
+            dist_matrix[env_idx, drone_idx, self.drone_assigned_target[:, drone_idx]]
+            for drone_idx in range(self._num_drones)
+        ], dim=1)  # (N, D) — distance of each drone to its own assigned target
+
+        # Distance reward: sum of per-drone contributions
+        assigned_values = torch.stack([
+            self.target_values[env_idx, self.drone_assigned_target[:, drone_idx]]
+            for drone_idx in range(self._num_drones)
+        ], dim=1)  # (N, D)
+        dist_reward = (torch.exp(-assigned_dists * self.cfg.dist_reward_scale) * assigned_values).sum(dim=-1)
         rewards["distance_reward"] = self.cfg.dist_reward_weight * dist_reward * step_dt
 
-        # --- 1b. Progress Reward: reward approach, penalize retreat ---
-        # Provides strong gradient at large distances where exp-decay is near zero.
-        # valid_prev skips the first step after reset (sentinel=-1.0).
-        valid_prev = self._prev_min_dists >= 0  # (N, T)
+        # --- 1b. Progress Reward (per assigned target) ---
+        valid_prev = self._prev_min_dists >= 0  # (N, D)
         dist_progress = torch.where(
             valid_prev,
-            (self._prev_min_dists - min_dists).clamp(-0.1, 0.1),  # m/step, capped
-            torch.zeros_like(min_dists),
+            (self._prev_min_dists - assigned_dists).clamp(-0.1, 0.1),
+            torch.zeros_like(assigned_dists),
         )
-        progress_reward = (dist_progress * self.target_values).sum(dim=-1)  # (N,)
+        progress_reward = (dist_progress * assigned_values).sum(dim=-1)  # (N,)
         rewards["dist_progress"] = self.cfg.progress_reward_weight * progress_reward * step_dt
-        self._prev_min_dists = min_dists.clone()
+        self._prev_min_dists = assigned_dists.clone()
 
-        # --- Update Capture State (real-time, revocable) ---
+        # --- Update Capture State (global, for success condition) ---
+        # Keep global min_dists for sustained_follow_timer (requires any drone near any target)
+        min_dists, closest_drone_indices = torch.min(dist_matrix, dim=1)  # (N, T)
         is_captured_now = min_dists < self.cfg.capture_distance
-        self.target_captured = is_captured_now  # 实时状态
+        self.target_captured = is_captured_now
         self.target_captured_by = torch.where(
             is_captured_now,
             closest_drone_indices,
@@ -741,32 +754,29 @@ class MARLMoveEnv(DirectMARLEnv):
         )
 
         # 持续跟随计时：至少3个不同物块各自被至少一架无人机跟随
-        target_min_dist = dist_matrix.min(dim=1)[
-            0
-        ]  # (N, T) — 每个物块到最近无人机的距离
+        target_min_dist = dist_matrix.min(dim=1)[0]  # (N, T)
         target_followed = target_min_dist < self.cfg.capture_distance  # (N, T)
         num_targets_followed = target_followed.sum(dim=-1)  # (N,)
-        enough_targets_followed = num_targets_followed >= 3  # 要求至少3个不同物块被跟随
+        enough_targets_followed = num_targets_followed >= 3
         self._sustained_follow_timer = torch.where(
             enough_targets_followed,
             self._sustained_follow_timer + step_dt,
-            self._sustained_follow_timer,  # Fix: Pause timer instead of resetting
+            self._sustained_follow_timer,
         )
         self.all_targets_captured = (
             self._sustained_follow_timer >= self.cfg.sustained_follow_duration
         )
 
-        # Success Reward: triggered when all_targets_captured condition holds
+        # Success Reward
         rewards["success_reward"] = (
             self.cfg.success_reward_weight * self.all_targets_captured.float()
         )
 
-        # Tracking Reward (Fix: Only reward when captured, prevent reward inversion)
-        # Old buggy logic: exp(-dist) where dist=0 when no target -> max reward for nothing
-        # New logic: is_captured * exp(-dist) -> 0 reward if not captured
+        # Tracking Reward: per-drone, only for its assigned target
+        is_assigned_captured = assigned_dists < self.cfg.capture_distance  # (N, D)
         tracking_reward = (
-            is_captured_now.float()
-            * torch.exp(-min_dists * self.cfg.tracking_reward_scale)
+            is_assigned_captured.float()
+            * torch.exp(-assigned_dists * self.cfg.tracking_reward_scale)
         ).sum(dim=-1)
         rewards["tracking_reward"] = (
             self.cfg.tracking_reward_weight * tracking_reward * step_dt
