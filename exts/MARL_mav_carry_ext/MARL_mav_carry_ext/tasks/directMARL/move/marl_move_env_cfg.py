@@ -96,11 +96,11 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # Distance Reward: w * exp(-dist * scale) * step_dt
     dist_reward_weight = 3.5  # Run35: 2.5→3.5，增强正向梯度
-    dist_reward_scale = 1.5  # Run39: 0.5→1.5，大距离梯度更陡，10m时exp(-15)→exp(-5)改善~150x
+    dist_reward_scale = 0.2  # Run40: 1.5→0.2，scale越小衰减越慢，10m时exp(-2)=0.135（Run39的1.5是错误方向：exp(-15)≈0）
 
     # Progress Reward: w * Σ(dist_decrease * target_value) * step_dt per step
     # Run30: 设为0，baseline无此项，与姿态约束冲突导致乱飞
-    progress_reward_weight = 0.0
+    progress_reward_weight = 1.0  # Run40: 0→1.0，开启逐步进度奖励，补充大距离方向信号
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
     success_reward_weight = 0.0  # Run30: 恢复baseline值（0.0）
