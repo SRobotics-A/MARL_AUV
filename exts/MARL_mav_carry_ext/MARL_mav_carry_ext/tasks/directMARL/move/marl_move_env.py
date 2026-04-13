@@ -211,6 +211,9 @@ class MARLMoveEnv(DirectMARLEnv):
         self.falcon_fly_low = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.falcon_fly_high = torch.zeros(  # Run41: 新增高飞终止缓冲
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self.illegal_contact = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -886,13 +889,16 @@ class MARLMoveEnv(DirectMARLEnv):
         soft_penalty = soft_excess.sum(dim=(1, 2))  # (N,)
         rewards["boundary_soft"] = -self.cfg.boundary_soft_penalty_weight * soft_penalty * step_dt
 
-        # --- 9. Fly Low Penalty (Run35: soft gradient penalty) ---
-        # Previous: step penalty only at z<0.5m → dead zone z=0.5~1.5m with zero gradient,
-        # drone could freely descend into termination region with no corrective signal.
-        # Fix: linear penalty starting at z<1.5m, providing continuous upward gradient.
-        # z=1.5m: penalty=0, z=1.0m: -0.5*weight, z=0.5m: -1.0*weight (termination boundary)
+        # --- 9. Fly Low Penalty (Run41: add * step_dt to normalize scale) ---
+        # Run40 analysis: fly_low WITHOUT step_dt had per-step strength=8.0,
+        # while height_penalty WITH step_dt had per-step strength=0.005 → 1600:1 ratio.
+        # Drones rationally climbed to z>>3.5m to eliminate fly_low (save 8.0/step),
+        # since height_penalty in 1.5-3.5m range is zero anyway.
+        # Fix: add * step_dt, compensate by raising penalty 8.0→50.0 to maintain similar
+        # physical magnitude (50*dt=50*0.01=0.5 per step; vs old 8.0 per step — still ~16x
+        # stronger than height_penalty to maintain asymmetry, but no longer 1600x).
         fly_low_deficit = (1.5 - self.drone_positions[:, :, 2]).clamp(min=0.0)  # (N, D)
-        rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty
+        rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty * step_dt
 
         # --- 10. Illegal Contact Penalty (Run23: disabled) ---
         # NovaCarter CollisionAPI was never fully disabled; contact readings are noise.
@@ -928,6 +934,10 @@ class MARLMoveEnv(DirectMARLEnv):
         """终止条件"""
         # 无人机飞太低（Run19 fix: 0.1→0.5m，关闭0.9m无约束俯冲区）
         self.falcon_fly_low = (self.drone_positions[:, :, 2] < 0.5).any(dim=-1)
+
+        # 无人机飞太高（Run41: 新增 fly_high 终止，z>5.5m 即终止）
+        # 修复高飞局部最优：之前无 fly_high 终止，drone 可爬至 bbox=24m 才结束 episode
+        self.falcon_fly_high = (self.drone_positions[:, :, 2] > self.cfg.fly_high_termination_z).any(dim=-1)
 
         # 非法接触（per-drone contact sensor）
         self.illegal_contact = torch.zeros(
@@ -975,6 +985,7 @@ class MARLMoveEnv(DirectMARLEnv):
         # 组合终止条件
         terminations = (
             self.falcon_fly_low
+            | self.falcon_fly_high  # Run41: 新增高飞终止
             # illegal_contact 仅作惩罚，不终止 episode（NovaCarter CollisionAPI 禁用失败的临时规避）
             | self.drone_collision
             | self.body_pos_outside
@@ -990,6 +1001,10 @@ class MARLMoveEnv(DirectMARLEnv):
                 if self.falcon_fly_low[idx]:
                     reasons.append(
                         f"Fly Low (z={self.drone_positions[idx, :, 2].min():.2f})"
+                    )
+                if self.falcon_fly_high[idx]:
+                    reasons.append(
+                        f"Fly High (z={self.drone_positions[idx, :, 2].max():.2f})"
                     )
                 if self.illegal_contact[idx]:
                     reasons.append("Illegal Contact")
@@ -1105,6 +1120,9 @@ class MARLMoveEnv(DirectMARLEnv):
         ).item()
         self.extras["log"]["Episode_Termination/falcon_fly_low"] = torch.count_nonzero(
             self.falcon_fly_low[env_ids]
+        ).item()
+        self.extras["log"]["Episode_Termination/falcon_fly_high"] = torch.count_nonzero(
+            self.falcon_fly_high[env_ids]
         ).item()
         self.extras["log"]["Episode_Termination/crash"] = torch.count_nonzero(
             self.falcon_fly_low[env_ids] | self.illegal_contact[env_ids]

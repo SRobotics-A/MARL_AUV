@@ -100,7 +100,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # Progress Reward: w * Σ(dist_decrease * target_value) * step_dt per step
     # Run30: 设为0，baseline无此项，与姿态约束冲突导致乱飞
-    progress_reward_weight = 1.0  # Run40: 0→1.0，开启逐步进度奖励，补充大距离方向信号
+    progress_reward_weight = 0.0  # Run41: 1.0→0，3D距离计算导致爬高时dist_progress为负
 
     # Success Reward: 持续跟随满 5 秒触发终止时的奖励
     success_reward_weight = 0.0  # Run30: 恢复baseline值（0.0）
@@ -134,7 +134,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     height_reward_weight = 0.0
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
-    height_penalty_weight = 0.5  # Run36: 0.3→0.5，上方约束需要更强梯度
+    height_penalty_weight = 2.0  # Run41: 0.5→2.0，加强上方约束（配合fly_high终止）
     height_penalty_threshold = 1.0  # Run36: 2.0→1.0，z>3.5m即触发（对称fly_low软惩罚）
 
     # Penalties — 固定惩罚，不乘 step_dt
@@ -142,7 +142,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     crash_penalty_scale = 1.0
     collision_penalty_scale = 2.0
     illegal_contact_penalty = 0.05
-    fly_low_penalty = 8.0  # Run33: 1.0→8.0（Run19验证：8.0减少crash/fly_low −68%）
+    fly_low_penalty = 50.0  # Run41: 8.0→50.0（配合新增* step_dt，维持物理量级：50*0.01=0.5/step）
+    fly_high_termination_z = 5.5  # Run41: 新增，z>5.5m终止episode，防止高飞局部最优
 
     # action和observation配置
     if control_mode == "geometric":
