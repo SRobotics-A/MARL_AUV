@@ -87,8 +87,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # 无人机初始位置（地图另一侧）
     # Spread: Drones further apart
-    drone_spawn_x_range = (-10.0, -8.0)  # Run22：负x侧spawn，与目标(-6~-2)保持2~8m距离
-    drone_spawn_y_range = (-4.0, 4.0)  # Run12：扩大Y方向spawn范围，减少drones_collide
+    drone_spawn_x_range = (-9.0, -9.0)  # Run39: 固定x=-9（调试用，消除随机起点干扰）
+    drone_spawn_y_range = (0.0, 0.0)    # Run39: 固定y=0（调试用，三架无人机每次从同一圆心出发）
     drone_spawn_z_range = (2.0, 3.0)  # 抬高避开 NovaCarter 3x 缩放后车顶(≈1.6m)
 
     # === Reward Weights (Exponential Decay Style, matches hover/hover_flycart) ===
