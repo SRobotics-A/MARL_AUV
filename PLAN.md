@@ -11327,3 +11327,254 @@ python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 --headless --num_en
 ### Changelog
 - 2026-04-13: Run 37 分析。核心发现：(1) height_reward_weight=2.0（旧 cfg）是高飞根因，创造 z=2.5m 悬停局部最优；(2) tracking_reward=0，distance_reward 回归，无人机拒绝水平移动；(3) per-assigned-target 代码逻辑正确但被 height_reward 掩盖，无法评估；(4) 当前 cfg 已正确设置 height_reward=0.0，Run 38 只需确认使用正确 cfg；(5) 训练回归（early=-76 → recent=-142），非收敛。Run 38 单一变更：确认 height_reward_weight=0.0。
 
+---
+
+## Run 40 训练分析报告
+
+**Run:** `2026-04-13_20-45-40_mappo_torch_mappo`
+**Date:** 2026-04-13
+**Task:** Isaac-move-marl-v0（3 Falcon + 4 NovaCarter，±8m bounce，0.3m/s）
+**Algorithm:** MAPPO
+
+---
+
+### 训练指标摘要
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 最终 total reward（ep 均值）| ~−220 | 全程负值，未收敛 |
+| 最终 instant reward（均值）| ~−0.10 | vs baseline +0.544，差距 0.65/step |
+| episode length（均值）| ~182 步 | vs baseline 1658 步，仅 11% |
+| distance_reward（ep 均值）| ~3.2 | 较早期 2.7 提升 +19% |
+| fly_low（ep 均值）| ~−90 | 主导惩罚项，占 ep total 40%+ |
+| height_penalty（ep 均值）| ~−4.5 | 推算隐含均高 ~10m |
+| dist_progress（ep 均值）| ~−12 | 负值（向上飞 → 3D 距离增大）|
+| tracking_reward（ep 均值）| ~0.05 | 仅为 baseline 0.09% |
+
+**配置关键变更（相对 Run 39）：**
+- `dist_reward_scale`：1.5 → **0.2**（bug 修复）
+- `progress_reward_weight`：0 → **1.0**（新增）
+- `height_reward_weight`：0（保持 Run 38 设置）
+- `velocity_penalty_weight`：0（保持 Run 39 设置）
+- 无人机固定 spawn (−9, 0)，目标固定 USD 初始位置
+
+---
+
+### 五个问题的逐一回答
+
+**Q1：三架无人机朝三个不同方向飞——策略分歧还是速度/控制问题？**
+
+这是**正确的目标分配行为，不是策略分歧**。
+
+`_assign_targets_for_envs()` 在每次 episode reset 时按匈牙利匹配将 3 架无人机分别指向 4 个目标（y = +6m、+2m、−2m、−6m 各一个），导致三架无人机向不同 y 方向展开属于设计行为。策略并未分歧——它们共享参数（MAPPO 中心化训练）且都在执行"朝各自目标飞"的动作，只是目标在不同位置。
+
+核心问题是**朝目标飞的同时还在向上爬高**，这与目标分配无关，是奖励梯度问题（见 Q4）。
+
+---
+
+**Q2：dist_reward_scale 修复（1.5→0.2）后大距离梯度是否恢复？**
+
+**部分恢复，但被高度信号淹没，效果不显著。**
+
+- `distance_reward` 从早期均值 ~2.7 升至 ~3.2，提升 +19%，说明大距离梯度确实有所改善
+- 但 Run 40 中 `fly_low ep_sum ≈ −90`、`height_penalty ep_sum ≈ −4.5`
+
+量化对比（per step 梯度强度）：
+- `fly_low`：8.0 × max(0, 1.5−z)，**无 step_dt**，每步有效权重 ≈ 8.0
+- `height_penalty`：0.5 × excess × step_dt，每步有效权重 ≈ 0.005
+- `distance_reward`：按 scale=0.2，每步梯度量级 ≈ 0.02～0.06
+
+fly_low 梯度是 distance_reward 的 **130～400 倍**，是 height_penalty 的 **1600 倍**。
+
+无人机学到的最优策略：爬到 z>1.5m 立刻消除 fly_low 惩罚（每步节省 8.0 奖励），而 height_penalty 在 z<3.5m 时为 0，z>3.5m 时仅每步 −0.005。距离梯度完全无法与之竞争。
+
+---
+
+**Q3：progress_reward 开启后是否提供方向信号？dist_progress 是否正值？**
+
+**dist_progress 全程为负，没有提供正向方向信号。**
+
+根本原因：`progress_reward` 基于相邻步 3D 距离变化 `d_prev − d_curr`。当无人机在爬高时，z 方向增量导致 3D 距离 **增大**（目标在地面 z≈0.3m），所以 `d_prev − d_curr < 0`，每步 progress_reward 为负。
+
+progress_reward 的设计意图（奖励靠近目标的行为）在当前高飞状态下**完全反转**，成为额外惩罚。这也解释了为什么 ep_sum ≈ −12。
+
+---
+
+**Q4：fly_low 与 height_penalty 的对称性问题是否导致高飞？**
+
+**是，这是本次 Run 40 高飞的根本原因。**
+
+梯度不对称分析：
+
+| 项目 | 公式 | per-step 量级 | 备注 |
+|------|------|--------------|------|
+| `fly_low` | −8.0 × max(0, 1.5−z) | **~8.0/step** | **无 step_dt** |
+| `height_penalty` | −0.5 × max(0, \|z−2.5\|−1.0) × dt | ~0.005/step | 有 step_dt；z<3.5m 时为 0 |
+| `distance_reward` | exp(−dist×scale) × w | ~0.02～0.06/step | |
+
+策略的理性选择：爬升到 z > 1.5m 可消除 fly_low 惩罚（每步节省 8.0），爬到 z < 3.5m 无 height_penalty，而 height_penalty 即使触发也仅 0.005/step。距离奖励无力阻止爬高。
+
+推算隐含均高：由 `height_penalty ep_sum ≈ −4.5`，`ep_len ≈ 182步`，`height_penalty_weight=0.5`，`threshold=1.0m`（触发于 z > 3.5m），`step_dt=0.01`：
+excess = 4.5 / (182 × 0.5 × 0.01) = 4.95m → 平均 z ≈ **3.5 + 4.95 ≈ 8.5m**（远高于目标）
+
+无 fly_high 终止（move env 不含 fly_high_termination 条件），drone 可以持续爬高直到 z > 24m 触发 bounding_box 终止。
+
+---
+
+**Q5：与 baseline（crash=0, per-step=+0.544, ep_len=1658）的差距**
+
+| 维度 | Run 40 | Baseline | 差距 |
+|------|--------|----------|------|
+| instant reward/step | ~−0.10 | +0.544 | **−0.644/step（负差距）** |
+| episode length | ~182 步 | 1658 步 | **−88.7%** |
+| tracking_reward ep | ~0.05 | ~55+ | **<0.1%** |
+| distance_reward ep | ~3.2 | ~50+ | **<7%** |
+| fly_low ep | ~−90 | ~0 | **高飞导致 ep 前期积累** |
+| height (飞行高度) | ~8.5m | ~2.5m | 超高 6m |
+
+总体评估：Run 40 在所有核心指标上均严重落后于 baseline，根因是 fly_low/height_penalty 梯度 1600x 不对称驱动高飞，使 distance_reward 和 tracking_reward 完全失效。
+
+---
+
+### 发现与诊断
+
+#### 发现 1 — fly_low 公式缺少 step_dt（CRITICAL）
+
+**症状：** 无人机系统性爬高到 8.5m+，distance_reward 和 tracking 完全无法触发
+
+**根本原因：** `fly_low` 奖励公式（`marl_move_env.py` 第 894-895 行）**缺少 step_dt 归一化**：
+```python
+fly_low_deficit = (1.5 - self.drone_positions[:, :, 2]).clamp(min=0.0)
+rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty
+```
+而 `height_penalty` 含 `* step_dt`，per-step 权重仅 0.005。fly_low 实际强度是 height_penalty 的 **1600 倍**，是其他 tracking 奖励的 **100-400 倍**，驱动爬高到 1.5m 以上后完全失控。
+
+**证据：** `fly_low ep_sum ≈ −90` vs `height_penalty ep_sum ≈ −4.5`，隐含高度 ~8.5m
+
+---
+
+#### 发现 2 — 缺少 fly_high 终止条件（CRITICAL）
+
+**症状：** 无人机爬高后无明确上界，依赖 bounding_box(24m) 终止，ep_len 极短（182步）
+
+**根本原因：** `marl_move_env.py` 中不存在 `fly_high_termination` 条件（grep 确认），而同类的 `move_flyfollow` 环境有 `fly_high_termination_z=5.5m`。无 fly_high 终止 → 无人机爬高后超出 bounding_box(24m) → 终止信号无法区分"飞太高"和"飞出边界"。
+
+**证据：** ep_len 仅 182 步，远低于应有的持续追踪时长；bounding_box 终止频率推断偏高
+
+---
+
+#### 发现 3 — dist_progress 在高飞状态下方向反转（HIGH）
+
+**症状：** `dist_progress ep_sum ≈ −12`，对任务方向没有引导，反而成为额外惩罚
+
+**根本原因：** progress_reward 使用 3D 距离差（含 z 分量），目标高度 z≈0.3m，无人机 z≈8.5m，水平移动带来的 3D 距离改善被 z 方向距离增大完全抵消
+
+---
+
+#### 发现 4 — dist_reward_scale 修复效果被高度信号掩盖（MEDIUM）
+
+**症状：** distance_reward +19% 改善，但 tracking_reward 未见显著提升
+
+**根本原因：** scale=0.2 修复正确，但只要高飞问题（发现 1）不解决，distance 梯度永远无法竞争 fly_low 的 8.0/step 信号
+
+---
+
+### 改进建议
+
+#### Priority 1（CRITICAL）：给 fly_low 添加 step_dt，提高 fly_low_penalty
+
+**问题：** fly_low 1600x 强度优势驱动高飞，是所有其他问题的根因
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 第 895 行：
+  ```python
+  # 修改前
+  rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty
+  # 修改后
+  rewards["fly_low"] = -fly_low_deficit.sum(dim=-1) * self.cfg.fly_low_penalty * step_dt
+  ```
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `fly_low_penalty`：8.0 → **50.0**（加 step_dt 后折算实际强度 = 50×0.01 = 0.5/step，与 height_penalty 量级对齐）
+
+**预期效果：** fly_low per-step 强度从 8.0 降至 0.5，与 height_penalty(0.005~0.05) 和 distance_reward(0.02~0.06) 量级接近，消除高飞吸引子
+
+---
+
+#### Priority 2（CRITICAL）：添加 fly_high 终止条件
+
+**问题：** 无高度上界，无人机可无限爬高至 bounding_box 终止，ep_len 极短
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 在 termination 计算部分添加（参考 move_flyfollow env 的实现）：
+  ```python
+  # 添加 fly_high 终止（参考 move_flyfollow 的 fly_high_termination_z=5.5）
+  fly_high_term = (self.drone_positions[:, :, 2] > self.cfg.fly_high_termination_z).any(dim=-1)
+  terminated |= fly_high_term
+  ```
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- 添加：`fly_high_termination_z: float = 5.5`
+
+**预期效果：** 高飞后快速终止 + 负奖励积累，为策略提供明确的高度上界信号；同时将 ep_len 从被 bounding_box 随机截断改为由行为质量决定
+
+---
+
+#### Priority 3（HIGH）：height_penalty_weight 加强
+
+**问题：** height_penalty 过弱（0.005/step），在 Priority 1 修复后仍需更强的高度惩罚平衡
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `height_penalty_weight`：0.5 → **2.0**（per-step 强度：0.02/step @ excess=1m，与 distance_reward 量级对齐）
+
+**前提：** Priority 1 修复必须先于此项，否则 height_penalty 加强无意义（fly_low 仍压制一切）
+
+---
+
+#### Priority 4（MEDIUM）：暂时禁用 progress_reward 直到高度修复
+
+**问题：** progress_reward 在高飞状态下方向反转为负，干扰策略梯度
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `progress_reward_weight`：1.0 → **0.0**（Run 41 期间暂时关闭，待高度正常后重新开启）
+
+---
+
+### 实验方案（Run 41）
+
+**核心目标：** 修复 fly_low/height_penalty 梯度 1600x 不对称，建立有效高度约束
+
+**参数变更（相对 Run 40）：**
+
+| 参数 | Run 40 | Run 41 |
+|------|--------|--------|
+| fly_low 公式 | 无 step_dt | **添加 × step_dt** |
+| `fly_low_penalty` | 8.0 | **50.0** |
+| `fly_high_termination_z` | 不存在 | **添加 5.5m** |
+| `height_penalty_weight` | 0.5 | **2.0** |
+| `progress_reward_weight` | 1.0 | **0.0** |
+
+**训练命令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-move-marl-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**100k 步中止标准：**
+- episode_length Q2 < 100 步 → fly_high_termination 过严或 fly_low 仍压制其他项，检查 fly_low/fly_high 比例
+- distance_reward 仍持续下降 → 高度修复不够，无人机仍在爬高，检查实际飞行高度
+- instant_reward < −0.20 → 新参数制造更强惩罚，回滚 height_penalty_weight
+
+**300k 步成功标准（超越 baseline）：**
+- distance_reward recent ep_mean > 5.0（vs Run 40 ≈ 3.2）
+- fly_low ep_mean > −5（vs Run 40 ≈ −90）
+- 无人机均高 < 3.5m（height_penalty ep_mean < −1）
+- instant_reward recent_mean > 0.0（vs Run 40 ≈ −0.10）
+- ep_len > 300 步（vs Run 40 ≈ 182）
+
+---
+
+### Changelog（Run 40）
+- 2026-04-13: Run 40 分析（Isaac-move-marl-v0，3 Falcon + 4 NovaCarter）。核心发现：(1) fly_low 公式缺少 step_dt，导致其 per-step 强度是 height_penalty 的 1600 倍、distance_reward 的 130~400 倍，是高飞根因；(2) 三架无人机朝不同方向 = 正常目标分配行为，非策略分歧；(3) progress_reward 因 3D 距离包含 z 分量，在高飞状态下方向反转，ep_sum ≈ −12；(4) move env 缺少 fly_high 终止条件（bounding_box 24m 兜底），ep_len 仅 182 步；(5) 推算隐含均高 ~8.5m。Run 41 三项关键修复：fly_low 添加 step_dt + penalty→50，添加 fly_high_termination(5.5m)，height_penalty_weight 0.5→2.0。
+
