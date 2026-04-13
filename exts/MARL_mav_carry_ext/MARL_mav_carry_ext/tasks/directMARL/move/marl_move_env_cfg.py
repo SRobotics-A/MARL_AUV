@@ -130,7 +130,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
-    height_reward_weight = 2.0
+    # Run38: 0→0，高度吸引子是无人机悬停局部最优的根因，关闭后靠 fly_low+height_penalty 约束高度
+    height_reward_weight = 0.0
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 0.5  # Run36: 0.3→0.5，上方约束需要更强梯度

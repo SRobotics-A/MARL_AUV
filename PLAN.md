@@ -11109,4 +11109,221 @@ python3 scripts/skrl/train.py --task=Isaac-marl-move-v0 --headless --num_envs=20
 
 ### Changelog
 - 2026-04-12: Run 34 分析。主要发现：(1) sum→mean upright 修复生效（2.46× 改善）；(2) crash 仍主导（Q5=0.70），根因是 z=0.5~1.5m 死区无梯度引导；(3) height_penalty Q5 per-step 改善 63%；(4) 正/负比仍 0.34:1，fly_low 负向占 58%；(5) 翻滚触发在追踪学习中期（Q2 bbox→crash转换点）。Run 35 核心改动：fly_low 阶跃→渐变（z<1.5m），dist_reward 2.5→3.5，tracking_reward 1.5→2.0。
+- 2026-04-13: Run 37（2026-04-12_21-31-53）分析。详见下节。
+
+---
+
+## Run 37 训练分析报告（2026-04-12_21-31-53）
+
+**Run:** 2026-04-12_21-31-53_mappo_torch_mappo
+**日期:** 2026-04-13
+**Task:** Isaac-marl-flyfollow-v0（move 任务分支）
+**Algorithm:** MAPPO / 400k steps
+
+---
+
+### 训练指标摘要
+
+| 指标 | early mean | recent mean | last | best |
+|------|-----------|-------------|------|------|
+| total_reward (mean) | −76.14 | −141.76 | −43.32 | −2.89 |
+| instant_reward (mean) | −0.388 | −0.837 | −0.403 | +0.085 |
+| distance_reward | 0.880 | 0.583 | 0.215 | 5.666 |
+| tracking_reward | 0.019 | 0.010 | 0.000 | 0.554 |
+| height_reward | 0.729 | 0.822 | 0.732 | 1.547 |
+| velocity_penalty | 0.020 | 0.020 | 0.016 | 0.036 |
+| force_penalty | 0.390 | 0.347 | 0.382 | 0.570 |
+| body_rate_penalty | 0.300 | 0.152 | 0.174 | 0.433 |
+| action_smoothness | 0.146 | 0.147 | 0.156 | 0.263 |
+| ep_len (mean) | 173.5 | 172.7 | 187.0 | 283.0 |
+| policy_std | 0.846 | 0.828 | 0.835 | 0.862 |
+
+**关键观察：**
+- total_reward 持续为负，recent_mean 比 early_mean 更负（回归），说明训练不仅未收敛，还在恶化
+- tracking_reward 全程接近 0（recent=0.010，last=0.000），无人机从未成功进入追踪区
+- height_reward 是最大的正奖励项（recent=0.822），明显高于 distance_reward（recent=0.583）
+- ep_len 全程约 173 步（1.7s），从未显著增长，说明存在稳定的早期终止原因
+- policy_std 稳定 0.828–0.846，未塌陷，探索度正常
+
+---
+
+### 问题分析
+
+#### 问题 1：height_reward_weight=2.0 是高飞的直接根因 — 严重程度：CRITICAL
+
+**症状：**
+height_reward early=0.729, recent=0.822，是所有奖励项中持续最高者，且在训练过程中还在上升。
+tracking_reward 全程≈0，无人机不向目标靠近。
+
+**根本原因：**
+YAML 配置显示 `height_reward_weight=2.0, desired_height=2.5m`。高度奖励为高斯型：
+`height_reward = 2.0 * exp(−(|z − 2.5|/sigma)²)`
+这在 z=2.5m 处创造了一个强吸引子。无人机找到了"悬停在 z=2.5m"的局部最优，此策略能稳定获得 height_reward ≈ 2.0/step，同时无需向目标移动。
+
+相比之下：
+- distance_reward 需要真正靠近目标（初始距离约 8~12m），early 阶段只能得 0.88
+- tracking_reward 需要进入 capture_distance=3.0m 圈内，初始完全无法触达
+
+**证据：**
+1. height_reward recent_mean=0.822（值接近理论最大 2.0 × exp(0) = 2.0，说明无人机 z 误差很小，正锁在 desired_height 附近）
+2. distance_reward 从 0.880 下降至 0.583（训练越来越差，无人机不靠近目标）
+3. ep_len best=283，recent_mean=173——无人机不移动，也不崩溃，只是悬停等待 timeout
+4. 当前 cfg 文件（marl_flyfollow_env_cfg.py line 143）已正确设置 `height_reward_weight=0.0`，但 **Run 37 的 params/env.yaml 显示 height_reward_weight=2.0**，说明 Run 37 使用的是一个旧版/不同的配置，此奖励仍处于激活状态
+
+**与 fly_low 渐变的交互：**
+Run 37 的 fly_low 软梯度从 z=1.5m 开始惩罚，而 desired_height=2.5m。这两者实际上形成了一个"舒适带"：
+- z > 2.5m：height_reward 下降（远离 desired），fly_low 不触发 → 微弱下压力
+- z = 2.5m：height_reward 最大 → 强吸引子
+- z < 1.5m：fly_low 渐变惩罚开始 → 排斥
+结论：策略学会了"锁在 z=2.5m 悬停"，这是梯度设计的必然结果，不是 bug，而是设计缺陷。
+
+---
+
+#### 问题 2：per-assigned-target 奖励结构本身正确，但被 height_reward 掩盖 — 严重程度：HIGH
+
+**症状：**
+distance_reward early=0.880 → recent=0.583（下降）。tracking_reward 近似为 0。
+
+**根本原因：**
+代码层面：Run 37 确实引入了 per-assigned-target 结构——`assigned_dist` 现在是 (E, D) 形状，通过 `gather` 从各无人机的分配目标计算，这在代码逻辑上是正确的。
+但由于 height_reward 构建了悬停局部最优，即使距离奖励的梯度方向是正确的，策略也不会执行水平移动——移动会扰动 z 高度，导致 height_reward 降低，净收益为负。
+
+**证据：**
+distance_reward 下降趋势（0.880 → 0.583）表明策略正在主动避免靠近目标，这与 height_reward 的保高度压力一致。
+
+---
+
+#### 问题 3：episode 极短（173步），终止原因不明确 — 严重程度：HIGH
+
+**症状：**
+ep_len best=283，mean_recent=173（约 1.7s），远低于 baseline 的 1658步。
+但 total_reward 为负（不是正的成功终止），fly_low、crash 等指标无法从当前 TF 数据中直接读取。
+
+**推断：**
+结合 Run 36 报告（"第三台无人机不稳定"）以及 ep_len=173 的短周期，最可能的终止原因是 fly_low 或 bounding_box：
+- 高飞悬停后，偶发的控制扰动可能导致超出 max_altitude=7.0m（fly_high 终止）
+- 或随机下冲导致 z < min_altitude=1.0m（fly_low 终止）
+- bounding_box_threshold=24.0m，spawn 在 x=(-10,-8)，清除距离充足，bounding_box 不是主因
+
+**证据：**
+ep_len std=40（来自 recent_std），波动不大，排除随机崩溃。更可能是高度相关终止。
+
+---
+
+#### 问题 4：训练回归而非收敛 — 严重程度：HIGH
+
+**症状：**
+total_reward_mean: early=−76.14 → recent=−141.76（worse），虽然 last=−43.32 有所好转，但整体趋势是先变差再恢复，呈现振荡，并无收敛信号。instant_reward 同样：early=−0.388 → recent=−0.837。
+
+**根本原因：**
+high std（recent_std=214）表明奖励存在极大波动。height_reward 的窄高斯吸引子（sigma=1.0）会在无人机稍偏离 z=2.5m 时急剧下降，导致奖励跳变，难以稳定学习。
+
+---
+
+#### 问题 5：upright 持续梯度效果无法验证，但结构合理 — 严重程度：LOW
+
+Run 37 引入了持续梯度 upright_penalty = w*(z_body-1.0).mean(-1)*dt。
+从数据看 body_rate_penalty recent=0.152（vs early=0.300，下降 49%），说明角速度被成功抑制，姿态稳定性有所提升。但这也可能是无人机悬停不动导致的副效果。无法在悬停局部最优下评估此改动的独立贡献。
+
+---
+
+### 核心诊断结论
+
+**高飞无法靠近目标的根因链：**
+```
+height_reward_weight=2.0 @ desired_height=2.5m
+    → 悬停吸引子：z=2.5m 为局部最优
+    → 水平移动降低 z 控制精度 → height_reward 下降
+    → 净收益 = distance_reward 增量 - height_reward 损失 < 0
+    → 策略拒绝水平移动
+    → tracking_reward = 0，distance_reward 下降
+    → 训练回归
+```
+
+**与现有 cfg 的不一致：**
+当前 `marl_flyfollow_env_cfg.py` 已将 `height_reward_weight=0.0`（正确）。但 Run 37 的 `params/env.yaml` 显示 `height_reward_weight=2.0`，说明 Run 37 训练时使用的 cfg 与当前代码不一致。Run 38 训练前，必须确认 cfg 已正确应用 `height_reward_weight=0.0`。
+
+---
+
+### 修改建议
+
+#### Priority 1（CRITICAL）：确认 height_reward_weight=0.0
+
+**问题：** height_reward_weight=2.0 是高飞悬停局部最优的直接根因
+
+**确认步骤：**
+1. 检查 `marl_flyfollow_env_cfg.py`：`height_reward_weight = 0.0` — 当前已正确
+2. 运行新训练时验证生成的 `params/env.yaml` 中 `height_reward_weight: 0.0`
+3. 不需要代码改动，只需确保不使用旧的 cfg override
+
+**文件：** `/home/xtj/xtj-project/RL/MARL_AUV/exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/flyfollow/marl_flyfollow_env_cfg.py`
+**当前值：** `height_reward_weight = 0.0` (line 143) — 正确，无需改动
+**注意：** Run 37 使用的旧配置有 `height_reward_weight=2.0`，这是所有问题的根因。
+
+---
+
+#### Priority 2（HIGH）：检查 dist_reward_weight 是否足够主导
+
+当 height_reward 关闭后，distance_reward 和 tracking_reward 需要成为唯一正向信号。
+当前 cfg 值：`dist_reward_weight=3.5`（已针对 Run 35+ 优化），`tracking_reward_weight=2.0`。
+
+**建议：** 保持 dist_reward_weight=3.5，确认 tracking_reward_weight=2.0。已知 Run 35+ 的 fly_low 渐变设计在这些权重下工作。无需变更，仅需确认。
+
+**文件：** `marl_flyfollow_env_cfg.py`
+**参数：** `dist_reward_weight=3.5, tracking_reward_weight=2.0`（确认保留）
+
+---
+
+#### Priority 3（HIGH）：fly_low 渐变机制 — 确认 z<1.5m 软梯度已激活
+
+Run 37 引入了 fly_low 软梯度（z<1.5m 线性惩罚），这是 Run 35 计划的核心。
+但在 height_reward=2.0 的干扰下无法评估其效果。在 height_reward=0 的条件下，这个渐变是必须的——否则无人机可能在低空追踪时直接坠机（Run 34 的 z=0.5~1.5m 死区问题）。
+
+**验证方法：** 下一个 run 的 fly_low_reward 项应持续存在且值合理（非 0）；crash 应 < 0.4。
+
+---
+
+#### Priority 4（MEDIUM）：per-assigned-target 奖励结构 — 代码已正确，需运行验证
+
+Run 37 的核心代码改动（_prev_min_dists 形状从 (N, num_targets) → (N, num_drones)，距离/追踪/进度奖励改为 per-assigned-target）在代码逻辑上已正确实现。
+无法在当前 Run 37 数据下验证行为效果（被 height_reward 局部最优覆盖）。
+在 height_reward=0 的 Run 38 下，应能观察到 distance_reward 不再下降。
+
+---
+
+#### Priority 5（LOW）：upright 持续梯度保留，weight 维持 0.5
+
+Run 37 引入了 `upright_penalty = w * (z_body - 1.0).mean(-1) * dt`，Run 33 分析确认这是正确的连续梯度公式（无死区）。当前 cfg 中 `upright_penalty_weight=0.5`（已按 Run 21 三次验证值设置）。保留不变。
+
+---
+
+### 实验方案（Run 38）
+
+**核心目标：** 在正确 cfg（height_reward=0）下验证 per-assigned-target 结构 + fly_low 渐变的联合效果。
+
+**参数变更（仅从 Run 37 出发）：**
+- `height_reward_weight`：2.0 → **0.0**（消除高飞吸引子；已在 cfg 文件中正确设置，需确认训练时不被 override）
+- 其余所有参数与 Run 37 保持一致
+
+**训练命令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-marl-flyfollow-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**100k 步中止标准：**
+- ep_len Q2 < 100 步 → height_reward 关闭后仍有其他终止问题，检查 fly_low/fly_high 分布
+- distance_reward 仍持续下降 → per-assigned-target 结构有 bug，需检查 gather 逻辑
+- tracking_reward Q2 = 0.000 → 追踪区未被进入，检查 capture_distance 设置
+
+**400k 步成功标准（对比 Run 37）：**
+- distance_reward recent_mean > 1.5（vs Run 37 = 0.583）
+- tracking_reward recent_mean > 0.10（vs Run 37 = 0.010）
+- ep_len recent_mean > 300 步（vs Run 37 = 173）
+- instant_reward recent_mean > 0.0（vs Run 37 = −0.837）
+- height_reward 应为 0（确认关闭）
+
+---
+
+### Changelog
+- 2026-04-13: Run 37 分析。核心发现：(1) height_reward_weight=2.0（旧 cfg）是高飞根因，创造 z=2.5m 悬停局部最优；(2) tracking_reward=0，distance_reward 回归，无人机拒绝水平移动；(3) per-assigned-target 代码逻辑正确但被 height_reward 掩盖，无法评估；(4) 当前 cfg 已正确设置 height_reward=0.0，Run 38 只需确认使用正确 cfg；(5) 训练回归（early=-76 → recent=-142），非收敛。Run 38 单一变更：确认 height_reward_weight=0.0。
 
