@@ -37,17 +37,17 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # control mode
     control_mode = "ACCBR"  # ACCBR or geometric
     # 动作空间参数
-    # Run31: 降低最大速度，小车0.3m/s，无人机1.5m/s足够追上且不会冲刺乱飞
-    lin_vel_max = 1.5  # m/s（Run31: 3.0→1.5，防止策略探索时高速冲刺）
+    # Run39: 速度上限贴近小车速度(0.3m/s)，速度比从5:1降到2.7:1，减少超调
+    lin_vel_max = 0.8   # m/s（Run39: 1.5→0.8，减少超调，小车0.3m/s，速度比2.7:1）
     ang_vel_max = 2.0  # rad/s（Run31: 3.0→2.0，配合姿态稳定）
     # env
     decimation = 3
     episode_length_s = 60
     # Added action limits for scaling
-    lin_acc_max = 3.0  # m/s^2（Run31: 5.0→3.0，更温和的加速度）
+    lin_acc_max = 1.5  # m/s^2（Run39: 3.0→1.5，配合低速上限，减少激进加速）
     # PD velocity controller gains
-    vel_Kp = 3.0  # Proportional gain
-    vel_Kd = 0.5  # Derivative gain
+    vel_Kp = 2.0  # Proportional gain（Run39: 3.0→2.0，减少速度误差激进响应）
+    vel_Kd = 0.3  # Derivative gain（Run39: 0.5→0.3，配合较小Kp）
 
     # history of observations
     partial_obs = True  # if only local observations are used
@@ -96,7 +96,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
 
     # Distance Reward: w * exp(-dist * scale) * step_dt
     dist_reward_weight = 3.5  # Run35: 2.5→3.5，增强正向梯度
-    dist_reward_scale = 0.5
+    dist_reward_scale = 1.5  # Run39: 0.5→1.5，大距离梯度更陡，10m时exp(-15)→exp(-5)改善~150x
 
     # Progress Reward: w * Σ(dist_decrease * target_value) * step_dt per step
     # Run30: 设为0，baseline无此项，与姿态约束冲突导致乱飞
@@ -119,7 +119,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     time_penalty = 0.0
 
     # Velocity Penalty: w * exp(-||vel||) * step_dt — 新增：抑制高速
-    velocity_penalty_weight = 0.3  # Run33: 1.5→0.3（Run31证明1.5压制tracking至0）
+    velocity_penalty_weight = 0.0  # Run39: 0.3→0，分析证明0.3仍然抑制水平靠近（梯度149:1）
 
     # Force Penalty: w * exp(-max_thrust) * step_dt — 新增
     force_penalty_weight = 0.5
