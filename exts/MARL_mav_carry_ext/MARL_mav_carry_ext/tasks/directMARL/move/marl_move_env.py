@@ -757,6 +757,7 @@ class MARLMoveEnv(DirectMARLEnv):
         )
 
         # 持续跟随计时：至少3个不同物块各自被至少一架无人机跟随
+        # Run41 fix: 条件断掉时清零 timer，确保真正连续的持续跟随
         target_min_dist = dist_matrix.min(dim=1)[0]  # (N, T)
         target_followed = target_min_dist < self.cfg.capture_distance  # (N, T)
         num_targets_followed = target_followed.sum(dim=-1)  # (N,)
@@ -764,7 +765,7 @@ class MARLMoveEnv(DirectMARLEnv):
         self._sustained_follow_timer = torch.where(
             enough_targets_followed,
             self._sustained_follow_timer + step_dt,
-            self._sustained_follow_timer,
+            torch.zeros_like(self._sustained_follow_timer),  # 清零而非保持，确保连续计时
         )
         self.all_targets_captured = (
             self._sustained_follow_timer >= self.cfg.sustained_follow_duration
@@ -990,6 +991,7 @@ class MARLMoveEnv(DirectMARLEnv):
             | self.drone_collision
             | self.body_pos_outside
             | self.targets_out_of_bounds
+            | self.all_targets_captured  # Run41: success 触发终止（连续跟随3目标≥0.5s）
         )
 
         # Debug logging
@@ -1017,6 +1019,8 @@ class MARLMoveEnv(DirectMARLEnv):
                     )
                 if self.targets_out_of_bounds[idx]:
                     reasons.append("Target Outside")
+                if self.all_targets_captured[idx]:
+                    reasons.append(f"SUCCESS (timer={self._sustained_follow_timer[idx]:.2f}s)")
                     # Check currently captured targets
                     current_captures = self.target_captured[idx]  # (T,) bool
                     if current_captures.any():
@@ -1060,7 +1064,10 @@ class MARLMoveEnv(DirectMARLEnv):
         )
 
         radius = 2.0
-        height = 2.5
+        # Run41 fix: 使用 cfg 的 drone_spawn_z_range 随机采样高度（之前硬编码 2.5 导致配置无效）
+        center_z = torch.empty(len(env_ids), device=self.device).uniform_(
+            *self.cfg.drone_spawn_z_range
+        )
         phases = torch.tensor(
             [0.0, 2.0 * 3.14159 / 3.0, 4.0 * 3.14159 / 3.0], device=self.device
         )
@@ -1073,7 +1080,7 @@ class MARLMoveEnv(DirectMARLEnv):
             offsets = torch.zeros((len(env_ids), 3), device=self.device)
             offsets[:, 0] = center_x + radius * torch.cos(phases[i])
             offsets[:, 1] = center_y + radius * torch.sin(phases[i])
-            offsets[:, 2] = height
+            offsets[:, 2] = center_z  # 使用配置中的随机高度范围
 
             new_positions = origins + offsets
 

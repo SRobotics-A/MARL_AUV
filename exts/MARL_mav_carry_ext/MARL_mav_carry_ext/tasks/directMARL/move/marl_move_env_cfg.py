@@ -65,18 +65,9 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     target_bounce_x_max = 8.0  # 折返边界：最大 x（相对 env_origin）
     target_size = (0.5, 0.5, 0.5)  # 物块尺寸 (m)
     capture_distance = 3.0  # 捕获距离阈值 (m，XY平面)，扩大适配NovaCarter 3x实际尺寸
-    sustained_follow_duration = 0.5  # 持续跟随秒数（Run13：50步≈ep_len的15%，解锁success首次触发）
-    # 物块初始位置（地面一侧，y方向分开）
-    # Spread: Targets wider apart
-    target_spawn_x_range = (-6.0, -2.0)
-    # Spread: Wider Y spread for dispersion
-    target_spawn_y_positions = [
-        6.0,
-        2.0,
-        -2.0,
-        -6.0,
-    ]
-    target_spawn_z = 0.25  # z高度固定在地面上方（NovaCarter车身高约0.25m）
+    sustained_follow_duration = 0.5  # 持续跟随秒数（需连续满足，条件断掉时清零）
+    # 注：目标初始位置由 USD 文件决定（_reset_targets 从 USD 读取），
+    # target_spawn_* 参数已删除，避免与实现不一致导致调参误判。
 
     # NovaCarter小车USD路径
     nova_carter_usd_path: str = (
@@ -102,8 +93,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # Run30: 设为0，baseline无此项，与姿态约束冲突导致乱飞
     progress_reward_weight = 0.0  # Run41: 1.0→0，3D距离计算导致爬高时dist_progress为负
 
-    # Success Reward: 持续跟随满 5 秒触发终止时的奖励
-    success_reward_weight = 0.0  # Run30: 恢复baseline值（0.0）
+    # Success Reward: 持续跟随满 0.5 秒触发终止时的奖励（稀疏终止奖励）
+    success_reward_weight = 5.0  # Run41: 0→5.0，接通 done 后需要非零奖励信号
 
     # Tracking Reward: w * exp(-track_dist * scale) * step_dt
     tracking_reward_weight = 2.0  # Run35: 1.5→2.0
