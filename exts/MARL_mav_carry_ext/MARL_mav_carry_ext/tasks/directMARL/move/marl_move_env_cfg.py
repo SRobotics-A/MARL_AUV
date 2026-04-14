@@ -81,6 +81,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     drone_spawn_x_range = (-9.0, -9.0)  # Run39: 固定x=-9（调试用，消除随机起点干扰）
     drone_spawn_y_range = (0.0, 0.0)    # Run39: 固定y=0（调试用，三架无人机每次从同一圆心出发）
     drone_spawn_z_range = (2.0, 3.0)  # 抬高避开 NovaCarter 3x 缩放后车顶(≈1.6m)
+    drone_formation_radius = 2.0  # 编队圆半径(m)：三架无人机绕同一圆心等角分布
 
     # === Reward Weights (Exponential Decay Style, matches hover/hover_flycart) ===
     # 所有正奖励乘 step_dt，指数衰减上界为 1.0

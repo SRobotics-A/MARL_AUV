@@ -1066,7 +1066,7 @@ class MARLMoveEnv(DirectMARLEnv):
             *self.cfg.drone_spawn_y_range
         )
 
-        radius = 2.0
+        radius = self.cfg.drone_formation_radius
         # Run41 fix: 使用 cfg 的 drone_spawn_z_range 随机采样高度（之前硬编码 2.5 导致配置无效）
         center_z = torch.empty(len(env_ids), device=self.device).uniform_(
             *self.cfg.drone_spawn_z_range
@@ -1098,8 +1098,7 @@ class MARLMoveEnv(DirectMARLEnv):
 
         # ===== Target Assignment (fixed for entire episode) =====
         # Assign each drone to a target by y-rank: highest-y drone → highest-y target (highest value).
-        # drone spawn y: center_y + radius * sin(phase[i]), radius=2.0
-        radius = 2.0
+        # drone spawn y: center_y + radius * sin(phase[i])
         drone_spawn_y = center_y.unsqueeze(1) + radius * torch.sin(phases).unsqueeze(0)  # (B, D)
         # drone_y_rank[b, r] = drone_idx with r-th highest y in batch b
         drone_y_rank = drone_spawn_y.argsort(dim=1, descending=True)  # (B, D)
