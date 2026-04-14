@@ -609,12 +609,15 @@ class MARLMoveEnv(DirectMARLEnv):
 
         observations = {}
         for drone_idx, agent_name in enumerate(self.cfg.possible_agents):
-            # 1. Self State (15)
+            # 1. Self State (18): pos(3) + lin_vel(3) + rot_matrix(9) + ang_vel(3)
+            # ACCBR模式下 policy 输出 body rates 命令，必须能感知当前角速度才能有效控制姿态。
+            # 无角速度时 policy 看不到无人机正在高速旋转，无法及时给出反向修正命令。
             obs_self = torch.cat(
                 [
                     self.drone_positions[:, drone_idx],  # 3
                     self.drone_linear_velocities[:, drone_idx],  # 3
                     self.drone_rot_matrices[:, drone_idx].view(self.num_envs, -1),  # 9
+                    self.drone_angular_velocities[:, drone_idx],  # 3 — 新增：角速度，ACCBR必须
                 ],
                 dim=-1,
             )
