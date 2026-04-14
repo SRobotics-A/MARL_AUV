@@ -122,8 +122,11 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
-    # Run38: 0→0，高度吸引子是无人机悬停局部最优的根因，关闭后靠 fly_low+height_penalty 约束高度
-    height_reward_weight = 0.0
+    # Run38: 关闭(1.0→0)，当时 height_reward 远强于 dist_reward，创造悬停吸引子。
+    # Run42: 恢复 weak 值(0→0.3)，现在 dist_reward 量级≥10x height_reward，不再抢主导。
+    # 作用：在 fly_low(z<1.5m推上) 与 height_penalty(z>3.5m推下) 之间提供 z=2.5m 软锚点，
+    # 防止 safe zone(1.5-3.5m)内无梯度导致高度自由漂移，解决"横向追目标、纵向飘高"分裂。
+    height_reward_weight = 0.3
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 2.0  # Run41: 0.5→2.0，加强上方约束（配合fly_high终止）
