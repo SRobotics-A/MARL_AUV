@@ -39,7 +39,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 动作空间参数
     # Run39: 速度上限贴近小车速度(0.3m/s)，速度比从5:1降到2.7:1，减少超调
     lin_vel_max = 0.8   # m/s（Run39: 1.5→0.8，减少超调，小车0.3m/s，速度比2.7:1）
-    ang_vel_max = 1.0  # rad/s（Run43: 2.0→1.0，防止policy学习过激body rate命令导致后期翻滚）
+    ang_vel_max = 1.5  # rad/s（Run44: 1.0→1.5，恢复部分机动性；Run43: 2.0→1.0）
     # env
     decimation = 3
     episode_length_s = 60
@@ -141,7 +141,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     illegal_contact_penalty = 0.05
     fly_low_penalty = 50.0  # Run41: 8.0→50.0（配合新增* step_dt，维持物理量级：50*0.01=0.5/step）
     fly_high_termination_z = 5.5  # Run41: 新增，z>5.5m终止episode，防止高飞局部最优
-    tilt_termination_threshold = 0.5  # Run43: cos(60°)=0.5，任一无人机倾斜>60°即终止episode
+    tilt_termination_threshold = 0.17  # Run44: 0.5→0.17，cos(80°)≈0.17，只终止极端翻滚，允许正常机动倾斜（Run43: 0.5=60°过严，随机策略频繁触发终止，policy无法学到靠近行为）
 
     # action和observation配置
     if control_mode == "geometric":
