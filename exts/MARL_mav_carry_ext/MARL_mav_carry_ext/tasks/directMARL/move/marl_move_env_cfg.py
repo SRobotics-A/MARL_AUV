@@ -39,7 +39,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 动作空间参数
     # Run39: 速度上限贴近小车速度(0.3m/s)，速度比从5:1降到2.7:1，减少超调
     lin_vel_max = 0.8   # m/s（Run39: 1.5→0.8，减少超调，小车0.3m/s，速度比2.7:1）
-    ang_vel_max = 2.0  # rad/s（Run31: 3.0→2.0，配合姿态稳定）
+    ang_vel_max = 1.0  # rad/s（Run43: 2.0→1.0，防止policy学习过激body rate命令导致后期翻滚）
     # env
     decimation = 3
     episode_length_s = 60
@@ -117,8 +117,10 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     force_penalty_weight = 0.5
 
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
-    upright_penalty_weight = 0.5  # Run33: 2.0→0.5（Run21三次验证，gradient过载根因）
-    upright_penalty_threshold = 0.766  # Run33: cos(40°)，恢复baseline宽松值
+    # Run43: 0.5→3.0，后期翻滚根因：tracking_reward(+0.020/step) >> upright_penalty(-0.0015/step@45°)
+    # policy 合理化接受倾斜换取追踪奖励。3.0使45°倾斜代价=-0.009/step，约为tracking的45%，不再被忽略。
+    upright_penalty_weight = 3.0
+    upright_penalty_threshold = 0.766  # cos(40°)
     upright_expect_dir = (0.0, 0.0, 1.0)
 
     # Altitude Reward: w * exp(-|z - desired|) * step_dt
@@ -139,6 +141,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     illegal_contact_penalty = 0.05
     fly_low_penalty = 50.0  # Run41: 8.0→50.0（配合新增* step_dt，维持物理量级：50*0.01=0.5/step）
     fly_high_termination_z = 5.5  # Run41: 新增，z>5.5m终止episode，防止高飞局部最优
+    tilt_termination_threshold = 0.5  # Run43: cos(60°)=0.5，任一无人机倾斜>60°即终止episode
 
     # action和observation配置
     if control_mode == "geometric":

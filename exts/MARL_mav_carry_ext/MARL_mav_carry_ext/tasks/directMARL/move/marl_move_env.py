@@ -214,6 +214,9 @@ class MARLMoveEnv(DirectMARLEnv):
         self.falcon_fly_high = torch.zeros(  # Run41: 新增高飞终止缓冲
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.falcon_tilt = torch.zeros(  # Run43: 新增倾斜终止缓冲（tilt>60°）
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self.illegal_contact = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -943,6 +946,12 @@ class MARLMoveEnv(DirectMARLEnv):
         # 修复高飞局部最优：之前无 fly_high 终止，drone 可爬至 bbox=24m 才结束 episode
         self.falcon_fly_high = (self.drone_positions[:, :, 2] > self.cfg.fly_high_termination_z).any(dim=-1)
 
+        # 无人机倾斜过大（Run43: 新增 tilt 终止，z_body_z < threshold 即终止）
+        # 根因：tracking_reward >> upright_penalty，policy合理化接受倾斜换取追踪。
+        # >60°倾斜时推力主要水平，drone无法维持高度必然坠落，提前终止减少无效仿真步。
+        z_body_z = self.drone_rot_matrices[:, :, 2, 2]  # (N, D) cos(tilt_angle)
+        self.falcon_tilt = (z_body_z < self.cfg.tilt_termination_threshold).any(dim=-1)
+
         # 非法接触（per-drone contact sensor）
         self.illegal_contact = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
@@ -990,6 +999,7 @@ class MARLMoveEnv(DirectMARLEnv):
         terminations = (
             self.falcon_fly_low
             | self.falcon_fly_high  # Run41: 新增高飞终止
+            | self.falcon_tilt      # Run43: 新增倾斜终止（tilt>60°）
             # illegal_contact 仅作惩罚，不终止 episode（NovaCarter CollisionAPI 禁用失败的临时规避）
             | self.drone_collision
             | self.body_pos_outside
@@ -1010,6 +1020,11 @@ class MARLMoveEnv(DirectMARLEnv):
                 if self.falcon_fly_high[idx]:
                     reasons.append(
                         f"Fly High (z={self.drone_positions[idx, :, 2].max():.2f})"
+                    )
+                if self.falcon_tilt[idx]:
+                    z_bz = self.drone_rot_matrices[idx, :, 2, 2]
+                    reasons.append(
+                        f"Tilt (z_body_z_min={z_bz.min():.2f}, tilt={torch.acos(z_bz.clamp(-1,1).min()).item()*57.3:.1f}°)"
                     )
                 if self.illegal_contact[idx]:
                     reasons.append("Illegal Contact")
@@ -1132,6 +1147,9 @@ class MARLMoveEnv(DirectMARLEnv):
         ).item()
         self.extras["log"]["Episode_Termination/falcon_fly_high"] = torch.count_nonzero(
             self.falcon_fly_high[env_ids]
+        ).item()
+        self.extras["log"]["Episode_Termination/falcon_tilt"] = torch.count_nonzero(
+            self.falcon_tilt[env_ids]
         ).item()
         self.extras["log"]["Episode_Termination/crash"] = torch.count_nonzero(
             self.falcon_fly_low[env_ids] | self.illegal_contact[env_ids]
