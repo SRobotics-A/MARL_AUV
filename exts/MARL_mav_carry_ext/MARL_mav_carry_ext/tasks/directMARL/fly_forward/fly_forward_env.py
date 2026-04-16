@@ -315,19 +315,12 @@ class FlyForwardEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         n = len(env_ids)
-        x_off = (
-            torch.rand(n, device=self.device)
-            * (self.cfg.spawn_x_range[1] - self.cfg.spawn_x_range[0])
-            + self.cfg.spawn_x_range[0]
-        )
-        y_off = (
-            torch.rand(n, device=self.device)
-            * (self.cfg.spawn_y_range[1] - self.cfg.spawn_y_range[0])
-            + self.cfg.spawn_y_range[0]
-        )
+        # 固定起点 (spawn_x, spawn_y, spawn_z) + 小随机扰动（训练鲁棒性）
+        x_noise = (torch.rand(n, device=self.device) * 2.0 - 1.0) * self.cfg.spawn_x_noise
+        y_noise = (torch.rand(n, device=self.device) * 2.0 - 1.0) * self.cfg.spawn_y_noise
         spawn_pos = self.scene.env_origins[env_ids].clone()
-        spawn_pos[:, 0] += x_off
-        spawn_pos[:, 1] += y_off
+        spawn_pos[:, 0] += self.cfg.spawn_x + x_noise
+        spawn_pos[:, 1] += self.cfg.spawn_y + y_noise
         spawn_pos[:, 2] = self.cfg.spawn_z
 
         root_state = self._robot.data.default_root_state[env_ids].clone()
@@ -352,5 +345,5 @@ class FlyForwardEnv(DirectRLEnv):
         self._forces[env_ids] = 0.0
         self._moments[env_ids] = 0.0
 
-        # Reset prev_x to spawn position
-        self._prev_x[env_ids] = x_off  # local x offset from env_origin
+        # Reset prev_x to actual spawn local-x
+        self._prev_x[env_ids] = self.cfg.spawn_x + x_noise

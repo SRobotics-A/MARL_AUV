@@ -47,15 +47,17 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     goal_tolerance: float = 10.0  # success radius (m)
 
     # ── Spawn ─────────────────────────────────────────────────────────────────
-    spawn_x_range: tuple = (-1.0, 1.0)   # small random offset at reset
-    spawn_y_range: tuple = (-1.0, 1.0)
-    spawn_z: float = 2.0
+    spawn_x: float = -8.0       # 固定起点 x（相对 env_origin）
+    spawn_y: float = 3.0        # 固定起点 y
+    spawn_z: float = 2.0        # 固定起点 z
+    spawn_x_noise: float = 0.5  # 训练时小随机扰动
+    spawn_y_noise: float = 0.5
 
     # ── Altitude limits ───────────────────────────────────────────────────────
     fly_high_z: float = 4.0    # terminate if z > 4m
     fly_low_z: float = 0.3     # terminate if z < 0.3m
-    out_of_bounds_y: float = 20.0  # terminate if |y| > 20m
-    out_of_bounds_x_min: float = -5.0  # terminate if x < -5m (moved backward)
+    out_of_bounds_y: float = 25.0  # terminate if |y - spawn_y| > 25m
+    out_of_bounds_x_min: float = -15.0  # terminate if x < -15m (moved too far back)
 
     # ── Normalisation ─────────────────────────────────────────────────────────
     norm_pos_scale: float = 250.0
@@ -113,7 +115,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot",
     ).replace(
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 2.0),   # start at (0, 0, 2) relative to env origin
+            pos=(-8.0, 3.0, 2.0),  # start at (-8, 3, 2) relative to env origin
             rot=(1.0, 0.0, 0.0, 0.0),
             joint_pos={".*": 0.0},
             joint_vel={
