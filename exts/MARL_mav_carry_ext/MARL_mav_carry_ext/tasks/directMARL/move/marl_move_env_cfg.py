@@ -39,7 +39,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # 动作空间参数
     # Run39: 速度上限贴近小车速度(0.3m/s)，速度比从5:1降到2.7:1，减少超调
     lin_vel_max = 0.8   # m/s（Run39: 1.5→0.8，减少超调，小车0.3m/s，速度比2.7:1）
-    ang_vel_max = 1.5  # rad/s（Run44: 1.0→1.5，恢复部分机动性；Run43: 2.0→1.0）
+    ang_vel_max = 1.2  # rad/s（Run44+: 1.5→1.2，放宽后tilt率反升42%，略收紧；Run44: 1.0→1.5）
     # env
     decimation = 3
     episode_length_s = 60
@@ -119,7 +119,8 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     # Upright Penalty: w * (z_dot - 1) * step_dt — 防止翻滚
     # Run43: 0.5→3.0，后期翻滚根因：tracking_reward(+0.020/step) >> upright_penalty(-0.0015/step@45°)
     # policy 合理化接受倾斜换取追踪奖励。3.0使45°倾斜代价=-0.009/step，约为tracking的45%，不再被忽略。
-    upright_penalty_weight = 3.0
+    # Run44+: 3.0→5.0，实测ep_sum≈-0.1极低，cos梯度平坦，30~60°范围几乎无惩罚，需加强
+    upright_penalty_weight = 5.0
     upright_penalty_threshold = 0.766  # cos(40°)
     upright_expect_dir = (0.0, 0.0, 1.0)
 
@@ -132,7 +133,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     desired_height = 2.5
     # Height Penalty (New: Strict constraint)
     height_penalty_weight = 2.0  # Run41: 0.5→2.0，加强上方约束（配合fly_high终止）
-    height_penalty_threshold = 1.0  # Run36: 2.0→1.0，z>3.5m即触发（对称fly_low软惩罚）
+    height_penalty_threshold = 0.5  # Run44+: 1.0→0.5，z>2.5m即软惩罚，梯度更连续（Run36: 2.0→1.0）
 
     # Penalties — 固定惩罚，不乘 step_dt
     drone_out_of_bounds_penalty = 1.0
@@ -140,7 +141,7 @@ class MARLMoveEnvCfg(DirectMARLEnvCfg):
     collision_penalty_scale = 2.0
     illegal_contact_penalty = 0.05
     fly_low_penalty = 50.0  # Run41: 8.0→50.0（配合新增* step_dt，维持物理量级：50*0.01=0.5/step）
-    fly_high_termination_z = 5.5  # Run41: 新增，z>5.5m终止episode，防止高飞局部最优
+    fly_high_termination_z = 4.5  # Run44+: 5.5→4.5，压低上限让高度负反馈更快触发（Run41: 新增5.5）
     tilt_termination_threshold = 0.17  # Run44: 0.5→0.17，cos(80°)≈0.17，只终止极端翻滚，允许正常机动倾斜（Run43: 0.5=60°过严，随机策略频繁触发终止，policy无法学到靠近行为）
 
     # action和observation配置
