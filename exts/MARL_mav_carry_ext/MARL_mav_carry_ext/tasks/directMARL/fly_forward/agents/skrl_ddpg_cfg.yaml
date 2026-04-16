@@ -7,11 +7,7 @@ seed: 42
 # DDPG needs 4 model roles: policy, target_policy, critic, target_critic
 # All are DeterministicMixin (deterministic output)
 models:
-  separate: True    # one model per role
-  CTDE: False
-  separate_actors: False
-  separate_critics: False
-  local_critics: False
+  separate: True    # one model per role (CTDE/separate_actors/critics not needed for single-agent)
 
   policy:           # actor: obs → action
     class: DeterministicMixin
