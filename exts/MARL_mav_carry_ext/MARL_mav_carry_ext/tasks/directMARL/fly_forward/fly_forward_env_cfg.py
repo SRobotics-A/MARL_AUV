@@ -110,7 +110,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # robot: single Falcon, spawned by Isaac Lab into each env
     robot: ArticulationCfg = FALCON_CFG.replace(
-        prim_path="{ENV_REGEX_NS}/Robot",
+        prim_path="/World/envs/env_.*/Robot",
     ).replace(
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 2.0),   # start at (0, 0, 2) relative to env origin
