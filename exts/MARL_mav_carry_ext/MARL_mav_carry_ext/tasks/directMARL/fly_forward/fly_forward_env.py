@@ -101,6 +101,10 @@ class FlyForwardEnv(DirectRLEnv):
         self.scene.clone_environments(copy_from_source=False)
         self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
+        # Rivermark 室外场景（仅在 env_0 下加载，供可视化；碰撞由 terrain 地平面保证）
+        scene_cfg = sim_utils.UsdFileCfg(usd_path=self.cfg.scene_usd_path)
+        sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
+
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 

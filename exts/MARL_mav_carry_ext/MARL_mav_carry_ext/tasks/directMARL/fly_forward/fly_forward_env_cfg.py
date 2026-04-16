@@ -130,6 +130,13 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
         num_envs=16, env_spacing=220.0, replicate_physics=True
     )
 
+    # ── Scene USD ─────────────────────────────────────────────────────────────
+    # Rivermark 室外场景 USD（仅在 env_0 生成，供可视化使用）
+    scene_usd_path: str = (
+        "/media/xtj/1CC8D044C8D01DB8/RL-download/isaac-sim/v5.1.0/Assets/Isaac/5.1/"
+        "Isaac/Environments/Outdoor/Rivermark/rivermark.usd"
+    )
+
     # ── Low-level control ─────────────────────────────────────────────────────
     low_level_decimation: int = 1
     max_thrust_pp: float = 6.25  # N per rotor
