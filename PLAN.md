@@ -11578,3 +11578,176 @@ python3 scripts/skrl/train.py --task=Isaac-move-marl-v0 --headless --num_envs=20
 ### Changelog（Run 40）
 - 2026-04-13: Run 40 分析（Isaac-move-marl-v0，3 Falcon + 4 NovaCarter）。核心发现：(1) fly_low 公式缺少 step_dt，导致其 per-step 强度是 height_penalty 的 1600 倍、distance_reward 的 130~400 倍，是高飞根因；(2) 三架无人机朝不同方向 = 正常目标分配行为，非策略分歧；(3) progress_reward 因 3D 距离包含 z 分量，在高飞状态下方向反转，ep_sum ≈ −12；(4) move env 缺少 fly_high 终止条件（bounding_box 24m 兜底），ep_len 仅 182 步；(5) 推算隐含均高 ~8.5m。Run 41 三项关键修复：fly_low 添加 step_dt + penalty→50，添加 fly_high_termination(5.5m)，height_penalty_weight 0.5→2.0。
 
+---
+
+## Run43 训练分析报告
+
+**Run：** 2026-04-15_21-47-11_mappo_torch_mappo
+**日期：** 2026-04-16
+**任务：** Isaac-move-marl-v0（3 Falcon + 4 NovaCarter）
+**算法：** MAPPO
+**实际运行配置（来自 env.yaml）：**
+
+| 参数 | 实际值 | 用户描述值 | 备注 |
+|------|--------|-----------|------|
+| `upright_penalty_weight` | 3.0 | 3.0 | 一致 |
+| `ang_vel_max` | **1.5** | 1.0 | **不一致：Run44修复已预合并** |
+| `tilt_termination_threshold` | **0.17** | 0.5 | **不一致：Run44修复已预合并** |
+| `fly_high_termination_z` | 5.5 | — | Run41引入，继承 |
+
+**重要发现：** 本次日志实际运行的是 `tilt=0.17`、`ang_vel=1.5`，即 **Run44 的修复已经被包含在 Run43 的实际训练中**。前一个 run（2026-04-15_11-51-41）才是 `tilt=0.5`、`ang=1.0` 的"真正 Run43"。以下分析以实际 env.yaml 参数为准。
+
+---
+
+### 训练指标摘要
+
+| 指标 | 早期均值 | 近期均值（last 20） | 最终值 |
+|------|---------|------------------|--------|
+| Total reward (mean) | 6.54 | 7.19 | 7.05 |
+| distance_reward | 3.38 | 2.96 | 2.49 |
+| tracking_reward | 0.0 | 0.0 | 0.0 |
+| upright_penalty | −0.041 | −0.093 | −0.070 |
+| height_penalty | −1.42 | −0.92 | −0.32 |
+| ts_mean（episode steps） | 71 | 65 | 62 |
+| falcon_tilt 终止率 | 0.0 | 0.42 | 0.75 |
+| falcon_fly_high 终止率 | 0.96 | 0.58 | 0.25 |
+| value_loss | 0.028 | 0.010 | 0.057 |
+| policy_std | 0.785 | 0.524 | 0.501 |
+
+**与前一 run（2026-04-15_11-51-41，tilt=0.5，ang=1.0）对比：**
+
+| 指标 | 前一 run | 本 run（tilt=0.17） | 变化 |
+|------|---------|-------------------|------|
+| tilt 终止率 | 0.34 | 0.42 | +0.08（更高）|
+| fly_high 终止率 | 0.79 | 0.58 | −0.21（改善）|
+| ts_mean | 69.1 | 65.3 | −3.8（略短）|
+| distance_reward | 3.33 | 2.96 | −0.37（退步）|
+| total_reward | 6.70 | 7.12 | +0.42（总奖励略升）|
+| upright_penalty | −0.12 | −0.093 | 改善（惩罚减小）|
+
+---
+
+### 发现与诊断
+
+#### 发现 1 — tilt_termination 从 step 80900 起大量触发，episode 截短 23% — CRITICAL
+
+**症状：** tilt 终止率从前 80k 步的 0.0 突然跳至 0.8+，并在整个后续训练中持续在 0~1.0 震荡（均值 0.42）。高 tilt 状态下 ts_mean=57.7，低 tilt 状态下 ts_mean=71.3，差距 13.6 步（约 23%）。
+
+**根本原因分析：**
+
+- 训练初期（0~80k 步），策略由于 `upright_penalty_weight=3.0` 的强约束，不会产生大倾斜。但随着 `fly_high_termination` 开始频繁截断 episode（从 step 1 就有 96% 的 fly_high 终止率），策略缺少足够的飞行时间学习定高，逐渐开始产生激进的 body rate 命令，倾斜角超过 `tilt_termination_threshold=0.17`（cos80°≈0.17，即倾斜超过 80° 触发）。
+
+- 关键矛盾：`tilt=0.17` 理论上只终止极端倾斜（>80°），但实际触发率高达 40%+ 说明策略**确实在产生极端倾斜动作**，而非阈值过严。这与 `ang_vel_max=1.5` 放宽、`upright_penalty` 虽然权重 3.0 但实际 ep_sum 仅 −0.07 至 −0.19 偏低相符——策略似乎在绕过 upright 惩罚同时仍产生翻滚。
+
+**证据：**
+- step 80900 开始突变：前无 tilt 触发，突变后连续多步 tilt=1.0
+- ts_min 在 tilt>0.7 时均值 54.5 vs tilt<0.1 时 70.2
+- upright_penalty ep_sum 近期 −0.093，换算每步 −0.093/65 ≈ −0.0014，惩罚过轻
+
+#### 发现 2 — fly_high 终止率从 96% 降至 58%，但仍是主要终止原因 — HIGH
+
+**症状：** 整个训练过程以 `fly_high_termination`（z>5.5m）和 `falcon_tilt` 为主要终止来源，两者之和约等于 1.0，说明**几乎没有 episode 因 timeout 正常结束**。
+
+**根本原因：** 无人机在 fly_high 和 tilt 之间交替：当策略学会降低高度时开始产生激进机动导致 tilt 触发；当策略缓解 tilt 时又爬高触发 fly_high。两者呈此消彼长的动态竞争（见时间线：fly_high=1.0 与 tilt=1.0 交替出现）。
+
+**证据：** 任意时刻 `falcon_fly_high + falcon_tilt ≈ 1.0`，time_out 终止率持续 0.0
+
+#### 发现 3 — tracking_reward 全程为 0，dist_progress 全程为 0 — HIGH
+
+**症状：** 400k 步训练后 tracking_reward 和 dist_progress 仍为 0，无人机从未进入 tracking zone。
+
+**根本原因：** episode 被 fly_high + tilt 截断（ts_mean=65 步≈0.65s），无人机没有足够时间接近目标。实际有效飞行时长远不足以完成从初始位置到目标的接近过程。
+
+#### 发现 4 — policy_std 后期下降至 0.50，探索能力萎缩 — MEDIUM
+
+**症状：** policy_std 从早期 0.785 单调下降至 0.500，后期甚至在 step 319300~385800 区间出现 0.000（疑似 tensorboard 记录间歇中断，非真实收敛到 0）。value_loss 稳定在 0.005~0.057，结构健康。
+
+**根本原因：** 策略陷入局部稳定状态（fly_high 和 tilt 之间的博弈均衡），无法探索出接近目标的新行为。distance_reward 近期均值 2.96 低于早期 3.38，说明策略在主动退步。
+
+#### 发现 5 — upright_penalty 强度（3.0）与实际 ep_sum（−0.07~−0.19）不匹配 — MEDIUM
+
+**症状：** upright_penalty_weight=3.0（Run42 时的 6× 加强），但 ep_sum 仅 −0.07~−0.19，换算 per-step ≈ −0.001~−0.003，极低。若 upright_penalty 真正起作用，不应允许 tilt>80° 触发。
+
+**根本原因推断：** upright_penalty 的计算可能基于 cos(tilt)，当 tilt 未超过某阈值时惩罚值接近 0（cos 函数在接近水平时梯度平坦），导致 upright_penalty 对中等倾斜（20°~60°）几乎无约束力，只有极端倾斜（>80°）才被终止条件捕获——但已晚。
+
+---
+
+### 改进建议
+
+#### Priority 1（HIGH）：增强 upright_penalty 对中等倾斜角的梯度
+
+**问题：** cos 函数在小倾斜角时梯度平坦，upright_penalty 实际约束力远弱于 weight=3.0 暗示的程度，策略可以维持 30~70° 倾斜而几乎无惩罚。
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env.py`
+- 将 upright_penalty 从线性 cos 改为二次型或指数型，对倾斜角超过 30° 后快速增大：
+  ```python
+  # 建议：upright_err = 1 - cos(tilt)，二次惩罚
+  upright_pen = (1.0 - cos_tilt).pow(2) * cfg.upright_penalty_weight
+  ```
+- 或提高 `upright_penalty_weight`：3.0 → **5.0**，并验证 ep_sum 是否达到 −0.5 以上
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `upright_penalty_weight`：3.0 → **5.0**
+
+**预期效果：** upright ep_sum 从 −0.1 升至 −0.5+，使策略在正常机动范围（<45°）内产生足够的保持水平的梯度
+
+#### Priority 2（HIGH）：降低 fly_high_termination_z，或增加 height_penalty 强度消除飞高吸引子
+
+**问题：** 5.5m 的 fly_high 终止过高，在 height_penalty（threshold=1.0m，即 z>3.0m 才触发，penalty_weight=2.0）生效前无人机已接近 fly_high 区域。推算：fly_high 触发率 58% 说明均高仍在 4~5m 区间。
+
+**建议修改：**
+- 文件：`exts/MARL_mav_carry_ext/MARL_mav_carry_ext/tasks/directMARL/move/marl_move_env_cfg.py`
+- `fly_high_termination_z`：5.5 → **4.5**（压缩容忍空间，使 fly_high 终止更快触发负向反馈）
+- `height_penalty_threshold`：1.0 → **0.5**（z>2.5m 即开始软惩罚，而非 3.0m）
+- **或** `height_penalty_weight`：2.0 → **3.0**
+
+**注意：** 修改前确认 height_penalty 的 ep_sum 变化，避免过度惩罚使无人机贴地飞行触发 fly_low
+
+#### Priority 3（MEDIUM）：解耦 fly_high 和 tilt 竞争，允许策略有更长 episode 学习接近行为
+
+**问题：** fly_high（平均 58%）+ tilt（平均 42%）= 100%，timeout=0%。策略完全没有 timeout 结束的 episode，无法积累足够的距离奖励梯度来学习接近。
+
+**建议：** 在 fly_high 大量触发阶段，优先解决高度问题（Priority 2），让 timeout 比例从 0% 提升至 30%+，才能给 distance_reward 足够的梯度信号。不建议单独调整 tilt 参数，因为 tilt=0.17 已经是相对合理的极端翻滚阈值。
+
+#### Priority 4（LOW）：考虑对 ang_vel_max 做课程式限制
+
+**问题：** `ang_vel_max=1.5` 相比 Run43 计划的 1.0 放宽，但当前 tilt 触发率反而高于前一 run（0.42 vs 0.34）。
+
+**建议：** 暂时将 `ang_vel_max` 回调至 1.2，或采用课程式设计（前 200k 步限制为 0.8，后逐步放宽），避免在学习早期就允许激进机动。
+
+---
+
+### 实验方案（Run44 实际建议）
+
+**注意：** env.yaml 显示 Run44 修复（tilt=0.17，ang=1.5）已在本次 run 中生效。Run44 应在此基础上叠加以下改动：
+
+| 参数 | 本次 run（已运行） | Run44 建议 |
+|------|-----------------|-----------|
+| `upright_penalty_weight` | 3.0 | **5.0**（加强中等倾斜梯度）|
+| `fly_high_termination_z` | 5.5 | **4.5**（降低上限，更快触发负反馈）|
+| `height_penalty_threshold` | 1.0 | **0.5**（z>2.5m 即惩罚）|
+| `ang_vel_max` | 1.5 | **1.2**（略收紧，减少激进机动）|
+| `tilt_termination_threshold` | 0.17 | 0.17（保持）|
+
+**训练命令：**
+```bash
+python3 scripts/skrl/train.py --task=Isaac-move-marl-v0 --headless --num_envs=2048 --algorithm="MAPPO"
+```
+
+**100k 步中止标准：**
+- tilt 终止率 > 60%（upright 惩罚仍不足，考虑继续加强）
+- fly_high 终止率仍 > 70%（height 修改不够，检查 fly_high_termination_z 是否生效）
+- distance_reward < 2.0（惩罚过强截断 episode，回滚 height_penalty_threshold）
+
+**300k 步成功标准：**
+- timeout 终止率 > 20%（episode 能正常结束，策略有足够时间接近目标）
+- distance_reward recent_mean > 4.0
+- fly_high 终止率 < 30%
+- tilt 终止率 < 20%
+- tracking_reward recent_mean > 0.1（无人机开始进入 tracking zone）
+
+---
+
+### Changelog（Run43）
+- 2026-04-16: Run43 分析（2026-04-15_21-47-11，Isaac-move-marl-v0）。关键发现：(1) 实际运行的 env.yaml 已包含 Run44 修复（tilt=0.17，ang=1.5），前一 run（2026-04-15_11-51-41）才是 tilt=0.5 的"真正 Run43"；(2) tilt 终止从 step 80900 突然爆发，达 40%+ 均值，飞行截短 23%；(3) fly_high（58%）+ tilt（42%）= 100%，timeout=0%，策略陷入双终止竞争，tracking_reward 全程 0；(4) upright_penalty ep_sum 仅 −0.07~−0.19，per-step 约 −0.001，惩罚实际太弱无法约束中等倾斜（30~60°）；(5) policy_std 单调下降至 0.50，探索能力萎缩。Run44 核心建议：upright_penalty_weight 3.0→5.0，fly_high_termination_z 5.5→4.5，height_penalty_threshold 1.0→0.5，ang_vel_max 1.5→1.2。
+
