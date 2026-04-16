@@ -1,16 +1,18 @@
 """Configuration for the single-drone fly-forward task (DDPG).
 
-Task: Fly 200m in the +x direction from the start position.
+Task: Fly 200m in the +x direction from (-8, 3, 2).
       Altitude must stay below 4m.
+Scene: fly_forward.usda (Rivermark outdoor + single Falcon drone).
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
-from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 
 import isaaclab.sim as sim_utils
@@ -24,15 +26,15 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Control ──────────────────────────────────────────────────────────────
     control_mode: str = "ACCBR"  # 6-dim: [vx,vy,vz,roll_rate,pitch_rate,yaw_rate]
-    lin_vel_max: float = 3.0     # m/s — faster than move task (need to cover 200m)
+    lin_vel_max: float = 3.0     # m/s
     ang_vel_max: float = 1.2     # rad/s
-    lin_acc_max: float = 3.0     # m/s² clamp on commanded acc
-    vel_Kp: float = 2.0          # velocity PD — proportional gain
-    vel_Kd: float = 0.3          # velocity PD — derivative gain
+    lin_acc_max: float = 3.0     # m/s²
+    vel_Kp: float = 2.0
+    vel_Kd: float = 0.3
 
     # ── Episode ───────────────────────────────────────────────────────────────
     decimation: int = 3
-    episode_length_s: float = 120.0  # 200m / 3m/s = 67s min; give 120s budget
+    episode_length_s: float = 120.0
 
     # ── Spaces ────────────────────────────────────────────────────────────────
     # obs: pos(3) + lin_vel(3) + rot_mat(9) + ang_vel(3) + goal_rel(3) = 21
@@ -41,90 +43,54 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     state_space: int = 0
 
     # ── Goal ──────────────────────────────────────────────────────────────────
-    goal_x: float = 200.0        # +x travel distance (m)
+    goal_x: float = 200.0
     goal_y: float = 0.0
-    goal_z: float = 2.0          # desired cruise altitude (m)
+    goal_z: float = 2.0
     goal_tolerance: float = 10.0  # success radius (m)
 
     # ── Spawn ─────────────────────────────────────────────────────────────────
-    spawn_x: float = -8.0       # 固定起点 x（相对 env_origin）
-    spawn_y: float = 3.0        # 固定起点 y
-    spawn_z: float = 2.0        # 固定起点 z
-    spawn_x_noise: float = 0.5  # 训练时小随机扰动
+    spawn_x: float = -8.0        # 固定起点 x（与 USDA 一致）
+    spawn_y: float = 3.0         # 固定起点 y（与 USDA 一致）
+    spawn_z: float = 2.0         # 固定起点 z（与 USDA 一致）
+    spawn_x_noise: float = 0.5   # 随机扰动（训练鲁棒性）
     spawn_y_noise: float = 0.5
 
     # ── Altitude limits ───────────────────────────────────────────────────────
-    fly_high_z: float = 4.0    # terminate if z > 4m
-    fly_low_z: float = 0.3     # terminate if z < 0.3m
-    out_of_bounds_y: float = 25.0  # terminate if |y - spawn_y| > 25m
-    out_of_bounds_x_min: float = -15.0  # terminate if x < -15m (moved too far back)
+    fly_high_z: float = 4.0
+    fly_low_z: float = 0.3
+    out_of_bounds_y: float = 25.0
+    out_of_bounds_x_min: float = -15.0
 
     # ── Normalisation ─────────────────────────────────────────────────────────
     norm_pos_scale: float = 250.0
     norm_vel_scale: float = 5.0
 
     # ── Reward weights ────────────────────────────────────────────────────────
-    # Progress: reward for moving in +x direction each step
     progress_reward_weight: float = 5.0
-
-    # Distance to goal (exponential decay)
     dist_reward_weight: float = 2.0
-    dist_reward_scale: float = 0.01   # exp(-dist * scale); scale=0.01 → exp(-2)@200m
-
-    # Height anchor: exp(-|z - goal_z|) * step_dt
+    dist_reward_scale: float = 0.01
     height_reward_weight: float = 0.5
-
-    # Upright: -(1 - z_body_z) * step_dt
     upright_penalty_weight: float = 3.0
-
-    # Action smoothness: exp(-||Δa||²) * step_dt
     action_smoothness_weight: float = 0.5
-
-    # Success: sparse reward on reaching goal
     success_reward: float = 200.0
-
-    # Crash penalties (fixed, not × step_dt)
     fly_high_penalty: float = 10.0
     fly_low_penalty: float = 10.0
     out_of_bounds_penalty: float = 10.0
 
     # ── Simulation ────────────────────────────────────────────────────────────
     sim: SimulationCfg = SimulationCfg(
-        dt=0.0033333333333333335,  # 300 Hz physics
+        dt=0.0033333333333333335,
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.8066),
     )
 
-    # ground plane
-    terrain: TerrainImporterCfg = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
-            restitution=0.0,
-        ),
-        debug_vis=False,
-    )
+    # ── Scene USD（fly_forward.usda 包含 Rivermark + Falcon）─────────────────
+    # 路径在 _setup_scene 中通过 Path(__file__) 动态解析，无需在此硬编码
 
-    # robot: single Falcon, spawned by Isaac Lab into each env
-    robot: ArticulationCfg = FALCON_CFG.replace(
-        prim_path="/World/envs/env_.*/Robot",
-    ).replace(
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(-8.0, 3.0, 2.0),  # start at (-8, 3, 2) relative to env origin
-            rot=(1.0, 0.0, 0.0, 0.0),
-            joint_pos={".*": 0.0},
-            joint_vel={
-                "Falcon_rotor_0_joint": 0.0,
-                "Falcon_rotor_1_joint": 0.0,
-                "Falcon_rotor_2_joint": 0.0,
-                "Falcon_rotor_3_joint": 0.0,
-            },
-        )
+    # ── Robot cfg（spawn=None 模式，prim 由 USDA 定义）────────────────────────
+    # prim_path 在 _setup_scene 中通过 resolve_prim 动态填充，此处仅作占位
+    robot_cfg: ArticulationCfg = FALCON_CFG.replace(
+        prim_path="/World/envs/env_.*/falcon",  # 对应 USDA 中 "falcon" prim
     )
 
     # scene — large env_spacing in x so 200m flights don't cross into other envs
@@ -132,12 +98,8 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
         num_envs=16, env_spacing=220.0, replicate_physics=True
     )
 
-    # ── Scene USD ─────────────────────────────────────────────────────────────
-    # Rivermark 室外场景 USD（仅在 env_0 生成，供可视化使用）
-    scene_usd_path: str = (
-        "/media/xtj/1CC8D044C8D01DB8/RL-download/isaac-sim/v5.1.0/Assets/Isaac/5.1/"
-        "Isaac/Environments/Outdoor/Rivermark/rivermark.usd"
-    )
+    # ── Collision contact threshold ───────────────────────────────────────────
+    contact_sensor_threshold: float = 50.0
 
     # ── Low-level control ─────────────────────────────────────────────────────
     low_level_decimation: int = 1

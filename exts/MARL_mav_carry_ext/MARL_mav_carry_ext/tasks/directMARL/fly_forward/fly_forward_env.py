@@ -7,13 +7,16 @@ Control: ACCBR (velocity command + body-rate command, 6-dim continuous action).
 from __future__ import annotations
 
 import torch
+from pathlib import Path
 
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
 
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
+from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import matrix_from_quat
 
 from .fly_forward_env_cfg import FlyForwardEnvCfg
@@ -91,20 +94,67 @@ class FlyForwardEnv(DirectRLEnv):
     # ── Scene setup ──────────────────────────────────────────────────────────
 
     def _setup_scene(self):
-        self._robot = Articulation(self.cfg.robot)
-        self.scene.articulations["robot"] = self._robot
+        """从 fly_forward.usda 加载完整场景（Rivermark 背景 + Falcon 无人机）。
 
-        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
-        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
-        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        步骤：
+          1. 加载地面平面（物理碰撞）
+          2. spawn_from_usd → clone_environments（USD 场景复制到所有并行 env）
+          3. 解析 env_0 中的 falcon prim → 绑定 Articulation（spawn=None）
+          4. 添加补充光照
+        """
+        # ── 1. 地面平面（物理碰撞） ───────────────────────────────────────────
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
-
-        # Rivermark 室外场景（仅在 env_0 下加载，供可视化；碰撞由 terrain 地平面保证）
-        scene_cfg = sim_utils.UsdFileCfg(usd_path=self.cfg.scene_usd_path)
+        # ── 2. 加载 fly_forward.usda 场景 ────────────────────────────────────
+        scene_usd_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets/data/AMR/fly_forward/fly_forward.usda"
+        )
+        scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
         sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
 
+        # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
+        self.scene.clone_environments(copy_from_source=False)
+
+        # ── 4. 定位 env_0 中的 falcon prim ───────────────────────────────────
+        env_root_base = "/World/envs/env_0"
+        env_root = f"{env_root_base}/World" if prim_utils.is_prim_path_valid(f"{env_root_base}/World") else env_root_base
+
+        # 依次尝试常见候选路径
+        falcon_env0 = None
+        for candidate in [
+            f"{env_root}/falcon",
+            f"{env_root}/falcon/Robot",
+            f"{env_root}/falcon/Falcon",
+            f"{env_root_base}/falcon",
+        ]:
+            if prim_utils.is_prim_path_valid(candidate):
+                falcon_env0 = candidate
+                break
+
+        if falcon_env0 is None:
+            # 回退：在 env_0 下全局搜索名为 "falcon" 的 prim
+            prims = sim_utils.get_all_matching_child_prims(
+                env_root, predicate=lambda p: p.GetName() == "falcon"
+            )
+            if prims:
+                falcon_env0 = prims[0].GetPath().pathString
+            else:
+                raise RuntimeError(
+                    f"Could not find 'falcon' prim under {env_root}. "
+                    "Please check fly_forward.usda."
+                )
+
+        # 从 env_0 路径推导通配符路径（供 Articulation 使用）
+        env_prim_pattern = falcon_env0.replace(env_root_base, "/World/envs/env_.*", 1)
+
+        # ── 5. 绑定 Articulation（spawn=None，使用 USDA 中已有的 prim） ───────
+        robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_prim_pattern)
+        robot_cfg.spawn = None
+        self._robot = Articulation(robot_cfg)
+        self.scene.articulations["robot"] = self._robot
+
+        # ── 6. 补充环境光照 ───────────────────────────────────────────────────
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
