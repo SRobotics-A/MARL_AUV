@@ -1,0 +1,110 @@
+# DDPG configuration for the single-drone fly-forward task
+# obs_dim=21, action_dim=6 (ACCBR: vx,vy,vz,roll_rate,pitch_rate,yaw_rate)
+
+seed: 42
+
+# ── Models ────────────────────────────────────────────────────────────────────
+# DDPG needs 4 model roles: policy, target_policy, critic, target_critic
+# All are DeterministicMixin (deterministic output)
+models:
+  separate: True    # one model per role
+  CTDE: False
+  separate_actors: False
+  separate_critics: False
+  local_critics: False
+
+  policy:           # actor: obs → action
+    class: DeterministicMixin
+    clip_actions: True
+    network:
+      - name: net
+        input: STATES
+        layers: [256, 256, 128]
+        activations: relu
+    output: ACTIONS
+
+  target_policy:    # target actor (same architecture, soft-updated)
+    class: DeterministicMixin
+    clip_actions: True
+    network:
+      - name: net
+        input: STATES
+        layers: [256, 256, 128]
+        activations: relu
+    output: ACTIONS
+
+  critic:           # Q-network: (obs, action) → scalar Q-value
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES_ACTIONS      # concatenates obs and taken_actions
+        layers: [256, 256, 128]
+        activations: relu
+    output: ONE
+
+  target_critic:    # target Q-network (same architecture, soft-updated)
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES_ACTIONS
+        layers: [256, 256, 128]
+        activations: relu
+    output: ONE
+
+
+# ── Replay buffer ─────────────────────────────────────────────────────────────
+memory:
+  class: RandomMemory
+  memory_size: 100000   # experience replay buffer size
+
+
+# ── DDPG agent ────────────────────────────────────────────────────────────────
+# https://skrl.readthedocs.io/en/latest/api/agents/ddpg.html
+agent:
+  class: DDPG
+  gradient_steps: 1
+  batch_size: 256
+
+  discount_factor: 0.99
+  polyak: 0.005           # soft target-network update rate (tau)
+
+  actor_learning_rate: 1.0e-4
+  critic_learning_rate: 1.0e-4
+  learning_rate_scheduler: null
+  learning_rate_scheduler_kwargs: {}
+
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null   # size filled in by Runner
+
+  random_timesteps: 1000    # pure random exploration at start
+  learning_starts: 1000     # start updating after filling buffer
+
+  grad_norm_clip: 1.0
+
+  # Ornstein-Uhlenbeck exploration noise (better for continuous control than Gaussian)
+  exploration:
+    noise: OrnsteinUhlenbeckNoise
+    noise_kwargs:
+      theta: 0.15
+      sigma: 0.2
+      base_scale: 1.0
+    initial_scale: 1.0
+    final_scale: 0.05
+    timesteps: 300000   # decay noise over 300k steps
+
+  rewards_shaper_scale: 1.0
+
+  experiment:
+    directory: "fly_forward"
+    experiment_name: ""
+    write_interval: 200
+    checkpoint_interval: 10000
+
+
+# ── Sequential trainer ────────────────────────────────────────────────────────
+trainer:
+  class: SequentialTrainer
+  timesteps: 500000
+  environment_info: log

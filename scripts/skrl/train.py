@@ -71,7 +71,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["PPO", "IPPO", "MAPPO"],
+    choices=["PPO", "IPPO", "MAPPO", "DDPG", "SAC", "TD3"],
     help="用于训练 skrl 代理的 RL 算法。"
 )
 
