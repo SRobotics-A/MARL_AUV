@@ -7,13 +7,11 @@ Control: ACCBR (velocity command + body-rate command, 6-dim continuous action).
 from __future__ import annotations
 
 import torch
-from pathlib import Path
 
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
 
 import isaaclab.sim as sim_utils
-import isaacsim.core.utils.prims as prim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
@@ -94,83 +92,23 @@ class FlyForwardEnv(DirectRLEnv):
     # ── Scene setup ──────────────────────────────────────────────────────────
 
     def _setup_scene(self):
-        """场景初始化：falcon USDA → clone → Rivermark(env_0 only) → Articulation。
+        """标准 DirectRLEnv 场景初始化：ground → robot(spawn=True) → clone。
 
-        步骤：
-          1. 加载地面平面（物理碰撞）
-          2. spawn_from_usd(fly_forward.usda) — 只含 Falcon，不含 Rivermark
-          3. clone_environments（只复制轻量的 Falcon 到所有 env）
-          4. 解析 env_0 中的 falcon prim → 绑定 Articulation（spawn=None）
-          5. clone 之后再把 Rivermark 加载到 env_0（纯视觉，不参与物理，不被 clone）
-          6. 添加补充光照
+        使用 FALCON_CFG 内置的 spawn=UsdFileCfg 模式，在 clone 之前注册 Articulation，
+        与 Isaac Lab 标准 DirectRLEnv 流程完全一致，不依赖任何 USDA 文件。
         """
         # ── 1. 地面平面（物理碰撞） ───────────────────────────────────────────
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # ── 2. 加载 fly_forward.usda（只含 Falcon） ───────────────────────────
-        assets_root = Path(__file__).resolve().parents[3] / "assets/data/AMR"
-        scene_usd_path = assets_root / "fly_forward/fly_forward.usda"
-        scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
-        sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
-
-        # ── 3. 克隆到所有并行 env（此时 USDA 里只有 Falcon，clone 速度快）──────
-        self.scene.clone_environments(copy_from_source=False)
-
-        # ── 4. 定位 env_0 中的 falcon prim ───────────────────────────────────
-        env_root_base = "/World/envs/env_0"
-        env_root = f"{env_root_base}/World" if prim_utils.is_prim_path_valid(f"{env_root_base}/World") else env_root_base
-
-        # 依次尝试常见候选路径
-        falcon_env0 = None
-        for candidate in [
-            f"{env_root}/falcon",
-            f"{env_root}/falcon/Robot",
-            f"{env_root}/falcon/Falcon",
-            f"{env_root_base}/falcon",
-        ]:
-            if prim_utils.is_prim_path_valid(candidate):
-                falcon_env0 = candidate
-                break
-
-        if falcon_env0 is None:
-            # 回退：在 env_0 下全局搜索名为 "falcon" 的 prim
-            prims = sim_utils.get_all_matching_child_prims(
-                env_root, predicate=lambda p: p.GetName() == "falcon"
-            )
-            if prims:
-                falcon_env0 = prims[0].GetPath().pathString
-            else:
-                raise RuntimeError(
-                    f"Could not find 'falcon' prim under {env_root}. "
-                    "Please check fly_forward.usda."
-                )
-
-        # 从 env_0 路径推导通配符路径（供 Articulation 使用）
-        env_prim_pattern = falcon_env0.replace(env_root_base, "/World/envs/env_.*", 1)
-
-        # ── 5. 绑定 Articulation（spawn=None，使用 USDA 中已有的 prim） ───────
-        robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_prim_pattern)
-        robot_cfg.spawn = None
-        self._robot = Articulation(robot_cfg)
+        # ── 2. 注册无人机（spawn=True，Isaac Lab 在 clone 时自动复制到所有 env）
+        self._robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self._robot
 
-        # ── 6. Rivermark 背景（clone 之后仅加载到 env_0，纯视觉，不被复制） ───
-        rivermark_usd = "/media/xtj/1CC8D044C8D01DB8/RL-download/isaac-sim/v5.1.0/Assets/Isaac/5.1/Isaac/Environments/Outdoor/Rivermark/rivermark.usd"
-        try:
-            from pxr import Gf, UsdGeom
-            rivermark_cfg = sim_utils.UsdFileCfg(usd_path=rivermark_usd)
-            sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/rivermark", cfg=rivermark_cfg)
-            _prim = prim_utils.get_prim_at_path("/World/envs/env_0/rivermark")
-            if _prim.IsValid():
-                xform = UsdGeom.Xformable(_prim)
-                xform.ClearXformOpOrder()
-                xform.AddTranslateOp().Set(Gf.Vec3d(45.0, 65.0, -6.7))
-                xform.AddOrientOp().Set(Gf.Quatf(0.9702957, 0.0, 0.0, -0.2419219))
-                xform.AddScaleOp().Set(Gf.Vec3f(1.0, 1.0, 1.0))
-        except Exception as exc:
-            print(f"[fly_forward] Rivermark 加载失败（可忽略，仅影响视觉）: {exc}")
+        # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
+        self.scene.clone_environments(copy_from_source=False)
+        self.scene.filter_collisions(global_prim_paths=["/World/ground"])
 
-        # ── 7. 补充环境光照 ───────────────────────────────────────────────────
+        # ── 4. 补充光照 ───────────────────────────────────────────────────────
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 

@@ -87,10 +87,9 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     # ── Scene USD（fly_forward.usda 包含 Rivermark + Falcon）─────────────────
     # 路径在 _setup_scene 中通过 Path(__file__) 动态解析，无需在此硬编码
 
-    # ── Robot cfg（spawn=None 模式，prim 由 USDA 定义）────────────────────────
-    # prim_path 在 _setup_scene 中通过 resolve_prim 动态填充，此处仅作占位
+    # ── Robot cfg（spawn=True 模式，由 FALCON_CFG 内置 UsdFileCfg 直接生成 prim）──
     robot_cfg: ArticulationCfg = FALCON_CFG.replace(
-        prim_path="/World/envs/env_.*/falcon",  # 对应 USDA 中 "falcon" prim
+        prim_path="/World/envs/env_.*/falcon",  # DirectRLEnv 通配符路径
     )
 
     # scene — large env_spacing in x so 200m flights don't cross into other envs
