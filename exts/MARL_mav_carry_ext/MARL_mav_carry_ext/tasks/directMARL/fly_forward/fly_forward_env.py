@@ -94,26 +94,26 @@ class FlyForwardEnv(DirectRLEnv):
     # ── Scene setup ──────────────────────────────────────────────────────────
 
     def _setup_scene(self):
-        """从 fly_forward.usda 加载完整场景（Rivermark 背景 + Falcon 无人机）。
+        """场景初始化：falcon USDA → clone → Rivermark(env_0 only) → Articulation。
 
         步骤：
           1. 加载地面平面（物理碰撞）
-          2. spawn_from_usd → clone_environments（USD 场景复制到所有并行 env）
-          3. 解析 env_0 中的 falcon prim → 绑定 Articulation（spawn=None）
-          4. 添加补充光照
+          2. spawn_from_usd(fly_forward.usda) — 只含 Falcon，不含 Rivermark
+          3. clone_environments（只复制轻量的 Falcon 到所有 env）
+          4. 解析 env_0 中的 falcon prim → 绑定 Articulation（spawn=None）
+          5. clone 之后再把 Rivermark 加载到 env_0（纯视觉，不参与物理，不被 clone）
+          6. 添加补充光照
         """
         # ── 1. 地面平面（物理碰撞） ───────────────────────────────────────────
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # ── 2. 加载 fly_forward.usda 场景 ────────────────────────────────────
-        scene_usd_path = (
-            Path(__file__).resolve().parents[3]
-            / "assets/data/AMR/fly_forward/fly_forward.usda"
-        )
+        # ── 2. 加载 fly_forward.usda（只含 Falcon） ───────────────────────────
+        assets_root = Path(__file__).resolve().parents[3] / "assets/data/AMR"
+        scene_usd_path = assets_root / "fly_forward/fly_forward.usda"
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
         sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
 
-        # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
+        # ── 3. 克隆到所有并行 env（此时 USDA 里只有 Falcon，clone 速度快）──────
         self.scene.clone_environments(copy_from_source=False)
 
         # ── 4. 定位 env_0 中的 falcon prim ───────────────────────────────────
@@ -154,7 +154,23 @@ class FlyForwardEnv(DirectRLEnv):
         self._robot = Articulation(robot_cfg)
         self.scene.articulations["robot"] = self._robot
 
-        # ── 6. 补充环境光照 ───────────────────────────────────────────────────
+        # ── 6. Rivermark 背景（clone 之后仅加载到 env_0，纯视觉，不被复制） ───
+        rivermark_usd = "/media/xtj/1CC8D044C8D01DB8/RL-download/isaac-sim/v5.1.0/Assets/Isaac/5.1/Isaac/Environments/Outdoor/Rivermark/rivermark.usd"
+        try:
+            from pxr import Gf, UsdGeom
+            rivermark_cfg = sim_utils.UsdFileCfg(usd_path=rivermark_usd)
+            sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/rivermark", cfg=rivermark_cfg)
+            _prim = prim_utils.get_prim_at_path("/World/envs/env_0/rivermark")
+            if _prim.IsValid():
+                xform = UsdGeom.Xformable(_prim)
+                xform.ClearXformOpOrder()
+                xform.AddTranslateOp().Set(Gf.Vec3d(45.0, 65.0, -6.7))
+                xform.AddOrientOp().Set(Gf.Quatf(0.9702957, 0.0, 0.0, -0.2419219))
+                xform.AddScaleOp().Set(Gf.Vec3f(1.0, 1.0, 1.0))
+        except Exception as exc:
+            print(f"[fly_forward] Rivermark 加载失败（可忽略，仅影响视觉）: {exc}")
+
+        # ── 7. 补充环境光照 ───────────────────────────────────────────────────
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
