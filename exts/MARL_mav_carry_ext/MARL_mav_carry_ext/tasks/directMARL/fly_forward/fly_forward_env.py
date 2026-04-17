@@ -38,9 +38,7 @@ class FlyForwardEnv(DirectRLEnv):
 
     def __init__(self, cfg: FlyForwardEnvCfg, render_mode: str | None = None, **kwargs):
         # super().__init__ calls _setup_scene, making env_origins available afterwards
-        print("[fly_forward] __init__: calling super().__init__ (this triggers _setup_scene + sim.reset) ...")
         super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
-        print("[fly_forward] __init__: super().__init__ DONE")
 
         # ── Body/rotor index cache ────────────────────────────────────────────
         self._falcon_body_idx = self._robot.find_bodies(".*base_link")[0]  # list[int]
@@ -106,37 +104,25 @@ class FlyForwardEnv(DirectRLEnv):
           3. resolve falcon prim → 绑定 Articulation（spawn=None）
           4. 补充环境光照
         """
-        import time as _time
-
         # ── 1. 地面平面 ──────────────────────────────────────────────────────
-        print("[fly_forward] step 1: spawn_ground_plane ...")
-        _t0 = _time.time()
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        print(f"[fly_forward] step 1 done ({_time.time() - _t0:.2f}s)")
 
         # ── 2. 加载 fly_forward USD 场景 ──────────────────────────────────────
         scene_usd_path = (
             Path(__file__).resolve().parents[3]
             / "assets/data/AMR/fly_forward/fly_forward.usda"
         )
-        print(f"[fly_forward] step 2: spawn_from_usd({scene_usd_path}) ...")
-        _t0 = _time.time()
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
         sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
-        print(f"[fly_forward] step 2 done ({_time.time() - _t0:.2f}s)")
 
         # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
-        print(f"[fly_forward] step 3: clone_environments (num_envs={self.scene.cfg.num_envs}) ...")
-        _t0 = _time.time()
         self.scene.clone_environments(copy_from_source=False)
-        print(f"[fly_forward] step 3 done ({_time.time() - _t0:.2f}s)")
 
         # ── 4. 确定 env_0 的实际根路径 ───────────────────────────────────────
         env_root_base = "/World/envs/env_0"
         env_root = env_root_base
         if prim_utils.is_prim_path_valid(f"{env_root_base}/World"):
             env_root = f"{env_root_base}/World"
-        print(f"[fly_forward] step 4: env_root = {env_root}")
 
         def resolve_agent_prim_path(agent_name: str) -> str:
             """定位 env_0 中指定 agent 的 prim 路径（与 move 任务逻辑一致）。"""
@@ -150,7 +136,6 @@ class FlyForwardEnv(DirectRLEnv):
                     f"{root}/{agent_name}/Falcon",
                     f"{root}/{agent_name}",
                 ]:
-                    print(f"[fly_forward]   checking: {candidate} -> {prim_utils.is_prim_path_valid(candidate)}")
                     if prim_utils.is_prim_path_valid(candidate):
                         return candidate
 
@@ -184,35 +169,22 @@ class FlyForwardEnv(DirectRLEnv):
             raise RuntimeError(f"Could not resolve prim path for agent '{agent_name}' under {env_root_base}.")
 
         # ── 5. 绑定 Falcon Articulation（spawn=None）─────────────────────────
-        print("[fly_forward] step 5: resolve falcon prim ...")
         env0_prim = resolve_agent_prim_path("falcon")
         env_prim_pattern = env0_prim.replace(env_root_base, "/World/envs/env_.*", 1)
-        print(f"[fly_forward] step 5: env0_prim={env0_prim}, pattern={env_prim_pattern}")
 
-        _t0 = _time.time()
         robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_prim_pattern)
         robot_cfg.spawn = None
-        print(f"[fly_forward] step 5: creating Articulation(spawn=None, prim_path={env_prim_pattern}) ...")
         self._robot = Articulation(robot_cfg)
         self.scene.articulations["robot"] = self._robot
-        print(f"[fly_forward] step 5 done ({_time.time() - _t0:.2f}s)")
 
         # ── 6. 补充环境光照 ───────────────────────────────────────────────────
-        print("[fly_forward] step 6: light ...")
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-        print("[fly_forward] _setup_scene COMPLETE")
 
     # ── Action pipeline ──────────────────────────────────────────────────────
 
-    _debug_step_count: int = 0
-
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Parse 6-dim ACCBR action → velocity/body-rate setpoints."""
-        self._debug_step_count += 1
-        if self._debug_step_count <= 3:
-            print(f"[fly_forward] _pre_physics_step #{self._debug_step_count}, actions shape={actions.shape}, "
-                  f"actions[0]={actions[0].tolist()}")
         self._actions = actions.clone()
 
         desired_vel = actions[:, :3] * self.cfg.lin_vel_max
@@ -233,9 +205,6 @@ class FlyForwardEnv(DirectRLEnv):
         }
 
     def _apply_action(self) -> None:
-        if self._debug_step_count <= 3:
-            print(f"[fly_forward] _apply_action ll_counter={self._ll_counter}")
-
         if self._ll_counter % self.cfg.low_level_decimation == 0:
             root = self._robot.data.root_state_w
             drone_pos = root[:, :3] - self.scene.env_origins
@@ -258,15 +227,9 @@ class FlyForwardEnv(DirectRLEnv):
                 "jerk": jerk,
             }
 
-            if self._debug_step_count <= 3:
-                print(f"[fly_forward]   drone_pos={drone_pos[0].tolist()}, quat={drone_quat[0].tolist()}")
-                print(f"[fly_forward]   body_ids: falcon_body={self._falcon_body_idx}, rotor={self._rotor_idx}")
-
             alpha_cmd, acc_load, acc_cmd, _ = self._geo_ctrl.getCommand(
                 drone_states, self._forces, self._setpoint
             )
-            if self._debug_step_count <= 3:
-                print(f"[fly_forward]   geo_ctrl done. alpha_cmd={alpha_cmd[0].tolist() if alpha_cmd.numel() > 0 else 'empty'}")
 
             target_rpm = self._indi_ctrl.getCommand(
                 drone_states, self._forces, alpha_cmd, acc_cmd, acc_load
@@ -275,17 +238,11 @@ class FlyForwardEnv(DirectRLEnv):
                 target_rpm, self.sampling_time
             )
 
-            if self._debug_step_count <= 3:
-                print(f"[fly_forward]   thrusts={thrusts[0].tolist()}, moments={moments[0].tolist()}")
-
             forces = torch.clamp(thrusts, min=0.0, max=self.cfg.max_thrust_pp)
             self._forces[..., 2] = forces
             self._moments[:, 0, 2] = torch.clamp(moments, -1.0, 1.0).sum(-1)
             self._ll_counter = 0
         self._ll_counter += 1
-
-        if self._debug_step_count <= 3:
-            print(f"[fly_forward]   set_external_force_and_torque (base_link) ...")
 
         # Apply torques on base_link (idx 0)
         self._robot.set_external_force_and_torque(
@@ -293,8 +250,6 @@ class FlyForwardEnv(DirectRLEnv):
             torques=self._moments,
             body_ids=torch.zeros(1, dtype=torch.int, device=self.device),
         )
-        if self._debug_step_count <= 3:
-            print(f"[fly_forward]   set_external_force_and_torque (rotors) ...")
 
         # Apply rotor thrusts
         self._robot.set_external_force_and_torque(
@@ -303,14 +258,9 @@ class FlyForwardEnv(DirectRLEnv):
             body_ids=self._rotor_idx,
         )
 
-        if self._debug_step_count <= 3:
-            print(f"[fly_forward] _apply_action DONE")
-
     # ── Observations ─────────────────────────────────────────────────────────
 
     def _get_observations(self) -> dict:
-        if self._debug_step_count <= 3:
-            print("[fly_forward] _get_observations ...")
         root = self._robot.data.root_state_w
         pos_local = root[:, :3] - self.scene.env_origins   # (N,3)
         lin_vel = root[:, 7:10]
@@ -415,8 +365,6 @@ class FlyForwardEnv(DirectRLEnv):
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        if self._debug_step_count <= 3:
-            print(f"[fly_forward] _reset_idx env_ids={env_ids}")
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
 
