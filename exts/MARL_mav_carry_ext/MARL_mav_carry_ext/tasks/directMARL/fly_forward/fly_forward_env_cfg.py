@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from gymnasium.spaces import Box
+
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -38,7 +40,8 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Spaces ────────────────────────────────────────────────────────────────
     # obs: pos(3) + lin_vel(3) + rot_mat(9) + ang_vel(3) + goal_rel(3) = 21
-    action_space: int = 6
+    # 注意：必须用有界 Box，否则 SKRL random_act 从 Uniform(-inf,+inf) 采样得到 NaN
+    action_space: Box = Box(low=-1.0, high=1.0, shape=(6,))
     observation_space: int = 21
     state_space: int = 0
 
