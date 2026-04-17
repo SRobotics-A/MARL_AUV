@@ -7,15 +7,18 @@ Control: ACCBR (velocity command + body-rate command, 6-dim continuous action).
 from __future__ import annotations
 
 import torch
+from pathlib import Path
 
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
 
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import matrix_from_quat
+from pxr import UsdPhysics
 
 from .fly_forward_env_cfg import FlyForwardEnvCfg
 
@@ -92,23 +95,89 @@ class FlyForwardEnv(DirectRLEnv):
     # ── Scene setup ──────────────────────────────────────────────────────────
 
     def _setup_scene(self):
-        """标准 DirectRLEnv 场景初始化：ground → robot(spawn=True) → clone。
+        """从 fly_forward.usda 加载场景（对齐 move 任务范式）。
 
-        使用 FALCON_CFG 内置的 spawn=UsdFileCfg 模式，在 clone 之前注册 Articulation，
-        与 Isaac Lab 标准 DirectRLEnv 流程完全一致，不依赖任何 USDA 文件。
+        USD 内含：Rivermark 室外环境 + 1 架 Falcon 无人机。
+        步骤：
+          1. 加载地面平面（物理碰撞）
+          2. spawn_from_usd → clone_environments
+          3. resolve falcon prim → 绑定 Articulation（spawn=None）
+          4. 补充环境光照
         """
-        # ── 1. 地面平面（物理碰撞） ───────────────────────────────────────────
+        # ── 1. 地面平面 ──────────────────────────────────────────────────────
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # ── 2. 注册无人机（spawn=True，Isaac Lab 在 clone 时自动复制到所有 env）
-        self._robot = Articulation(self.cfg.robot_cfg)
-        self.scene.articulations["robot"] = self._robot
+        # ── 2. 加载 fly_forward USD 场景 ──────────────────────────────────────
+        scene_usd_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets/data/AMR/fly_forward/fly_forward.usda"
+        )
+        scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_usd_path))
+        sim_utils.spawn_from_usd(prim_path="/World/envs/env_0/World", cfg=scene_cfg)
 
         # ── 3. 克隆到所有并行 env ─────────────────────────────────────────────
         self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=["/World/ground"])
 
-        # ── 4. 补充光照 ───────────────────────────────────────────────────────
+        # ── 4. 确定 env_0 的实际根路径 ───────────────────────────────────────
+        env_root_base = "/World/envs/env_0"
+        env_root = env_root_base
+        if prim_utils.is_prim_path_valid(f"{env_root_base}/World"):
+            env_root = f"{env_root_base}/World"
+
+        def resolve_agent_prim_path(agent_name: str) -> str:
+            """定位 env_0 中指定 agent 的 prim 路径（与 move 任务逻辑一致）。"""
+            roots = [env_root]
+            if prim_utils.is_prim_path_valid(f"{env_root}/World"):
+                roots.append(f"{env_root}/World")
+
+            for root in roots:
+                for candidate in [
+                    f"{root}/{agent_name}/Robot",
+                    f"{root}/{agent_name}/Falcon",
+                    f"{root}/{agent_name}",
+                ]:
+                    if prim_utils.is_prim_path_valid(candidate):
+                        return candidate
+
+                # instanceable prim 处理
+                outer_path = f"{root}/{agent_name}"
+                if prim_utils.is_prim_path_valid(outer_path):
+                    import omni.usd
+                    _stage = omni.usd.get_context().get_stage()
+                    _prim = _stage.GetPrimAtPath(outer_path)
+                    if _prim.IsValid() and _prim.IsInstance():
+                        proto = _prim.GetPrototype()
+                        if proto:
+                            for child in proto.GetAllChildren():
+                                if child.HasAPI(UsdPhysics.ArticulationRootAPI):
+                                    return f"{outer_path}/{child.GetName()}"
+
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: p.GetName() == agent_name
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+                prims = sim_utils.get_all_matching_child_prims(
+                    root, predicate=lambda p: agent_name in p.GetName()
+                )
+                if prims:
+                    return prims[0].GetPath().pathString
+
+            prim = sim_utils.find_first_matching_prim(f"{env_root_base}.*/{agent_name}(/.*)?")
+            if prim is not None:
+                return prim.GetPath().pathString
+            raise RuntimeError(f"Could not resolve prim path for agent '{agent_name}' under {env_root_base}.")
+
+        # ── 5. 绑定 Falcon Articulation（spawn=None）─────────────────────────
+        env0_prim = resolve_agent_prim_path("falcon")
+        env_prim_pattern = env0_prim.replace(env_root_base, "/World/envs/env_.*", 1)
+
+        robot_cfg = self.cfg.robot_cfg.replace(prim_path=env_prim_pattern)
+        robot_cfg.spawn = None
+        self._robot = Articulation(robot_cfg)
+        self.scene.articulations["robot"] = self._robot
+
+        # ── 6. 补充环境光照 ───────────────────────────────────────────────────
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
