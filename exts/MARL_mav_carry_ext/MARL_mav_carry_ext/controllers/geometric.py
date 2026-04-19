@@ -144,6 +144,48 @@ class GeometricController:
     # function to overwrite parameters from yaml file
     # function to check if all parameters are valid
 
+    def _move_to_device(self, device: torch.device | str) -> None:
+        target_device = torch.device(device)
+        if target_device == self.device:
+            return
+
+        self.device = target_device
+        tensor_attrs = (
+            "p_err_max_",
+            "v_err_max_",
+            "p_offset",
+            "integration_max",
+            "gravity",
+            "z_i",
+            "_epsilon",
+            "kp_acc",
+            "kd_acc",
+            "ki_acc",
+            "kp_rate",
+            "filter_sampling_frequency",
+            "filter_cutoff_frequency",
+            "filter_cutoff_frequency_bodyrate",
+            "filter_init_value_acc",
+            "filter_init_value_mot",
+            "filter_init_value_rate",
+        )
+        debug_tensor_attrs = (
+            "filtered_acc",
+            "filtered_rate",
+            "unfiltered_thrusts",
+            "filtered_thrusts",
+            "acc_load_debug",
+        )
+        for attr in tensor_attrs:
+            setattr(self, attr, getattr(self, attr).to(target_device))
+        if self.debug:
+            for attr in debug_tensor_attrs:
+                setattr(self, attr, getattr(self, attr).to(target_device))
+
+        self.filterAcc_.to(target_device)
+        self.filterMot_.to(target_device)
+        self.filterRate_.to(target_device)
+
     def getCommand(
         self,
         state: dict,
@@ -173,6 +215,8 @@ class GeometricController:
                    - acc_cmd: 期望加速度指令
                    - q_cmd: 期望姿态四元数
         """
+
+        self._move_to_device(state["lin_acc"].device)
 
         # 计算总推力（所有旋翼推力之和）
         current_collective_thrust = actions.sum(1)  # sum over all propellors

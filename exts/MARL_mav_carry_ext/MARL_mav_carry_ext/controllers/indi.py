@@ -114,6 +114,39 @@ class IndiController:
             self.unfiltered_mot = torch.zeros((self.num_envs, 4), device=self.device)    # 未滤波的推力
             self.filtered_mot = torch.zeros((self.num_envs, 4), device=self.device)      # 滤波后的推力
 
+    def _move_to_device(self, device: torch.device | str) -> None:
+        target_device = torch.device(device)
+        if target_device == self.device:
+            return
+
+        self.device = target_device
+        tensor_attrs = (
+            "beta",
+            "G_1",
+            "G_1_inv",
+            "G_2",
+            "thrust_map",
+            "inertia_mat",
+            "p_offset",
+            "filter_sampling_frequency",
+            "filter_cutoff_frequency",
+            "filter_init_value_mot",
+            "filter_init_value_rate",
+        )
+        debug_tensor_attrs = (
+            "filtered_ang_acc",
+            "unfiltered_mot",
+            "filtered_mot",
+        )
+        for attr in tensor_attrs:
+            setattr(self, attr, getattr(self, attr).to(target_device))
+        if self.debug:
+            for attr in debug_tensor_attrs:
+                setattr(self, attr, getattr(self, attr).to(target_device))
+
+        self.filterMot_.to(target_device)
+        self.filterRate_.to(target_device)
+
     def getCommand(
         self,
         state: dict,
@@ -142,6 +175,8 @@ class IndiController:
         Returns:
             rotor_speeds: 四个旋翼的目标转速[rad/s]
         """
+        self._move_to_device(state["quat"].device)
+
         # 计算总推力并进行滤波
         forces = actions.sum(-1)  # 当前总推力（四个旋翼推力之和）
         filtered_forces = self.filterMot_.add(forces)  # 滤波后的总推力

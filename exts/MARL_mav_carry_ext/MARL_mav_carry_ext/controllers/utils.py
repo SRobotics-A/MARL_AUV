@@ -154,6 +154,16 @@ class LowPassFilter:
         self.input[env_ids] = self.initial_value.unsqueeze(2).repeat(1, 1, 2)[env_ids]   # 重置输入缓冲区
         self.output[env_ids] = self.initial_value.unsqueeze(2).repeat(1, 1, 2)[env_ids]  # 重置输出缓冲区
 
+    def to(self, device):
+        """Move filter coefficients and state buffers to the target device."""
+        self.sampling_freq = self.sampling_freq.to(device)
+        self.num = self.num.to(device)
+        self.dem = self.dem.to(device)
+        self.initial_value = self.initial_value.to(device)
+        self.input = self.input.to(device)
+        self.output = self.output.to(device)
+        return self
+
     def __call__(self):
         """
         获取当前滤波输出

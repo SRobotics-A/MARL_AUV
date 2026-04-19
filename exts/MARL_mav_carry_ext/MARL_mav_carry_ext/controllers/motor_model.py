@@ -54,10 +54,18 @@ class RotorMotor:
 
         # 旋翼旋转方向（从上往下看）
         # [1.0, -1.0, 1.0, -1.0] 对应 [CW, CCW, CW, CCW]
-        self.direction = torch.tensor([1.0, -1.0, 1.0, -1.0], device="cuda")
+        self.direction = torch.tensor([1.0, -1.0, 1.0, -1.0], device=init_omega.device)
 
         # 当前转速状态
         self.current_omega = init_omega       # 当前转速 [num_envs x 4]
+
+    def _move_to_device(self, device: torch.device | str) -> None:
+        target_device = torch.device(device)
+        self.init_omega = self.init_omega.to(target_device)
+        self.thrust_map = self.thrust_map.to(target_device)
+        self.torque_map = self.torque_map.to(target_device)
+        self.direction = self.direction.to(target_device)
+        self.current_omega = self.current_omega.to(target_device)
 
     def get_motor_thrusts_moments(self, target_rates: torch.Tensor, sampling_time: float):
         """
@@ -77,6 +85,8 @@ class RotorMotor:
                 - thrusts: 四个旋翼的推力 [num_envs x 4]
                 - moments: 四个旋翼的反扭矩 [num_envs x 4]
         """
+        self._move_to_device(target_rates.device)
+
         # 判断转速变化方向以选择相应的时间常数
         # 如果目标转速大于当前转速，使用上升时间常数；否则使用下降时间常数
         tau = torch.where(target_rates > self.current_omega, self.tau_up, self.tau_down)
