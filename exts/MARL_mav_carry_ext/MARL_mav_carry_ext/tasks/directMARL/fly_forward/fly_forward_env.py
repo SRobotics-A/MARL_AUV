@@ -6,6 +6,8 @@ Control: ACCBR (velocity command + body-rate command, 6-dim continuous action).
 
 from __future__ import annotations
 
+import csv
+import os
 import torch
 from pathlib import Path
 
@@ -30,8 +32,9 @@ class FlyForwardEnv(DirectRLEnv):
         drone_pos_norm(3) | drone_lin_vel_norm(3) | rot_matrix(9) |
         drone_ang_vel_norm(3) | goal_rel_norm(3)
 
-    Action (6-dim, scaled by lin/ang vel max):
-        [vx_cmd, vy_cmd, vz_cmd, roll_rate, pitch_rate, yaw_rate] ∈ [-1, 1]
+    Action (6-dim):
+        [vx_cmd, vy_cmd, vz_cmd, roll_rate, pitch_rate, yaw_rate] in [-1, 1].
+        vx/vy use lin_vel_max, vz uses conservative asymmetric up/down limits.
     """
 
     cfg: FlyForwardEnvCfg
@@ -55,12 +58,34 @@ class FlyForwardEnv(DirectRLEnv):
         self._ll_counter: int = 0
 
         # ── Controllers ───────────────────────────────────────────────────────
+        # hover omega = sqrt(m*g / (4*k_tau)) ≈ 972 rad/s for Falcon
+        # 原来用 1355 rad/s，是悬停的 1.94×，reset 后产生 +9 m/s² 瞬时向上加速度
+        _hover_omega = 972.0
         self._geo_ctrl = GeometricController(self.num_envs, "ACCBR")
         self._indi_ctrl = IndiController(self.num_envs)
         self._motor_model = RotorMotor(
             self.num_envs,
-            torch.full((self.num_envs, 4), 1355.0, device=self.device),
+            torch.full((self.num_envs, 4), _hover_omega, device=self.device),
         )
+
+        # ── Diagnostic logger (FLY_FORWARD_DIAG=1 to enable) ─────────────────
+        self._diag_enabled = os.environ.get("FLY_FORWARD_DIAG", "0") == "1"
+        self._diag_random = os.environ.get("FLY_FORWARD_RANDOM", "0") == "1"
+        if self._diag_enabled:
+            self._diag_path = os.environ.get("FLY_FORWARD_DIAG_PATH", "/tmp/fly_forward_diag.csv")
+            self._diag_file = open(self._diag_path, "w", newline="")
+            self._diag_writer = csv.writer(self._diag_file)
+            mode = "random" if self._diag_random else "policy"
+            self._diag_writer.writerow(
+                ["mode", "episode", "policy_step",
+                 "x", "z", "vx", "vz",
+                 "a0", "a1", "a2",
+                 "cmd_acc_x", "cmd_acc_y", "cmd_acc_z"]
+            )
+            self._diag_episode: int = 0
+            self._diag_step: int = 0
+            self._diag_prev_done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            print(f"[FlyForwardEnv] Diagnostic logger → {self._diag_path}  mode={mode}")
         self.sampling_time = self.sim.get_physics_dt() * self.cfg.low_level_decimation
 
         # ── Goal world position ───────────────────────────────────────────────
@@ -85,6 +110,8 @@ class FlyForwardEnv(DirectRLEnv):
                 "progress_reward",
                 "dist_reward",
                 "height_reward",
+                "height_penalty",
+                "fly_high_guard_penalty",
                 "upright_penalty",
                 "action_smoothness",
                 "success_reward",
@@ -185,16 +212,45 @@ class FlyForwardEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Parse 6-dim ACCBR action → velocity/body-rate setpoints."""
+        if self._diag_random:
+            actions = torch.rand_like(actions) * 2.0 - 1.0
         self._actions = actions.clone()
 
-        desired_vel = actions[:, :3] * self.cfg.lin_vel_max
+        current_pos = self._robot.data.root_pos_w - self.scene.env_origins
+        z = current_pos[:, 2]
+        high_guard = torch.clamp(
+            (z - self.cfg.fly_high_guard_z) / (self.cfg.fly_high_z - self.cfg.fly_high_guard_z),
+            0.0,
+            1.0,
+        )
+        upward_scale = 1.0 - high_guard
+
+        desired_vel = torch.empty_like(actions[:, :3])
+        desired_vel[:, :2] = actions[:, :2] * self.cfg.lin_vel_max
+        z_action = actions[:, 2]
+        desired_vel[:, 2] = torch.where(
+            z_action >= 0.0,
+            z_action * self.cfg.lin_vel_z_up_max * upward_scale,
+            z_action * self.cfg.lin_vel_z_down_max,
+        )
         current_vel = self._robot.data.root_lin_vel_w
         vel_error = desired_vel - current_vel
         d_error = (vel_error - self._prev_vel_error) / self.step_dt
         self._prev_vel_error = vel_error.clone()
 
         commanded_acc = self.cfg.vel_Kp * vel_error + self.cfg.vel_Kd * d_error
-        commanded_acc = torch.clamp(commanded_acc, -self.cfg.lin_acc_max, self.cfg.lin_acc_max)
+        commanded_acc[:, :2] = torch.clamp(
+            commanded_acc[:, :2], -self.cfg.lin_acc_max, self.cfg.lin_acc_max
+        )
+        max_up_acc = self.cfg.lin_acc_z_up_max * upward_scale
+        commanded_acc[:, 2] = torch.clamp_min(commanded_acc[:, 2], -self.cfg.lin_acc_z_down_max)
+        commanded_acc[:, 2] = torch.minimum(commanded_acc[:, 2], max_up_acc)
+        descent_cap = torch.where(
+            high_guard > 0.0,
+            -self.cfg.fly_high_guard_descent_acc * high_guard,
+            max_up_acc,
+        )
+        commanded_acc[:, 2] = torch.minimum(commanded_acc[:, 2], descent_cap)
 
         self._setpoint = {
             "lin_acc": commanded_acc,
@@ -203,6 +259,22 @@ class FlyForwardEnv(DirectRLEnv):
             "yaw_rate": actions[:, 5:6] * self.cfg.ang_vel_max,
             "yaw_acc": torch.zeros(self.num_envs, 1, device=self.device),
         }
+
+        if self._diag_enabled:
+            self._diag_step += 1
+            root = self._robot.data.root_state_w
+            pos_l = root[0, :3] - self.scene.env_origins[0]
+            vel = root[0, 7:10]
+            a = actions[0]
+            ca = commanded_acc[0]
+            mode = "random" if self._diag_random else "policy"
+            self._diag_writer.writerow([
+                mode, self._diag_episode, self._diag_step,
+                f"{pos_l[0].item():.4f}", f"{pos_l[2].item():.4f}",
+                f"{vel[0].item():.4f}", f"{vel[2].item():.4f}",
+                f"{a[0].item():.4f}", f"{a[1].item():.4f}", f"{a[2].item():.4f}",
+                f"{ca[0].item():.4f}", f"{ca[1].item():.4f}", f"{ca[2].item():.4f}",
+            ])
 
     def _apply_action(self) -> None:
         if self._ll_counter % self.cfg.low_level_decimation == 0:
@@ -268,13 +340,28 @@ class FlyForwardEnv(DirectRLEnv):
         rot_mat = matrix_from_quat(root[:, 3:7]).view(self.num_envs, 9)
         goal_rel = self._goal_w - root[:, :3]              # (N,3)
 
+        # z 用独立缩放 norm_z_scale (5m) 使策略能感知 2-4m 高度变化
+        # x/y 用 norm_pos_scale (250m) 以适配 200m 任务范围
+        pos_norm = torch.stack(
+            [pos_local[:, 0] / self.cfg.norm_pos_scale,
+             pos_local[:, 1] / self.cfg.norm_pos_scale,
+             pos_local[:, 2] / self.cfg.norm_z_scale],
+            dim=-1,
+        )
+        goal_rel_norm = torch.stack(
+            [goal_rel[:, 0] / self.cfg.norm_pos_scale,
+             goal_rel[:, 1] / self.cfg.norm_pos_scale,
+             goal_rel[:, 2] / self.cfg.norm_z_scale],
+            dim=-1,
+        )
+
         obs = torch.cat(
             [
-                pos_local / self.cfg.norm_pos_scale,
+                pos_norm,
                 lin_vel / self.cfg.norm_vel_scale,
                 rot_mat,
                 ang_vel / self.cfg.ang_vel_max,
-                goal_rel / self.cfg.norm_pos_scale,
+                goal_rel_norm,
             ],
             dim=-1,
         )  # (N, 21)
@@ -292,7 +379,7 @@ class FlyForwardEnv(DirectRLEnv):
 
         # 1. X-direction progress (dense shaping)
         delta_x = pos_local[:, 0] - self._prev_x
-        progress_rew = delta_x * self.cfg.progress_reward_weight
+        progress_rew = delta_x * self.cfg.progress_reward_weight * step_dt
         self._prev_x = pos_local[:, 0].clone()
 
         # 2. Distance to goal (exponential decay)
@@ -301,37 +388,47 @@ class FlyForwardEnv(DirectRLEnv):
             -dist * self.cfg.dist_reward_scale
         ) * step_dt
 
-        # 3. Height anchor
+        # 3. Height anchor and soft penalty above target altitude
         z = pos_local[:, 2]
+        height_error = z - self.cfg.goal_z
         height_rew = self.cfg.height_reward_weight * torch.exp(
-            -torch.abs(z - self.cfg.goal_z)
+            -torch.abs(height_error)
         ) * step_dt
+        height_pen = -self.cfg.height_penalty_weight * torch.relu(height_error).square() * step_dt
+        fly_high_guard_pen = (
+            -self.cfg.fly_high_guard_penalty_weight
+            * torch.relu(z - self.cfg.fly_high_guard_z).square()
+            * step_dt
+        )
 
         # 4. Upright penalty (negative when tilted)
         upright_pen = self.cfg.upright_penalty_weight * (z_body_z - 1.0) * step_dt
 
-        # 5. Action smoothness
+        # 5. Action smoothness penalty
         delta_a = self._actions - self._prev_actions
-        smooth_rew = self.cfg.action_smoothness_weight * torch.exp(
-            -(delta_a ** 2).sum(-1)
-        ) * step_dt
+        smooth_rew = -self.cfg.action_smoothness_weight * delta_a.square().sum(-1) * step_dt
         self._prev_actions = self._actions.clone()
 
         # 6. Success bonus (sparse)
         success_rew = self._success.float() * self.cfg.success_reward
 
-        # 7. Crash penalty (fixed, not × dt)
-        crash = (self._fly_high | self._fly_low | self._out_of_bounds).float()
-        crash_pen = -crash * self.cfg.fly_high_penalty
+        # 7. Termination penalties (fixed, not × dt)
+        crash_pen = -(
+            self._fly_high.float() * self.cfg.fly_high_penalty
+            + self._fly_low.float() * self.cfg.fly_low_penalty
+            + self._out_of_bounds.float() * self.cfg.out_of_bounds_penalty
+        )
 
         total = (
-            progress_rew + dist_rew + height_rew + upright_pen
+            progress_rew + dist_rew + height_rew + height_pen + fly_high_guard_pen + upright_pen
             + smooth_rew + success_rew + crash_pen
         )
 
         self._episode_sums["progress_reward"] += progress_rew
         self._episode_sums["dist_reward"] += dist_rew
         self._episode_sums["height_reward"] += height_rew
+        self._episode_sums["height_penalty"] += height_pen
+        self._episode_sums["fly_high_guard_penalty"] += fly_high_guard_pen
         self._episode_sums["upright_penalty"] += upright_pen
         self._episode_sums["action_smoothness"] += smooth_rew
         self._episode_sums["success_reward"] += success_rew
@@ -419,6 +516,12 @@ class FlyForwardEnv(DirectRLEnv):
         self._drone_prev_acc[env_ids] = 0.0
         self._forces[env_ids] = 0.0
         self._moments[env_ids] = 0.0
+        # 重置电机转速到悬停值，避免跨 episode 积累导致初始过推力
+        self._motor_model.reset(env_ids)
+
+        if self._diag_enabled and 0 in env_ids:
+            self._diag_episode += 1
+            self._diag_step = 0
 
         # Reset prev_x to actual spawn local-x
         self._prev_x[env_ids] = self.cfg.spawn_x + x_noise

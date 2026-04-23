@@ -77,8 +77,8 @@ agent:
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null   # size filled in by Runner
 
-  random_timesteps: 1000    # pure random exploration at start
-  learning_starts: 1000     # start updating after filling buffer
+  random_timesteps: 5000    # pure random exploration at start
+  learning_starts: 5000     # start updating after filling buffer
 
   grad_norm_clip: 1.0
 

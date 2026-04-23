@@ -28,9 +28,13 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Control ──────────────────────────────────────────────────────────────
     control_mode: str = "ACCBR"  # 6-dim: [vx,vy,vz,roll_rate,pitch_rate,yaw_rate]
-    lin_vel_max: float = 3.0     # m/s
-    ang_vel_max: float = 1.2     # rad/s
-    lin_acc_max: float = 3.0     # m/s²
+    lin_vel_max: float = 3.0     # m/s, x/y command limit
+    lin_vel_z_up_max: float = 0.25    # m/s, conservative upward command limit
+    lin_vel_z_down_max: float = 1.5  # m/s, keep enough authority to recover from fly_high
+    ang_vel_max: float = 0.5     # rad/s
+    lin_acc_max: float = 2.0     # m/s², x/y acceleration limit
+    lin_acc_z_up_max: float = 0.3    # m/s², conservative upward acceleration limit
+    lin_acc_z_down_max: float = 2.0  # m/s², allow stronger descent correction
     vel_Kp: float = 2.0
     vel_Kd: float = 0.3
 
@@ -46,7 +50,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     state_space: int = 0
 
     # ── Goal ──────────────────────────────────────────────────────────────────
-    goal_x: float = 200.0
+    goal_x: float = 20.0
     goal_y: float = 0.0
     goal_z: float = 2.0
     goal_tolerance: float = 10.0  # success radius (m)
@@ -60,23 +64,28 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Altitude limits ───────────────────────────────────────────────────────
     fly_high_z: float = 4.0
+    fly_high_guard_z: float = 3.0
+    fly_high_guard_descent_acc: float = 2.0
     fly_low_z: float = 0.3
     out_of_bounds_y: float = 25.0
     out_of_bounds_x_min: float = -15.0
 
     # ── Normalisation ─────────────────────────────────────────────────────────
-    norm_pos_scale: float = 250.0
+    norm_pos_scale: float = 250.0   # for x/y (goal distance)
+    norm_z_scale: float = 5.0       # for z position — 独立缩放，避免 z/250 ≈ 0.008 不可见
     norm_vel_scale: float = 5.0
 
     # ── Reward weights ────────────────────────────────────────────────────────
     progress_reward_weight: float = 5.0
     dist_reward_weight: float = 2.0
     dist_reward_scale: float = 0.01
-    height_reward_weight: float = 0.5
+    height_reward_weight: float = 0.8
+    height_penalty_weight: float = 5.0
+    fly_high_guard_penalty_weight: float = 8.0
     upright_penalty_weight: float = 3.0
     action_smoothness_weight: float = 0.5
     success_reward: float = 200.0
-    fly_high_penalty: float = 10.0
+    fly_high_penalty: float = 30.0
     fly_low_penalty: float = 10.0
     out_of_bounds_penalty: float = 10.0
 
