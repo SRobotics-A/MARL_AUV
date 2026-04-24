@@ -394,11 +394,15 @@ class FlyForwardEnv(DirectRLEnv):
         height_rew = self.cfg.height_reward_weight * torch.exp(
             -torch.abs(height_error)
         ) * step_dt
-        height_pen = -self.cfg.height_penalty_weight * torch.relu(height_error).square() * step_dt
-        fly_high_guard_pen = (
+        height_pen = torch.clamp(
+            -self.cfg.height_penalty_weight * torch.relu(height_error).square() * step_dt,
+            min=-self.cfg.height_penalty_clip,
+        )
+        fly_high_guard_pen = torch.clamp(
             -self.cfg.fly_high_guard_penalty_weight
             * torch.relu(z - self.cfg.fly_high_guard_z).square()
-            * step_dt
+            * step_dt,
+            min=-self.cfg.fly_high_guard_penalty_clip,
         )
 
         # 4. Upright penalty (negative when tilted)

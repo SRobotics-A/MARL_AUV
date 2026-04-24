@@ -88,6 +88,11 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     fly_high_penalty: float = 30.0
     fly_low_penalty: float = 10.0
     out_of_bounds_penalty: float = 10.0
+    # ── 单步惩罚硬上限（防止关闭 fly_high 终止时二次项量级爆炸）─────────────────
+    # z=4m 时 height_pen≈-0.2/step、guard_pen≈-0.08/step；clip 在 -5/-3 确保
+    # 梯度在正常区完整保留，异常高度时 episode 累计 < ~96k（远低于 1e6）
+    height_penalty_clip: float = 5.0       # 单步下界：height_pen >= -clip
+    fly_high_guard_penalty_clip: float = 3.0  # 单步下界：guard_pen >= -clip
 
     # ── Simulation ────────────────────────────────────────────────────────────
     sim: SimulationCfg = SimulationCfg(
