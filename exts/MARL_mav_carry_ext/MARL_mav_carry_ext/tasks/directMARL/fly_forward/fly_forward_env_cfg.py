@@ -1,6 +1,7 @@
-"""Configuration for the single-drone fly-forward task (DDPG).
+"""Configuration for the single-drone fly-forward task (PPO).
 
-Task: Fly 200m in the +x direction from (-8, 3, 2).
+Task: Fly to a random goal on a 50m circle centered on the spawn point.
+      Each episode samples a fresh azimuth uniformly in [0, 2π).
       Altitude must stay below 4m.
 Scene: fly_forward.usda (Rivermark outdoor + single Falcon drone).
 """
@@ -24,7 +25,7 @@ from MARL_mav_carry_ext.assets import FALCON_CFG
 
 @configclass
 class FlyForwardEnvCfg(DirectRLEnvCfg):
-    """Configuration for the fly-forward single-drone DDPG task."""
+    """Configuration for the fly-forward single-drone PPO task (random 50m-radius goal)."""
 
     # ── Control ──────────────────────────────────────────────────────────────
     control_mode: str = "ACCBR"  # 6-dim: [vx,vy,vz,roll_rate,pitch_rate,yaw_rate]
@@ -50,8 +51,9 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     state_space: int = 0
 
     # ── Goal ──────────────────────────────────────────────────────────────────
-    goal_x: float = 20.0
-    goal_y: float = 0.0
+    # 每轮 reset 时，以 (spawn_x, spawn_y) 为圆心、goal_radius 为半径，
+    # 从 360° 均匀采样一个方向，goal_z 固定为目标高度。
+    goal_radius: float = 50.0
     goal_z: float = 2.0
     goal_tolerance: float = 10.0  # success radius (m)
 
@@ -67,8 +69,8 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     fly_high_guard_z: float = 2.7   # guard starts earlier: at z=3.0m high_guard=0.23 → descent_cap=-0.28 m/s²
     fly_high_guard_descent_acc: float = 1.2  # 2.0→1.2: exit z=3.8m at ~1.06 m/s → stops near goal_z
     fly_low_z: float = 0.3
-    out_of_bounds_y: float = 25.0
-    out_of_bounds_x_min: float = -15.0
+    # 50m 半径目标 → 飞行范围 ≈ ±60m；留 10m 缓冲作为终止边界
+    out_of_bounds_radius: float = 70.0  # 偏离 spawn 超过该距离即终止
 
     # ── Normalisation ─────────────────────────────────────────────────────────
     norm_pos_scale: float = 250.0   # for x/y (goal distance)

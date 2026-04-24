@@ -1,6 +1,7 @@
-"""Single-drone fly-forward environment (DirectRLEnv, DDPG).
+"""Single-drone fly-forward environment (DirectRLEnv, PPO).
 
-Task: Fly 200m in the +x direction. Altitude must stay below 4m.
+Task: Fly to a goal sampled on a 50m-radius circle around the spawn point.
+      A fresh azimuth is drawn uniformly in [0, 2π) every reset.
 Control: ACCBR (velocity command + body-rate command, 6-dim continuous action).
 """
 
@@ -88,14 +89,14 @@ class FlyForwardEnv(DirectRLEnv):
             print(f"[FlyForwardEnv] Diagnostic logger → {self._diag_path}  mode={mode}")
         self.sampling_time = self.sim.get_physics_dt() * self.cfg.low_level_decimation
 
-        # ── Goal world position ───────────────────────────────────────────────
-        goal_offset = torch.tensor(
-            [cfg.goal_x, cfg.goal_y, cfg.goal_z], device=self.device
-        )
-        self._goal_w = self.scene.env_origins + goal_offset  # (N, 3)
+        # ── Goal world position (assigned per-env at reset) ───────────────────
+        self._goal_w = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # ── Progress tracking ─────────────────────────────────────────────────
-        self._prev_x = torch.zeros(self.num_envs, device=self.device)
+        # ── Spawn world position (圆心；_reset_idx 写入，OOB 检查使用) ─────────
+        self._spawn_w = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # ── Progress tracking: horizontal distance to goal at last step ──────
+        self._prev_dist_xy = torch.zeros(self.num_envs, device=self.device)
 
         # ── Termination flags ─────────────────────────────────────────────────
         self._fly_high = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -377,10 +378,11 @@ class FlyForwardEnv(DirectRLEnv):
         z_body_z = rot_mat[:, 2, 2]   # cos(tilt)
         step_dt = self.step_dt
 
-        # 1. X-direction progress (dense shaping)
-        delta_x = pos_local[:, 0] - self._prev_x
-        progress_rew = delta_x * self.cfg.progress_reward_weight * step_dt
-        self._prev_x = pos_local[:, 0].clone()
+        # 1. Progress toward goal (dense shaping, direction-agnostic)
+        dist_xy = torch.norm((pos_w - self._goal_w)[:, :2], dim=-1)
+        delta_dist = self._prev_dist_xy - dist_xy   # positive when approaching
+        progress_rew = delta_dist * self.cfg.progress_reward_weight * step_dt
+        self._prev_dist_xy = dist_xy.clone()
 
         # 2. Distance to goal (exponential decay)
         dist = torch.norm(pos_w - self._goal_w, dim=-1)
@@ -447,10 +449,9 @@ class FlyForwardEnv(DirectRLEnv):
 
         self._fly_high = z > self.cfg.fly_high_z
         self._fly_low = z < self.cfg.fly_low_z
-        self._out_of_bounds = (
-            (torch.abs(y) > self.cfg.out_of_bounds_y)
-            | (x < self.cfg.out_of_bounds_x_min)
-        )
+        # OOB：偏离 spawn 中心（水平面）超过 out_of_bounds_radius
+        dist_from_spawn_xy = torch.norm((root[:, :3] - self._spawn_w)[:, :2], dim=-1)
+        self._out_of_bounds = dist_from_spawn_xy > self.cfg.out_of_bounds_radius
         self._success = (
             torch.norm(root[:, :3] - self._goal_w, dim=-1) < self.cfg.goal_tolerance
         )
@@ -464,12 +465,6 @@ class FlyForwardEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
-
-        # Update goal for these envs (in case env_origins changed, though they don't)
-        goal_offset = torch.tensor(
-            [self.cfg.goal_x, self.cfg.goal_y, self.cfg.goal_z], device=self.device
-        )
-        self._goal_w[env_ids] = self.scene.env_origins[env_ids] + goal_offset
 
         # Logging
         extras = {}
@@ -494,6 +489,23 @@ class FlyForwardEnv(DirectRLEnv):
         spawn_pos[:, 0] += self.cfg.spawn_x + x_noise
         spawn_pos[:, 1] += self.cfg.spawn_y + y_noise
         spawn_pos[:, 2] = self.cfg.spawn_z
+
+        # ── 随机目标：以 nominal spawn 为圆心，goal_radius 为半径，方向均匀采样 ──
+        angles = torch.rand(n, device=self.device) * (2.0 * torch.pi)
+        self._goal_w[env_ids, 0] = (
+            self.scene.env_origins[env_ids, 0]
+            + self.cfg.spawn_x
+            + self.cfg.goal_radius * torch.cos(angles)
+        )
+        self._goal_w[env_ids, 1] = (
+            self.scene.env_origins[env_ids, 1]
+            + self.cfg.spawn_y
+            + self.cfg.goal_radius * torch.sin(angles)
+        )
+        self._goal_w[env_ids, 2] = self.scene.env_origins[env_ids, 2] + self.cfg.goal_z
+
+        # 记录 spawn 世界坐标（OOB 使用；圆心与实际落点一致）
+        self._spawn_w[env_ids] = spawn_pos
 
         root_state = self._robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] = spawn_pos
@@ -523,5 +535,7 @@ class FlyForwardEnv(DirectRLEnv):
             self._diag_episode += 1
             self._diag_step = 0
 
-        # Reset prev_x to actual spawn local-x
-        self._prev_x[env_ids] = self.cfg.spawn_x + x_noise
+        # 初始化水平距离缓存（progress reward 的基准）
+        self._prev_dist_xy[env_ids] = torch.norm(
+            (spawn_pos - self._goal_w[env_ids])[:, :2], dim=-1
+        )
