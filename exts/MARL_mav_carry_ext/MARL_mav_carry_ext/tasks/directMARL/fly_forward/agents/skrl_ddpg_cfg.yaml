@@ -93,7 +93,11 @@ agent:
     final_scale: 0.05
     timesteps: 300000   # decay noise over 300k steps
 
-  rewards_shaper_scale: 1.0
+  rewards_shaper_scale: 0.1   # compress reward scale → Q ≈ [-80, +20], stable for critic
+
+  # clip TD targets to prevent critic blowup from large penalties
+  target_value_min: -200.0
+  target_value_max:  200.0
 
   experiment:
     directory: "fly_forward"
