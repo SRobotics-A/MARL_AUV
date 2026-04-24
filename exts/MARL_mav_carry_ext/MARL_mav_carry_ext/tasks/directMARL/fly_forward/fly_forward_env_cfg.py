@@ -33,7 +33,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     lin_vel_z_down_max: float = 1.5  # m/s, keep enough authority to recover from fly_high
     ang_vel_max: float = 0.5     # rad/s
     lin_acc_max: float = 2.0     # m/s², x/y acceleration limit
-    lin_acc_z_up_max: float = 0.3    # m/s², conservative upward acceleration limit
+    lin_acc_z_up_max: float = 0.8    # m/s², upward acceleration limit (0.3→0.8 fix overshoot recovery)
     lin_acc_z_down_max: float = 2.0  # m/s², allow stronger descent correction
     vel_Kp: float = 2.0
     vel_Kd: float = 0.3
