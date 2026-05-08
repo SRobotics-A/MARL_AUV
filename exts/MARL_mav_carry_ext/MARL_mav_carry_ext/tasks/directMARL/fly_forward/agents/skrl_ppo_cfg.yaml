@@ -1,93 +1,100 @@
-# PPO configuration for the single-drone fly-forward task
-# obs_dim=21, action_dim=6 (ACCBR: vx,vy,vz,roll_rate,pitch_rate,yaw_rate)
-# Task: fly to a random 50m-radius goal, 360° azimuth per reset.
+# 单无人机 fly-forward 任务的 PPO 配置文件
+# 观测维度 obs_dim=21，动作维度 action_dim=6
+# ACCBR 动作含义：vx、vy、vz、roll_rate、pitch_rate、yaw_rate
+# 任务目标：低空课程中，向前飞到固定 20m 目标点。
 
-seed: 42
+seed: 42                  # 随机种子，用于提高实验可复现性
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
-# PPO needs 2 model roles: policy (Gaussian) and value (Deterministic).
+# 模型配置
+# PPO 需要两个模型角色：
+# - policy：高斯策略网络，用于输出连续动作分布
+# - value：确定性价值网络，用于估计状态价值 V(s)
 models:
   separate: True          # policy 和 value 独立 MLP
-  CTDE: False             # 单智能体
-  separate_actors: False
-  separate_critics: False
+  CTDE: False             # 是否使用集中式训练、分布式执行；当前为单智能体，不启用
+  separate_actors: False  # 多智能体场景下是否为每个 actor 使用独立网络；当前不启用
+  separate_critics: False # 多智能体场景下是否为每个 critic 使用独立网络；当前不启用
 
   policy:
-    class: GaussianMixin
-    clip_actions: True
-    clip_log_std: True
-    min_log_std: -5.0
-    max_log_std: 2.0
-    initial_log_std: 0.0
+    class: GaussianMixin  # 连续动作高斯策略
+    clip_actions: True    # 将输出动作裁剪到环境动作空间范围内
+    clip_log_std: True    # 裁剪动作分布的 log_std，避免方差过大或过小
+    min_log_std: -5.0     # log 标准差下限
+    max_log_std: 2.0      # log 标准差上限
+    initial_log_std: -1.5 # 初始 log 标准差
     network:
       - name: net
-        input: STATES
-        layers: [256, 256, 128]
-        activations: elu
-    output: ACTIONS
+        input: STATES       # 输入为环境状态
+        layers: [256, 256, 128] # MLP 隐藏层宽度
+        activations: elu    # 隐藏层激活函数
+    output: ACTIONS         # 输出为动作
 
   value:
-    class: DeterministicMixin
-    clip_actions: False
+    class: DeterministicMixin # 确定性价值函数网络
+    clip_actions: False       # value 网络不输出动作，不需要裁剪动作
     network:
       - name: net
-        input: STATES
-        layers: [256, 256, 128]
-        activations: elu
-    output: ONE
+        input: STATES       # 输入为环境状态
+        layers: [256, 256, 128] # MLP 隐藏层宽度
+        activations: elu    # 隐藏层激活函数
+    output: ONE             # 输出单个标量价值 V(s)
 
 
 # ── Rollout memory ────────────────────────────────────────────────────────────
+# Rollout 经验缓存配置，用于保存 on-policy 采样数据
 memory:
-  class: RandomMemory
-  memory_size: -1   # = rollouts
+  class: RandomMemory      # skrl 的随机访问经验缓存
+  memory_size: -1          # -1 表示缓存大小跟随 agent.rollouts
 
 
 # ── PPO agent ─────────────────────────────────────────────────────────────────
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
+# PPO 智能体超参数
 agent:
-  class: PPO
-  rollouts: 32             # on-policy rollout steps per env
-  learning_epochs: 5
-  mini_batches: 4
-  discount_factor: 0.99
-  lambda: 0.95             # GAE
+  class: PPO               # 使用 PPO 算法
+  rollouts: 32             # 每个环境采样的 on-policy rollout 步数
+  learning_epochs: 5       # 每轮采样后重复训练的 epoch 数
+  mini_batches: 4          # 将 rollout 数据切分成的 mini-batch 数量
+  discount_factor: 0.99    # 奖励折扣因子 gamma
+  lambda: 0.95             # GAE(lambda) 优势估计参数
 
-  learning_rate: 3.0e-4
-  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate: 1.0e-4    # 初始学习率
+  learning_rate_scheduler: KLAdaptiveLR # 基于 KL 散度自适应调整学习率
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.03     # 自适应学习率调度器的目标 KL 阈值
 
-  state_preprocessor: RunningStandardScaler
-  state_preprocessor_kwargs: null
-  value_preprocessor: RunningStandardScaler
-  value_preprocessor_kwargs: null
+  state_preprocessor: RunningStandardScaler # 状态输入在线标准化
+  state_preprocessor_kwargs: null            # 状态预处理器额外参数
+  value_preprocessor: RunningStandardScaler  # value 目标在线标准化
+  value_preprocessor_kwargs: null            # value 预处理器额外参数
 
-  random_timesteps: 0
-  learning_starts: 0
+  random_timesteps: 0      # 训练开始前随机动作探索步数；0 表示不额外随机探索
+  learning_starts: 0       # 收集多少步后开始学习；0 表示立即学习
 
-  grad_norm_clip: 1.0
-  ratio_clip: 0.2
-  value_clip: 0.2
-  clip_predicted_values: True
+  grad_norm_clip: 1.0      # 梯度范数裁剪阈值，提升训练稳定性
+  ratio_clip: 0.2          # PPO policy ratio 裁剪范围 epsilon
+  value_clip: 0.2          # value loss 裁剪范围
+  clip_predicted_values: True # 是否裁剪 value 预测，减少价值函数突变
 
-  entropy_loss_scale: 0.005
-  value_loss_scale: 1.0
-  kl_threshold: 0.0
+  entropy_loss_scale: 0.0005 # 熵奖励权重，鼓励策略探索
+  value_loss_scale: 1.0     # value loss 权重
+  kl_threshold: 0.0         # PPO 内部早停 KL 阈值；0 表示不启用该早停
 
-  rewards_shaper_scale: 1.0
-  time_limit_bootstrap: False
+  rewards_shaper_scale: 1.0 # reward shaper 的缩放系数
+  time_limit_bootstrap: False # 时间上限终止时是否 bootstrap value
 
   experiment:
-    directory: "fly_forward"
-    experiment_name: ""
-    write_interval: 200
-    checkpoint_interval: 10000
+    directory: "fly_forward" # 日志和 checkpoint 输出目录名
+    experiment_name: ""      # 实验名称；空字符串通常由运行脚本自动生成
+    write_interval: 200      # TensorBoard / 日志写入间隔
+    checkpoint_interval: 10000 # checkpoint 保存间隔
 
 
 # ── Sequential trainer ────────────────────────────────────────────────────────
+# 顺序训练器配置
 trainer:
-  class: SequentialTrainer
-  timesteps: 1000000
-  environment_info: log
+  class: SequentialTrainer # skrl 顺序训练器
+  timesteps: 1000000       # 总训练步数
+  environment_info: log    # 打印 / 记录环境信息
