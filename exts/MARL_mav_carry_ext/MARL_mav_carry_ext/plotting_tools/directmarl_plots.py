@@ -165,6 +165,35 @@ class DirectMARLPlotter:
         drone_BR = quat_apply(drone_orientation.unsqueeze(0), drone_ang_vel.unsqueeze(0))[0]  # 机体角速度
         drone_acc = self.robot.data.body_acc_w[:, self.drone_idx, :3][0]              # 加速度
         drone_ang_acc = self.robot.data.body_acc_w[:, self.drone_idx, 3:6][0]         # 角加速度
+        if not all(hasattr(self.env, name) for name in ("_drone_jerk", "actions", "geo_controllers", "_indi_controllers")):
+            rotor_forces = self.env._forces[0][..., 2] if hasattr(self.env, "_forces") else torch.empty(0)
+            for drone_num in range(drone_pos.shape[0]):
+                if drone_num not in self.drone_data_by_id:
+                    self.drone_data_by_id[drone_num] = {
+                        "drone_pos": drone_pos[drone_num].unsqueeze(0).tolist(),
+                        "drone_orientation": drone_orientation[drone_num].unsqueeze(0).tolist(),
+                        "drone_vel": drone_vel[drone_num].unsqueeze(0).tolist(),
+                        "drone_ang_vel": drone_ang_vel[drone_num].unsqueeze(0).tolist(),
+                        "drone_acc": drone_acc[drone_num].unsqueeze(0).tolist(),
+                        "drone_ang_acc": drone_ang_acc[drone_num].unsqueeze(0).tolist(),
+                    }
+                    if rotor_forces.numel() >= (drone_num + 1) * 4:
+                        self.drone_data_by_id[drone_num]["rotor_forces"] = (
+                            rotor_forces[(drone_num * 4) : (drone_num * 4) + 4].unsqueeze(0).tolist()
+                        )
+                else:
+                    self.drone_data_by_id[drone_num]["drone_pos"].append(drone_pos[drone_num].tolist())
+                    self.drone_data_by_id[drone_num]["drone_orientation"].append(drone_orientation[drone_num].tolist())
+                    self.drone_data_by_id[drone_num]["drone_vel"].append(drone_vel[drone_num].tolist())
+                    self.drone_data_by_id[drone_num]["drone_ang_vel"].append(drone_ang_vel[drone_num].tolist())
+                    self.drone_data_by_id[drone_num]["drone_acc"].append(drone_acc[drone_num].tolist())
+                    self.drone_data_by_id[drone_num]["drone_ang_acc"].append(drone_ang_acc[drone_num].tolist())
+                    if "rotor_forces" in self.drone_data_by_id[drone_num]:
+                        self.drone_data_by_id[drone_num]["rotor_forces"].append(
+                            rotor_forces[(drone_num * 4) : (drone_num * 4) + 4].tolist()
+                        )
+            return
+
         drone_jerk = self.env._drone_jerk[0]                                          # 加加速度
         rotor_forces = self.env._forces[0][..., 2]                                    # 旋翼推力(3*4个)
         

@@ -35,10 +35,11 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     lin_vel_z_down_max: float = 1.5   # z 方向向下速度上限，保留从过高高度恢复的下降能力
     ang_vel_max: float = 0.5     # 姿态角速度指令上限，单位 rad/s
     lin_acc_max: float = 2.0     # x/y 平面加速度上限，单位 m/s²
-    lin_acc_z_up_max: float = 0.1     # z 方向向上加速度上限，抑制高度超调
-    lin_acc_z_down_max: float = 2.0   # z 方向向下加速度上限，允许更强下降修正
+    lin_acc_z_up_max: float = 1.0     # z 方向向上加速度上限，给高度保持足够上升余量
+    lin_acc_z_down_max: float = 3.0   # z 方向向下加速度上限，允许更强下降修正
     vel_Kp: float = 2.0          # 速度控制比例增益
     vel_Kd: float = 0.3          # 速度控制微分增益
+    drone_mass: float = 0.6017   # Falcon 质量估计，direct-force 诊断模式用于计算悬停推力
 
     # ── Episode ───────────────────────────────────────────────────────────────
     decimation: int = 3          # 环境每执行一次 action，对应的物理仿真步数
@@ -53,12 +54,12 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Goal ──────────────────────────────────────────────────────────────────
     # 阶段课程目标：先要求无人机从出生点完成短距离前向推进。
-    goal_x: float = 8.0         # 目标点 x 坐标
+    goal_x: float = 4.0         # 目标点 x 坐标
     goal_y: float = 0.0         # 目标点 y 坐标
     goal_z: float = 2.0         # 目标高度
-    goal_tolerance: float = 2.0 # 短距离阶段的目标 shaping 半径，单位 m
+    goal_tolerance: float = 1.5 # 短距离阶段的目标 shaping 半径，单位 m
     success_speed_tolerance: float = 0.8 # 成功时的速度上限，第一阶段先宽松限制高速撞线
-    height_hold_kp: float = 1.5 # 高度保持比例增益
+    height_hold_kp: float = 2.0625 # 高度保持比例增益
     height_hold_damping: float = 0.4 # 高度保持阻尼系数
 
     # ── Spawn ─────────────────────────────────────────────────────────────────
@@ -69,8 +70,8 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     spawn_y_noise: float = 0.5   # y 方向随机扰动（训练鲁棒性）
 
     # ── Altitude limits ───────────────────────────────────────────────────────
-    fly_high_z: float = 3.0     # 飞得过高的终止高度阈值
-    fly_high_guard_z: float = 2.0 # 过高保护开始介入的高度阈值
+    fly_high_z: float = 3.2     # 飞得过高的终止高度阈值
+    fly_high_guard_z: float = 2.4 # 过高保护开始介入的高度阈值
     fly_high_guard_descent_acc: float = 3.5 # 过高保护触发时额外施加的下降加速度
     fly_low_z: float = 0.3      # 飞得过低的终止高度阈值
     out_of_bounds_radius: float = 35.0 # 水平越界半径；短距离目标下保持较紧范围
@@ -85,12 +86,12 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     progress_reward_weight: float = 5.0     # 真实接近目标的进度奖励权重
     forward_vel_reward_weight: float = 2.5  # 兼容旧配置，当前 reward 不使用
     dist_reward_weight: float = 1.0         # 距离目标奖励权重
-    dist_reward_scale: float = 0.25         # 距离奖励缩放系数；8m 初始距离下约 exp(-2)=0.135
+    dist_reward_scale: float = 0.35         # 距离奖励缩放系数；4m 初始距离下约 exp(-1.4)=0.247
     height_reward_weight: float = 0.8       # 兼容旧配置，当前 reward 不使用
     altitude_band_reward_weight: float = 0.2 # 安全高度带内存活正奖励
-    height_penalty_weight: float = 3.0      # 偏离目标高度的惩罚权重
-    fly_high_guard_penalty_weight: float = 20.0 # 过高保护区域惩罚权重
-    near_goal_radius: float = 3.0           # 目标附近减速区域半径，需大于 success 半径以提前减速
+    height_penalty_weight: float = 2.0      # 偏离目标高度的惩罚权重
+    fly_high_guard_penalty_weight: float = 10.0 # 过高保护区域惩罚权重
+    near_goal_radius: float = 2.5           # 目标附近减速区域半径，需大于 success 半径以提前减速
     slow_near_goal_reward_weight: float = 1.0 # 目标附近低速奖励权重
     speed_reward_scale: float = 1.0         # 低速奖励中的速度衰减系数
     speed_penalty_weight: float = 0.02      # 全局速度惩罚权重

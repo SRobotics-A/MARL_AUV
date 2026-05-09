@@ -62,7 +62,7 @@ class FlyForwardEnv(DirectRLEnv):
         # ── Controllers ───────────────────────────────────────────────────────
         # Falcon 的悬停转速 hover omega = sqrt(m*g / (4*k_tau)) ≈ 972 rad/s。
         # 原来用 1355 rad/s，是悬停的 1.94×，reset 后产生 +9 m/s² 瞬时向上加速度
-        _hover_omega = 972.0
+        _hover_omega = 980.0
         self._geo_ctrl = GeometricController(self.num_envs, "ACCBR") # 几何控制器：将期望加速度 / 角速度转为中间控制量
         self._indi_ctrl = IndiController(self.num_envs)              # INDI 控制器：根据当前状态计算目标转速
         self._motor_model = RotorMotor(
@@ -84,10 +84,10 @@ class FlyForwardEnv(DirectRLEnv):
             self._diag_writer = csv.writer(self._diag_file)
             mode = "zero" if self._diag_zero_action else "random" if self._diag_random else "policy"
             self._diag_writer.writerow(
-                ["mode", "episode", "policy_step",
-                 "x", "z", "vx", "vz",
-                 "a0", "a1", "a2",
-                 "cmd_acc_x", "cmd_acc_y", "cmd_acc_z"]
+                ["phase", "episode", "policy_step",
+                 "z", "vz", "cmd_acc_z",
+                 "thrust0", "thrust1", "thrust2", "thrust3",
+                 "total_thrust", "hover_ratio", "ll_counter"]
             )
             self._diag_episode: int = 0
             self._diag_step: int = 0
@@ -131,6 +131,13 @@ class FlyForwardEnv(DirectRLEnv):
                 "success_reward",
                 "crash_penalty",
             ]
+        }
+
+        self.metrics = {
+            "position_error": torch.zeros(self.num_envs, device=self.device),
+            "height_error": torch.zeros(self.num_envs, device=self.device),
+            "distance_to_goal": torch.zeros(self.num_envs, device=self.device),
+            "speed": torch.zeros(self.num_envs, device=self.device),
         }
 
     # ── Scene setup ──────────────────────────────────────────────────────────
@@ -226,6 +233,7 @@ class FlyForwardEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """解析 5 维 ACCBR 动作，并叠加自动高度保持。"""
+        actions = torch.clamp(actions, -1.0, 1.0)
         if self._diag_zero_action:
             # 零动作 smoke test：隔离策略输出，只检查高度保持和底层控制是否会自行爬升。
             actions = torch.zeros_like(actions)
@@ -289,24 +297,63 @@ class FlyForwardEnv(DirectRLEnv):
         }
 
         if self._diag_enabled:
-            # 只记录 env_0，降低 CSV 体积；主要关注位置、速度、动作和命令加速度。
+            # 只计数；实际施力诊断在 _apply_action() 写入，避免 thrust 滞后一行。
             self._diag_step += 1
-            root = self._robot.data.root_state_w
-            pos_l = root[0, :3] - self.scene.env_origins[0]
-            vel = root[0, 7:10]
-            a = actions[0]
-            ca = commanded_acc[0]
-            mode = "zero" if self._diag_zero_action else "random" if self._diag_random else "policy"
-            self._diag_writer.writerow([
-                mode, self._diag_episode, self._diag_step,
-                f"{pos_l[0].item():.4f}", f"{pos_l[2].item():.4f}",
-                f"{vel[0].item():.4f}", f"{vel[2].item():.4f}",
-                f"{a[0].item():.4f}", f"{a[1].item():.4f}", f"{a[2].item():.4f}",
-                f"{ca[0].item():.4f}", f"{ca[1].item():.4f}", f"{ca[2].item():.4f}",
-            ])
+
+    def _write_apply_diag(self) -> None:
+        if not self._diag_enabled:
+            return
+
+        root = self._robot.data.root_state_w
+        pos_l = root[0, :3] - self.scene.env_origins[0]
+        vel = root[0, 7:10]
+
+        applied_total = self._forces[0, :, 2].sum()
+        true_hover_total = 1.025 * self.cfg.drone_mass * 9.81
+        hover_ratio_applied = applied_total / true_hover_total
+        lin_acc_z = self._setpoint["lin_acc"][0, 2] if hasattr(self, "_setpoint") else torch.zeros((), device=self.device)
+
+        self._diag_writer.writerow([
+            "apply",
+            self._diag_episode,
+            self._diag_step,
+            f"{pos_l[2].item():.4f}",
+            f"{vel[2].item():.4f}",
+            f"{lin_acc_z.item():.4f}",
+            f"{self._forces[0, 0, 2].item():.6f}",
+            f"{self._forces[0, 1, 2].item():.6f}",
+            f"{self._forces[0, 2, 2].item():.6f}",
+            f"{self._forces[0, 3, 2].item():.6f}",
+            f"{applied_total.item():.6f}",
+            f"{hover_ratio_applied.item():.4f}",
+            str(self._ll_counter),
+        ])
 
     def _apply_action(self) -> None:
         """将高层 setpoint 通过几何控制、INDI 控制和电机模型转换为外力 / 外力矩。"""
+        if os.environ.get("FLY_FORWARD_DIRECT_FORCE", "0") == "1":
+            root = self._robot.data.root_state_w
+            mass = self.cfg.drone_mass
+            f_hover = mass * 9.81 / 4.0
+            scale = float(os.environ.get("FLY_FORWARD_FORCE_SCALE", "1.0"))
+
+            self._forces.zero_()
+            self._moments.zero_()
+            self._forces[..., 2] = scale * f_hover
+
+            self._robot.set_external_force_and_torque(
+                forces=torch.zeros(self.num_envs, 1, 3, device=self.device),
+                torques=self._moments,
+                body_ids=self._falcon_body_idx,
+            )
+            self._robot.set_external_force_and_torque(
+                forces=self._forces,
+                torques=torch.zeros_like(self._forces),
+                body_ids=self._rotor_idx,
+            )
+            self._write_apply_diag()
+            return
+
         if self._diag_zero_action:
             root = self._robot.data.root_state_w
             pos_local = root[:, :3] - self.scene.env_origins
@@ -341,6 +388,7 @@ class FlyForwardEnv(DirectRLEnv):
                 torques=torch.zeros_like(self._forces),
                 body_ids=self._rotor_idx,
             )
+            self._write_apply_diag()
             return
 
         if self._ll_counter % self.cfg.low_level_decimation == 0:
@@ -402,8 +450,19 @@ class FlyForwardEnv(DirectRLEnv):
             torques=torch.zeros_like(self._forces),
             body_ids=self._rotor_idx,
         )
+        self._write_apply_diag()
 
     # ── Observations ─────────────────────────────────────────────────────────
+
+    def _update_metrics(self) -> None:
+        root = self._robot.data.root_state_w
+        pos_w = root[:, :3]
+        pos_l = pos_w - self.scene.env_origins
+        goal_rel = self._goal_w - pos_w
+        self.metrics["position_error"] = torch.norm(goal_rel, dim=-1)
+        self.metrics["height_error"] = torch.abs(pos_l[:, 2] - self.cfg.goal_z)
+        self.metrics["distance_to_goal"] = torch.norm(goal_rel, dim=-1)
+        self.metrics["speed"] = torch.norm(root[:, 7:10], dim=-1)
 
     def _get_observations(self) -> dict:
         """构造策略网络输入观测。"""
@@ -413,6 +472,7 @@ class FlyForwardEnv(DirectRLEnv):
         ang_vel = root[:, 10:13]                           # (N, 3)，世界系角速度
         rot_mat = matrix_from_quat(root[:, 3:7]).view(self.num_envs, 9) # 姿态四元数转 3x3 旋转矩阵并展平
         goal_rel = self._goal_w - root[:, :3]              # (N, 3)，目标相对当前位置的世界系向量
+        self._update_metrics()
 
         # 绝对 x/y 位置和目标相对 x/y 分开缩放，避免短距离目标信号过小。
         pos_norm = torch.stack(
