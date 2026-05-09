@@ -23,7 +23,7 @@ models:
     clip_log_std: True    # 裁剪动作分布的 log_std，避免方差过大或过小
     min_log_std: -5.0     # log 标准差下限
     max_log_std: 2.0      # log 标准差上限
-    initial_log_std: -1.5 # 初始 log 标准差
+    initial_log_std: -2.0 # 初始 log 标准差
     network:
       - name: net
         input: STATES       # 输入为环境状态
@@ -78,7 +78,7 @@ agent:
   value_clip: 0.2          # value loss 裁剪范围
   clip_predicted_values: True # 是否裁剪 value 预测，减少价值函数突变
 
-  entropy_loss_scale: 0.0005 # 熵奖励权重，鼓励策略探索
+  entropy_loss_scale: 0.0003 # 熵奖励权重，鼓励策略探索
   value_loss_scale: 1.0     # value loss 权重
   kl_threshold: 0.0         # PPO 内部早停 KL 阈值；0 表示不启用该早停
 

@@ -126,8 +126,10 @@ class FlyForwardEnv(DirectRLEnv):
                 "fly_high_guard_penalty",
                 "slow_near_goal_reward",
                 "speed_penalty",
+                "speed_limit_penalty",
                 "upright_penalty",
                 "action_smoothness",
+                "action_magnitude",
                 "success_reward",
                 "crash_penalty",
             ]
@@ -255,7 +257,8 @@ class FlyForwardEnv(DirectRLEnv):
 
         # 将归一化动作映射为期望速度。x/y 来自策略，z 由高度保持 PD 计算。
         desired_vel = torch.zeros(self.num_envs, 3, device=self.device)
-        desired_vel[:, :2] = actions[:, :2] * self.cfg.lin_vel_max
+        desired_vel[:, 0] = actions[:, 0] * self.cfg.lin_vel_x_max
+        desired_vel[:, 1] = actions[:, 1] * self.cfg.lin_vel_y_max
         current_vel = self._robot.data.root_lin_vel_w
         height_vel_cmd = self.cfg.height_hold_kp * (self.cfg.goal_z - z) - self.cfg.height_hold_damping * current_vel[:, 2]
         desired_vel[:, 2] = torch.clamp_min(height_vel_cmd, -self.cfg.lin_vel_z_down_max)
@@ -290,9 +293,9 @@ class FlyForwardEnv(DirectRLEnv):
         # setpoint 是几何控制器的输入：线加速度、机体系角速度、yaw/yaw_rate/yaw_acc。
         self._setpoint = {
             "lin_acc": commanded_acc,
-            "body_rates": actions[:, 2:5] * self.cfg.ang_vel_max,
+            "body_rates": torch.zeros(self.num_envs, 3, device=self.device),
             "yaw": torch.zeros(self.num_envs, 1, device=self.device),
-            "yaw_rate": actions[:, 4:5] * self.cfg.ang_vel_max,
+            "yaw_rate": torch.zeros(self.num_envs, 1, device=self.device),
             "yaw_acc": torch.zeros(self.num_envs, 1, device=self.device),
         }
 
@@ -548,6 +551,10 @@ class FlyForwardEnv(DirectRLEnv):
 
         # 7. 全局速度惩罚，避免高速冲过目标
         speed_pen = -self.cfg.speed_penalty_weight * speed.square()
+        speed_limit_pen = (
+            -self.cfg.speed_limit_penalty_weight
+            * torch.relu(speed - self.cfg.speed_soft_limit).square()
+        )
 
         # 8. 姿态稳定
         upright_pen = self.cfg.upright_penalty_weight * (z_body_z - 1.0)
@@ -555,6 +562,7 @@ class FlyForwardEnv(DirectRLEnv):
         # 9. 动作平滑
         delta_a = self._actions - self._prev_actions
         smooth_pen = -self.cfg.action_smoothness_weight * delta_a.square().sum(-1)
+        action_mag_pen = -self.cfg.action_magnitude_weight * self._actions.square().sum(-1)
         self._prev_actions = self._actions.clone()
 
         # 10. 成功奖励
@@ -575,8 +583,10 @@ class FlyForwardEnv(DirectRLEnv):
             + fly_high_guard_pen
             + slow_near_goal_rew
             + speed_pen
+            + speed_limit_pen
             + upright_pen
             + smooth_pen
+            + action_mag_pen
             + success_rew
             + crash_pen
         )
@@ -589,8 +599,10 @@ class FlyForwardEnv(DirectRLEnv):
         self._episode_sums["fly_high_guard_penalty"] += fly_high_guard_pen
         self._episode_sums["slow_near_goal_reward"] += slow_near_goal_rew
         self._episode_sums["speed_penalty"] += speed_pen
+        self._episode_sums["speed_limit_penalty"] += speed_limit_pen
         self._episode_sums["upright_penalty"] += upright_pen
         self._episode_sums["action_smoothness"] += smooth_pen
+        self._episode_sums["action_magnitude"] += action_mag_pen
         self._episode_sums["success_reward"] += success_rew
         self._episode_sums["crash_penalty"] += crash_pen
 
@@ -603,8 +615,10 @@ class FlyForwardEnv(DirectRLEnv):
                 "Episode Reward/fly_high_guard_pen": fly_high_guard_pen.mean().item(),
                 "Episode Reward/slow_near_goal": slow_near_goal_rew.mean().item(),
                 "Episode Reward/speed_pen": speed_pen.mean().item(),
+                "Episode Reward/speed_limit_pen": speed_limit_pen.mean().item(),
                 "Episode Reward/upright": upright_pen.mean().item(),
                 "Episode Reward/smooth": smooth_pen.mean().item(),
+                "Episode Reward/action_magnitude": action_mag_pen.mean().item(),
                 "Episode Reward/success": success_rew.mean().item(),
                 "Episode Reward/crash": crash_pen.mean().item(),
                 "Metrics/z_mean": z.mean().item(),
