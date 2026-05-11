@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from MARL_mav_carry_ext.controllers.utils import LowPassFilter
@@ -42,6 +44,7 @@ class GeometricController:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_envs = num_envs
         self.control_mode = control_mode
+        self.disable_acc_load = os.environ.get("FLY_FORWARD_DISABLE_ACC_LOAD", "0") == "1"
 
         # 位置和速度误差限幅值，防止控制输入过大
         self.p_err_max_ = torch.full((self.num_envs, 3), torch.finfo(torch.float32).max, device=self.device)
@@ -249,9 +252,14 @@ class GeometricController:
 
         # 负载加速度估计（在世界坐标系中）
         # 公式：acc_load = measured_acc - gravity - (thrust / mass) * body_z_axis
-        acc_load = (
-            state["lin_acc"] - self.gravity - quat_apply(state["quat"], current_collective_thrust / self.falcon_mass)
-        )
+        if self.disable_acc_load or os.environ.get("FLY_FORWARD_DISABLE_ACC_LOAD", "0") == "1":
+            acc_load = torch.zeros_like(state["lin_acc"])
+        else:
+            acc_load = (
+                state["lin_acc"]
+                - self.gravity
+                - quat_apply(state["quat"], current_collective_thrust / self.falcon_mass)
+            )
 
         if self.debug:
             self.acc_load_debug = acc_load

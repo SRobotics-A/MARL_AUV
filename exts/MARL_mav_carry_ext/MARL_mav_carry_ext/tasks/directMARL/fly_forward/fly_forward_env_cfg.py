@@ -2,8 +2,21 @@
 
 任务：从出生点出发，在保持低空稳定飞行的同时向前推进。
       当前阶段课程：先学习低空存活和短距离前向飞行。
-      飞行高度必须保持在 4m 以下。
+      当前高飞终止阈值由 fly_high_z 控制，过高保护从 fly_high_guard_z 开始介入。
 场景：fly_forward.usda（Rivermark 室外场景 + 单架 Falcon 无人机）。
+
+配置组织方式：
+    Control: 高层动作到期望速度 / 期望加速度的映射和限幅。
+    Episode/Spaces: DirectRLEnv 的 episode 长度、action_space、observation_space。
+    Goal/Spawn/Altitude: 当前课程目标、出生点随机化和低空安全边界。
+    Normalisation: 观测归一化尺度，影响 PPO 能否看到足够强的目标信号。
+    Reward weights: reward shaping 的所有权重，只定义数值，不实现公式。
+    Simulation/Scene/Robot: Isaac Lab 仿真、USD 场景和 Falcon articulation 配置。
+
+注意：
+    当前课程故意不是最终长航程任务，而是“短距离、低速、低空、一维前飞”的第一阶段。
+    如果后续把 goal_x 加到 20m/50m/200m，需要同步检查 norm_goal_xy_scale、dist_reward_scale、
+    near_goal_radius、速度上限和终止半径，否则 reward 尺度会再次失衡。
 """
 
 from __future__ import annotations
@@ -25,18 +38,27 @@ from MARL_mav_carry_ext.assets import FALCON_CFG
 
 @configclass
 class FlyForwardEnvCfg(DirectRLEnvCfg):
-    """fly-forward 单无人机 PPO 任务配置（低空、短距离、前向飞行课程）。"""
+    """fly-forward 单无人机 PPO 任务配置（低空、短距离、前向飞行课程）。
+
+    这个类只保存参数，不包含训练逻辑。实际使用位置：
+        - fly_forward_env.py::_pre_physics_step 读取控制限幅和高度保持参数。
+        - fly_forward_env.py::_get_observations 读取观测归一化参数。
+        - fly_forward_env.py::_get_rewards 读取 reward 权重。
+        - fly_forward_env.py::_get_dones 读取成功 / 失败阈值。
+    """
 
     # ── Control ──────────────────────────────────────────────────────────────
-    # 控制模式：ACCBR 表示动作直接给速度 / 角速度指令，z 方向由高度保持逻辑自动处理。
-    control_mode: str = "ACCBR"  # 5 维动作：[vx, vy, roll_rate, pitch_rate, yaw_rate]
+    # 控制模式：ACCBR 表示兼容“加速度 + body rate”控制接口。
+    # 但当前课程为了降低探索维度，只使用 action[0] -> 非负 vx_cmd。
+    # z 方向由高度保持逻辑自动处理，body_rates/yaw_rate 暂时固定为 0。
+    control_mode: str = "ACCBR"  # 兼容 5 维动作；当前课程只使用 action[0] 生成非负 vx_cmd
     lin_vel_max: float = 3.0     # 兼容旧配置，当前 x/y 分别使用 lin_vel_x_max / lin_vel_y_max
-    lin_vel_x_max: float = 0.8   # x 方向速度指令上限，单位 m/s
-    lin_vel_y_max: float = 0.2   # y 方向速度指令上限，单位 m/s
-    lin_vel_z_up_max: float = 0.08    # z 方向向上速度上限，保守限制爬升速度
+    lin_vel_x_max: float = 0.4   # x 方向速度指令上限，单位 m/s
+    lin_vel_y_max: float = 0.0   # y 方向速度指令上限，单位 m/s
+    lin_vel_z_up_max: float = 0.4     # z 方向向上速度上限，禁用 acc_load 后需要足够恢复高度
     lin_vel_z_down_max: float = 1.5   # z 方向向下速度上限，保留从过高高度恢复的下降能力
     ang_vel_max: float = 0.5     # 姿态角速度指令上限，单位 rad/s
-    lin_acc_max: float = 2.0     # x/y 平面加速度上限，单位 m/s²
+    lin_acc_max: float = 0.3     # x/y 平面加速度上限，单位 m/s²
     lin_acc_z_up_max: float = 1.0     # z 方向向上加速度上限，给高度保持足够上升余量
     lin_acc_z_down_max: float = 3.0   # z 方向向下加速度上限，允许更强下降修正
     vel_Kp: float = 2.0          # 速度控制比例增益
@@ -56,11 +78,12 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Goal ──────────────────────────────────────────────────────────────────
     # 阶段课程目标：先要求无人机从出生点完成短距离前向推进。
-    goal_x: float = 3.0         # 目标点 x 坐标
-    goal_y: float = 0.0         # 目标点 y 坐标
-    goal_z: float = 2.0         # 目标高度
-    goal_tolerance: float = 2.0 # 短距离阶段的目标 shaping 半径，单位 m
-    success_speed_tolerance: float = 0.8 # 成功时的速度上限，第一阶段先宽松限制高速撞线
+    # reset 时实际目标为 spawn_pos + (goal_x, goal_y, 0)，z 使用 env_origin + goal_z。
+    goal_x: float = 2.0         # 目标点相对出生点的 x 偏移，单位 m
+    goal_y: float = 0.0         # 目标点相对出生点的 y 偏移，单位 m
+    goal_z: float = 2.0         # 目标局部高度，单位 m
+    goal_tolerance: float = 1.2 # 短距离阶段的目标 shaping 半径，单位 m
+    success_speed_tolerance: float = 0.4 # 成功时的速度上限，第一阶段先宽松限制高速撞线
     height_hold_kp: float = 2.0625 # 高度保持比例增益
     height_hold_damping: float = 0.4 # 高度保持阻尼系数
 
@@ -80,26 +103,32 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Normalisation ─────────────────────────────────────────────────────────
     norm_pos_scale: float = 50.0  # x/y 位置归一化尺度，适配前向飞行课程
-    norm_goal_xy_scale: float = 3.0 # 目标相对 x/y 归一化尺度，当前 3m 课程下初始 goal_rel_x 约为 1
+    norm_goal_xy_scale: float = 2.0 # 目标相对 x/y 归一化尺度，当前 2m 课程下初始 goal_rel_x 约为 1
     norm_z_scale: float = 5.0     # z 位置独立归一化，避免高度信号过小
     norm_vel_scale: float = 5.0   # 速度归一化尺度
 
     # ── Reward weights ────────────────────────────────────────────────────────
-    progress_reward_weight: float = 8.0     # 真实接近目标的进度奖励权重
+    # reward 公式在 fly_forward_env.py::_get_rewards 中实现。
+    # 这里的权重按“早期短距离低空训练”调过：硬约束主要靠控制限幅，reward 负责提供方向信号。
+    progress_reward_weight: float = 3.0     # 真实接近目标的进度奖励权重
+    forward_progress_reward_weight: float = 10.0 # 安全高度内 x 正向进度奖励权重
+    forward_speed_reward_weight: float = 1.0 # 目标前向速度奖励权重
+    target_forward_speed: float = 0.3       # 期望前向速度，单位 m/s
+    forward_speed_sigma: float = 0.05       # 前向速度奖励高斯宽度
     forward_vel_reward_weight: float = 2.5  # 兼容旧配置，当前 reward 不使用
     dist_reward_weight: float = 1.0         # 距离目标奖励权重
-    dist_reward_scale: float = 0.35         # 距离奖励缩放系数；3m 初始距离下约 exp(-1.05)=0.35
+    dist_reward_scale: float = 0.5          # 距离奖励缩放系数；2m 初始距离下约 exp(-1)=0.368
     height_reward_weight: float = 0.8       # 兼容旧配置，当前 reward 不使用
     altitude_band_reward_weight: float = 0.2 # 安全高度带内存活正奖励
-    height_penalty_weight: float = 3.0      # 偏离目标高度的惩罚权重
+    height_penalty_weight: float = 1.0      # 偏离目标高度的惩罚权重，避免长 episode 累计值过大
     fly_high_guard_penalty_weight: float = 20.0 # 过高保护区域惩罚权重
-    near_goal_radius: float = 2.5           # 目标附近减速区域半径，需大于 success 半径以提前减速
+    near_goal_radius: float = 3.0           # 目标附近减速区域半径，需大于 success 半径以提前减速
     slow_near_goal_reward_weight: float = 1.0 # 目标附近低速奖励权重
     speed_reward_scale: float = 1.0         # 低速奖励中的速度衰减系数
-    speed_penalty_weight: float = 0.08      # 全局速度惩罚权重
+    speed_penalty_weight: float = 0.02      # 全局速度惩罚权重
     speed_soft_limit: float = 1.2           # 速度软限制阈值，超过后额外惩罚
-    speed_limit_penalty_weight: float = 2.0 # 超过速度软限制后的二次惩罚权重
-    action_magnitude_weight: float = 0.02   # 动作幅度惩罚权重
+    speed_limit_penalty_weight: float = 0.0 # 超过速度软限制后的二次惩罚权重
+    action_magnitude_weight: float = 0.01   # 动作幅度惩罚权重
     upright_penalty_weight: float = 0.5     # 姿态偏离竖直 / 水平稳定状态的惩罚权重
     action_smoothness_weight: float = 0.01  # 动作平滑惩罚权重
     success_forward_x: float = 8.0          # 判定前向成功所需达到的 x 坐标
