@@ -50,15 +50,16 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     # ── Control ──────────────────────────────────────────────────────────────
     # 控制模式：ACCBR 表示兼容“加速度 + body rate”控制接口。
     # 但当前课程为了降低探索维度，只使用 action[0] -> 非负 vx_cmd。
+    # 动作映射为 a0=-1 -> 0m/s，a0=0 -> 半速前进，a0=1 -> 最大前进速度，避免初始策略开局悬停。
     # z 方向由高度保持逻辑自动处理，body_rates/yaw_rate 暂时固定为 0。
     control_mode: str = "ACCBR"  # 兼容 5 维动作；当前课程只使用 action[0] 生成非负 vx_cmd
     lin_vel_max: float = 3.0     # 兼容旧配置，当前 x/y 分别使用 lin_vel_x_max / lin_vel_y_max
-    lin_vel_x_max: float = 0.4   # x 方向速度指令上限，单位 m/s
+    lin_vel_x_max: float = 0.8   # x 方向速度指令上限，单位 m/s；10m 课程使用中等速度
     lin_vel_y_max: float = 0.0   # y 方向速度指令上限，单位 m/s
     lin_vel_z_up_max: float = 0.4     # z 方向向上速度上限，禁用 acc_load 后需要足够恢复高度
     lin_vel_z_down_max: float = 1.5   # z 方向向下速度上限，保留从过高高度恢复的下降能力
     ang_vel_max: float = 0.5     # 姿态角速度指令上限，单位 rad/s
-    lin_acc_max: float = 0.3     # x/y 平面加速度上限，单位 m/s²
+    lin_acc_max: float = 0.5     # x/y 平面加速度上限，单位 m/s²；比 2m 快，但避免 20m 版本过冲
     lin_acc_z_up_max: float = 1.0     # z 方向向上加速度上限，给高度保持足够上升余量
     lin_acc_z_down_max: float = 3.0   # z 方向向下加速度上限，允许更强下降修正
     vel_Kp: float = 2.0          # 速度控制比例增益
@@ -77,13 +78,13 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     state_space: int = 0        # 未使用集中式 state，置 0
 
     # ── Goal ──────────────────────────────────────────────────────────────────
-    # 阶段课程目标：先要求无人机从出生点完成短距离前向推进。
+    # 阶段课程目标：在低空稳定前飞的基础上，把目标距离扩展到 10m。
     # reset 时实际目标为 spawn_pos + (goal_x, goal_y, 0)，z 使用 env_origin + goal_z。
-    goal_x: float = 2.0         # 目标点相对出生点的 x 偏移，单位 m
+    goal_x: float = 10.0        # 目标点相对出生点的 x 偏移，单位 m
     goal_y: float = 0.0         # 目标点相对出生点的 y 偏移，单位 m
     goal_z: float = 2.0         # 目标局部高度，单位 m
-    goal_tolerance: float = 1.2 # 短距离阶段的目标 shaping 半径，单位 m
-    success_speed_tolerance: float = 0.4 # 成功时的速度上限，第一阶段先宽松限制高速撞线
+    goal_tolerance: float = 1.3 # 10m 课程的目标半径，先保留一定容差，稳定后再收紧
+    success_speed_tolerance: float = 0.5 # 成功时的速度上限，要求接近目标时完成减速
     height_hold_kp: float = 2.0625 # 高度保持比例增益
     height_hold_damping: float = 0.4 # 高度保持阻尼系数
 
@@ -103,7 +104,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
 
     # ── Normalisation ─────────────────────────────────────────────────────────
     norm_pos_scale: float = 50.0  # x/y 位置归一化尺度，适配前向飞行课程
-    norm_goal_xy_scale: float = 2.0 # 目标相对 x/y 归一化尺度，当前 2m 课程下初始 goal_rel_x 约为 1
+    norm_goal_xy_scale: float = 10.0 # 目标相对 x/y 归一化尺度，10m 课程下初始 goal_rel_x 约为 1
     norm_z_scale: float = 5.0     # z 位置独立归一化，避免高度信号过小
     norm_vel_scale: float = 5.0   # 速度归一化尺度
 
@@ -112,27 +113,31 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     # 这里的权重按“早期短距离低空训练”调过：硬约束主要靠控制限幅，reward 负责提供方向信号。
     progress_reward_weight: float = 3.0     # 真实接近目标的进度奖励权重
     forward_progress_reward_weight: float = 10.0 # 安全高度内 x 正向进度奖励权重
-    forward_speed_reward_weight: float = 1.0 # 目标前向速度奖励权重
-    target_forward_speed: float = 0.3       # 期望前向速度，单位 m/s
-    forward_speed_sigma: float = 0.05       # 前向速度奖励高斯宽度
+    forward_speed_reward_weight: float = 1.0 # 目标前向速度奖励权重；实际 reward 中会乘 step_dt
+    target_forward_speed: float = 0.6       # 期望前向速度，单位 m/s
+    forward_speed_sigma: float = 0.12       # 前向速度奖励高斯宽度；10m 中速课程使用中等宽度
+    forward_speed_min_vx: float = 0.1       # 前向速度奖励的最小 vx 门槛，避免悬停拿速度奖励
     forward_vel_reward_weight: float = 2.5  # 兼容旧配置，当前 reward 不使用
-    dist_reward_weight: float = 1.0         # 距离目标奖励权重
-    dist_reward_scale: float = 0.5          # 距离奖励缩放系数；2m 初始距离下约 exp(-1)=0.368
+    dist_reward_weight: float = 1.0         # 距离目标奖励权重；实际 reward 中会乘 step_dt，避免超时刷分
+    dist_reward_scale: float = 0.25         # 距离奖励缩放系数；10m 初始距离下约 exp(-2.5)=0.08
     height_reward_weight: float = 0.8       # 兼容旧配置，当前 reward 不使用
-    altitude_band_reward_weight: float = 0.2 # 安全高度带内存活正奖励
+    altitude_band_reward_weight: float = 0.2 # 安全高度带内存活正奖励；实际 reward 中会乘 step_dt
     height_penalty_weight: float = 1.0      # 偏离目标高度的惩罚权重，避免长 episode 累计值过大
     fly_high_guard_penalty_weight: float = 20.0 # 过高保护区域惩罚权重
-    near_goal_radius: float = 3.0           # 目标附近减速区域半径，需大于 success 半径以提前减速
-    slow_near_goal_reward_weight: float = 1.0 # 目标附近低速奖励权重
+    near_goal_radius: float = 3.0           # 目标附近减速区域半径，10m 课程下提前进入减速阶段
+    near_goal_reward_radius: float = 1.8    # 低速接近奖励的触发半径，需小于减速半径，避免远处悬停刷分
+    slow_near_goal_reward_weight: float = 1.0 # 目标附近低速奖励权重；实际 reward 中会乘 step_dt
     speed_reward_scale: float = 1.0         # 低速奖励中的速度衰减系数
     speed_penalty_weight: float = 0.02      # 全局速度惩罚权重
     speed_soft_limit: float = 1.2           # 速度软限制阈值，超过后额外惩罚
     speed_limit_penalty_weight: float = 0.0 # 超过速度软限制后的二次惩罚权重
+    hover_still_speed_threshold: float = 0.08 # 远离目标时，低于该速度视为“基本悬停”
+    hover_still_penalty_weight: float = 0.3 # 远离目标且基本不动时的惩罚，专门用于打掉悬停局部最优
     action_magnitude_weight: float = 0.01   # 动作幅度惩罚权重
     upright_penalty_weight: float = 0.5     # 姿态偏离竖直 / 水平稳定状态的惩罚权重
     action_smoothness_weight: float = 0.01  # 动作平滑惩罚权重
-    success_forward_x: float = 8.0          # 判定前向成功所需达到的 x 坐标
-    success_reward: float = 20.0            # 成功到达目标后的终止奖励
+    success_forward_x: float = 8.0          # 判定成功前至少需要完成的前向位移，单位 m
+    success_reward: float = 3000.0          # 成功到达目标后的终止奖励，需高于超时悬停累计 dense reward
     fly_high_penalty: float = 20.0          # 飞得过高时的终止惩罚
     fly_low_penalty: float = 20.0           # 飞得过低时的终止惩罚
     out_of_bounds_penalty: float = 20.0     # 水平越界时的终止惩罚

@@ -48,7 +48,7 @@ class FlyForwardEnv(DirectRLEnv):
         drone_ang_vel_norm(3) | goal_rel_norm(3)
 
     当前课程阶段动作：
-        action[0] -> 非负 vx_cmd
+        action[0] -> 非负 vx_cmd，-1 对应 0m/s，0 对应半速前进，1 对应最大前进速度
         action[1:5] 暂时忽略
         vy/body_rates/yaw_rate 固定为 0，z 方向由高度保持逻辑自动维持在 goal_z 附近。
 
@@ -167,6 +167,7 @@ class FlyForwardEnv(DirectRLEnv):
                 "slow_near_goal_reward",
                 "speed_penalty",
                 "speed_limit_penalty",
+                "hover_still_penalty",
                 "upright_penalty",
                 "action_smoothness",
                 "action_magnitude",
@@ -279,7 +280,7 @@ class FlyForwardEnv(DirectRLEnv):
         这一层是“高层课程逻辑”，不直接施加力：
             1. 先把策略动作限制到 [-1, 1]，避免网络输出异常值进入控制器。
             2. 诊断模式可以覆盖动作，例如 zero-action、const-a0、random-action。
-            3. 当前课程只使用 action[0]，并把它映射为非负 x 方向期望速度。
+            3. 当前课程只使用 action[0]，并把 [-1, 1] 线性映射为非负 x 方向期望速度。
             4. y 方向和机体系角速度暂时固定为 0，降低早期探索难度。
             5. z 方向由高度保持 PD 自动生成期望速度，再转换成期望加速度。
 
@@ -298,7 +299,8 @@ class FlyForwardEnv(DirectRLEnv):
         self._actions = actions.clone() # 保存当前动作，用于奖励中的动作平滑项
 
         # 当前局部位置用于高度保护；root_pos_w 是世界坐标，需要减去 env 原点。
-        current_pos = self._robot.data.root_pos_w - self.scene.env_origins
+        root_pos_w = self._robot.data.root_pos_w
+        current_pos = root_pos_w - self.scene.env_origins
         z = current_pos[:, 2]
         # 高度保护门控：z 从 fly_high_guard_z 接近 fly_high_z 时，upward_scale 从 1 降到 0。
         high_guard = torch.clamp(
@@ -310,8 +312,14 @@ class FlyForwardEnv(DirectRLEnv):
 
         # 将归一化动作映射为期望速度。
         # 当前阶段只有 x 方向来自策略；y 固定为 0；z 由高度保持 PD 计算。
+        # 注意不要用 clamp(a0, 0, 1)：初始策略均值约为 0，会直接映射成 desired_vx=0 并导致开局悬停。
+        # 线性映射后，a0=-1 -> 0m/s，a0=0 -> 0.5*lin_vel_x_max，a0=1 -> lin_vel_x_max。
         desired_vel = torch.zeros(self.num_envs, 3, device=self.device)
-        desired_vel[:, 0] = torch.clamp(actions[:, 0], 0.0, 1.0) * self.cfg.lin_vel_x_max
+        desired_vel[:, 0] = 0.5 * (actions[:, 0] + 1.0) * self.cfg.lin_vel_x_max
+        # 接近目标时主动降低 x 方向速度上限，避免 10m/20m 课程里高速冲过目标却无法满足 success_speed。
+        dist_to_goal = torch.norm(root_pos_w - self._goal_w, dim=-1)
+        near_goal_speed_scale = torch.clamp(dist_to_goal / self.cfg.near_goal_radius, 0.0, 1.0)
+        desired_vel[:, 0] *= near_goal_speed_scale
         desired_vel[:, 1] = 0.0
         current_vel = self._robot.data.root_lin_vel_w
         height_vel_cmd = self.cfg.height_hold_kp * (self.cfg.goal_z - z) - self.cfg.height_hold_damping * current_vel[:, 2]
@@ -676,6 +684,7 @@ class FlyForwardEnv(DirectRLEnv):
         z = pos_l[:, 2]
         dist = torch.norm(pos_w - self._goal_w, dim=-1)
         speed = torch.norm(vel_w, dim=-1)
+        forward_progress = pos_w[:, 0] - self._spawn_w[:, 0]
 
         fly_high = z > self.cfg.fly_high_z
         fly_low = z < self.cfg.fly_low_z
@@ -686,6 +695,7 @@ class FlyForwardEnv(DirectRLEnv):
         stable_upright = z_body_z > 0.9
         success = (
             (dist < self.cfg.goal_tolerance)
+            & (forward_progress > self.cfg.success_forward_x)
             & (speed < self.cfg.success_speed_tolerance)
             & (z < self.cfg.fly_high_guard_z)
             & stable_upright
@@ -698,6 +708,7 @@ class FlyForwardEnv(DirectRLEnv):
             "z": z,
             "dist": dist,
             "speed": speed,
+            "forward_progress": forward_progress,
             "z_body_z": z_body_z,
             "fly_high": fly_high,
             "fly_low": fly_low,
@@ -711,11 +722,12 @@ class FlyForwardEnv(DirectRLEnv):
         当前 reward 是“短距离低空前飞课程”的 shaping，而不是最终 200m 长航程版本：
             - progress_rew: 到目标距离变小才给奖励，防止远离目标。
             - forward_progress_rew: 在安全高度内向 +x 前进给奖励，帮助早期学会低速前飞。
-            - forward_speed_rew: 远离目标时奖励接近 target_forward_speed 的前向速度。
+            - forward_speed_rew: 远离目标且确实向前运动时，奖励接近 target_forward_speed 的前向速度。
             - slow_near_goal_rew: 接近目标后奖励低速，配合 success_speed_tolerance 防止高速撞线。
             - height/fly_high/upright/speed/action: 约束高度、姿态、速度和动作幅度。
 
         注意 _prev_dist、_prev_x、_prev_actions 会在这里更新，因此它们必须在 reset 时重新初始化。
+        持续存活型 dense reward 需要乘 step_dt，否则 PPO 会偏向“悬停到超时刷累计奖励”。
         """
         terms = self._compute_task_terms()
         pos_w = terms["pos_w"]
@@ -724,6 +736,7 @@ class FlyForwardEnv(DirectRLEnv):
         z = terms["z"]
         dist = terms["dist"]
         speed = terms["speed"]
+        forward_progress = terms["forward_progress"]
         z_body_z = terms["z_body_z"]
         height_error = z - self.cfg.goal_z
 
@@ -736,13 +749,17 @@ class FlyForwardEnv(DirectRLEnv):
         delta_x = pos_l[:, 0] - self._prev_x
         self._prev_x = pos_l[:, 0].clone()
 
-        # 2. 距离目标越近越好
-        dist_rew = self.cfg.dist_reward_weight * torch.exp(-self.cfg.dist_reward_scale * dist)
+        # 2. 距离目标越近越好。乘 step_dt，避免长时间悬停仅靠 dense distance reward 刷高总分。
+        dist_rew = (
+            self.cfg.dist_reward_weight
+            * torch.exp(-self.cfg.dist_reward_scale * dist)
+            * self.step_dt
+        )
 
         # 3. 安全高度带内存活正奖励，让早期策略明确知道低空稳定是有效行为。
         in_altitude_band = (z > self.cfg.fly_low_z + 0.2) & (z < self.cfg.fly_high_guard_z)
         altitude_safe = in_altitude_band.float()
-        altitude_band_rew = self.cfg.altitude_band_reward_weight * altitude_safe
+        altitude_band_rew = self.cfg.altitude_band_reward_weight * altitude_safe * self.step_dt
         goal_rel_x = self._goal_w[:, 0] - pos_w[:, 0]
         before_goal = goal_rel_x > 0.0
         forward_progress_rew = (
@@ -753,11 +770,15 @@ class FlyForwardEnv(DirectRLEnv):
         )
         vx = vel_w[:, 0]
         approach_phase = dist > self.cfg.goal_tolerance
+        forward_moving = vx > self.cfg.forward_speed_min_vx
         forward_speed_rew = (
             self.cfg.forward_speed_reward_weight
             * torch.exp(-((vx - self.cfg.target_forward_speed) ** 2) / self.cfg.forward_speed_sigma)
             * altitude_safe
             * approach_phase.float()
+            * before_goal.float()
+            * forward_moving.float()
+            * self.step_dt
         )
 
         # 4. 高度约束，明确惩罚偏离目标高度
@@ -769,12 +790,16 @@ class FlyForwardEnv(DirectRLEnv):
             * torch.relu(z - self.cfg.fly_high_guard_z).square()
         )
 
-        # 6. 目标附近必须慢下来
-        near_goal = dist < self.cfg.near_goal_radius
+        # 6. 目标附近必须慢下来。低速奖励只在“已完成大部分前向位移且真正接近目标”时生效，
+        # 避免策略在离目标还远时靠悬停刷累计奖励。
+        near_goal = dist < self.cfg.near_goal_reward_radius
+        final_approach = forward_progress > (self.cfg.success_forward_x - self.cfg.goal_tolerance)
         slow_near_goal_rew = (
             self.cfg.slow_near_goal_reward_weight
             * torch.exp(-self.cfg.speed_reward_scale * speed)
+            * final_approach.float()
             * near_goal.float()
+            * self.step_dt
         )
 
         # 7. 全局速度惩罚，避免高速冲过目标
@@ -783,6 +808,12 @@ class FlyForwardEnv(DirectRLEnv):
             -self.cfg.speed_limit_penalty_weight
             * torch.relu(speed - self.cfg.speed_soft_limit).square()
         )
+        hovering_far = (
+            (speed < self.cfg.hover_still_speed_threshold)
+            & (forward_progress < self.cfg.success_forward_x - self.cfg.goal_tolerance)
+            & (dist > self.cfg.near_goal_reward_radius)
+        )
+        hover_still_pen = -self.cfg.hover_still_penalty_weight * hovering_far.float() * self.step_dt
 
         # 8. 姿态稳定
         upright_pen = self.cfg.upright_penalty_weight * (z_body_z - 1.0)
@@ -814,6 +845,7 @@ class FlyForwardEnv(DirectRLEnv):
             + slow_near_goal_rew
             + speed_pen
             + speed_limit_pen
+            + hover_still_pen
             + upright_pen
             + smooth_pen
             + action_mag_pen
@@ -832,6 +864,7 @@ class FlyForwardEnv(DirectRLEnv):
         self._episode_sums["slow_near_goal_reward"] += slow_near_goal_rew
         self._episode_sums["speed_penalty"] += speed_pen
         self._episode_sums["speed_limit_penalty"] += speed_limit_pen
+        self._episode_sums["hover_still_penalty"] += hover_still_pen
         self._episode_sums["upright_penalty"] += upright_pen
         self._episode_sums["action_smoothness"] += smooth_pen
         self._episode_sums["action_magnitude"] += action_mag_pen
@@ -850,6 +883,7 @@ class FlyForwardEnv(DirectRLEnv):
                 "Episode Reward/slow_near_goal": slow_near_goal_rew.mean().item(),
                 "Episode Reward/speed_pen": speed_pen.mean().item(),
                 "Episode Reward/speed_limit_pen": speed_limit_pen.mean().item(),
+                "Episode Reward/hover_still_pen": hover_still_pen.mean().item(),
                 "Episode Reward/upright": upright_pen.mean().item(),
                 "Episode Reward/smooth": smooth_pen.mean().item(),
                 "Episode Reward/action_magnitude": action_mag_pen.mean().item(),
@@ -859,6 +893,7 @@ class FlyForwardEnv(DirectRLEnv):
                 "Metrics/z_max": z.max().item(),
                 "Metrics/dist_mean": dist.mean().item(),
                 "Metrics/speed_mean": speed.mean().item(),
+                "Metrics/forward_progress_mean": forward_progress.mean().item(),
             }
         )
 
