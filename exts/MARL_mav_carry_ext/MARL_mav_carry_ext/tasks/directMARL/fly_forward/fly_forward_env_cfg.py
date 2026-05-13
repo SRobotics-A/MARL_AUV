@@ -116,7 +116,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     move_reward_min_speed: float = 0.05     # 低于该速度时不认为无人机真正动起来
     progress_reward_weight: float = 8.0     # 真实接近目标的进度奖励权重
     forward_progress_reward_weight: float = 8.0 # 向目标方向移动的进度奖励权重
-    forward_speed_reward_weight: float = 1.0 # 目标前向速度奖励权重；实际 reward 中会乘 step_dt
+    forward_speed_reward_weight: float = 2.0 # 目标前向速度奖励权重；实际 reward 中会乘 step_dt
     target_forward_speed: float = 0.45      # 期望前向速度，单位 m/s
     forward_speed_sigma: float = 0.12       # 前向速度奖励高斯宽度；10m 中速课程使用中等宽度
     forward_speed_min_vx: float = 0.1       # 前向速度奖励的最小 vx 门槛，避免悬停拿速度奖励
@@ -136,6 +136,7 @@ class FlyForwardEnvCfg(DirectRLEnvCfg):
     speed_limit_penalty_weight: float = 0.0 # 超过速度软限制后的二次惩罚权重
     hover_still_speed_threshold: float = 0.08 # 远离目标时，低于该速度视为“基本悬停”
     hover_still_penalty_weight: float = 0.3 # 远离目标且基本不动时的惩罚，专门用于打掉悬停局部最优
+    time_penalty_weight: float = 0.05       # 每步时间惩罚权重，鼓励更早完成任务；实际 reward 中会乘 step_dt
     action_magnitude_weight: float = 0.001  # 动作幅度惩罚权重，只作用于当前使用的 action[0]
     upright_penalty_weight: float = 0.5     # 姿态偏离竖直 / 水平稳定状态的惩罚权重
     action_smoothness_weight: float = 0.002 # 动作平滑惩罚权重，避免过强约束前向动作

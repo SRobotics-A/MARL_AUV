@@ -183,6 +183,7 @@ class FlyForwardEnv(DirectRLEnv):
                 "speed_penalty",
                 "speed_limit_penalty",
                 "hover_still_penalty",
+                "time_penalty",
                 "upright_penalty",
                 "action_smoothness",
                 "action_magnitude",
@@ -905,6 +906,7 @@ class FlyForwardEnv(DirectRLEnv):
             & (dist > self.cfg.near_goal_reward_radius)
         )
         hover_still_pen = -self.cfg.hover_still_penalty_weight * hovering_far.float() * self.step_dt
+        time_pen = -self.cfg.time_penalty_weight * torch.ones_like(dist) * self.step_dt
 
         # 8. 姿态稳定
         upright_pen = self.cfg.upright_penalty_weight * (z_body_z - 1.0)
@@ -943,6 +945,7 @@ class FlyForwardEnv(DirectRLEnv):
             + speed_pen
             + speed_limit_pen
             + hover_still_pen
+            + time_pen
             + upright_pen
             + smooth_pen
             + action_mag_pen
@@ -962,6 +965,7 @@ class FlyForwardEnv(DirectRLEnv):
         self._episode_sums["speed_penalty"] += speed_pen
         self._episode_sums["speed_limit_penalty"] += speed_limit_pen
         self._episode_sums["hover_still_penalty"] += hover_still_pen
+        self._episode_sums["time_penalty"] += time_pen
         self._episode_sums["upright_penalty"] += upright_pen
         self._episode_sums["action_smoothness"] += smooth_pen
         self._episode_sums["action_magnitude"] += action_mag_pen
@@ -982,6 +986,7 @@ class FlyForwardEnv(DirectRLEnv):
                 "Episode Reward/speed_pen": speed_pen.mean().item(),
                 "Episode Reward/speed_limit_pen": speed_limit_pen.mean().item(),
                 "Episode Reward/hover_still_pen": hover_still_pen.mean().item(),
+                "Episode Reward/time_pen": time_pen.mean().item(),
                 "Episode Reward/upright": upright_pen.mean().item(),
                 "Episode Reward/smooth": smooth_pen.mean().item(),
                 "Episode Reward/action_magnitude": action_mag_pen.mean().item(),
