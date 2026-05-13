@@ -80,11 +80,25 @@ args_cli = parser.parse_args()
 # 如果启用了视频录制，自动启用摄像头功能
 if args_cli.video:
     args_cli.enable_cameras = True
+else:
+    args_cli.enable_cameras = False
+
+args_cli.livestream = 0
 
 # 启动 Omniverse 应用程序
 # AppLauncher 负责初始化 Isaac Sim 模拟器环境
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+if args_cli.headless and not args_cli.video:
+    import carb
+
+    carb_settings = carb.settings.get_settings()
+    carb_settings.set_bool("/app/window/enabled", False)
+    carb_settings.set_bool("/app/livestream/enabled", False)
+    carb_settings.set_bool("/app/xr/enabled", False)
+    carb_settings.set_bool("/isaaclab/render/offscreen", False)
+    carb_settings.set_bool("/isaaclab/render/active_viewport", False)
 
 """以下为播放的主要逻辑部分。"""
 
@@ -96,7 +110,7 @@ import torch
 # 确保本地 skrl 可被导入（仓库内自带 skrl 目录）
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _local_skrl = os.path.join(_repo_root, "skrl")
-if _local_skrl not in sys.path:
+if os.path.isfile(os.path.join(_local_skrl, "skrl", "__init__.py")) and _local_skrl not in sys.path:
     sys.path.insert(0, _local_skrl)
 
 import skrl

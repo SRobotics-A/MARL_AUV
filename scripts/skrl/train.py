@@ -85,6 +85,10 @@ args_cli, hydra_args = parser.parse_known_args()
 # 如果启用了视频录制，自动启用摄像头功能
 if args_cli.video:
     args_cli.enable_cameras = True
+else:
+    args_cli.enable_cameras = False
+
+args_cli.livestream = 0
 
 # 清理 sys.argv 以便 Hydra 能正确处理剩余参数
 sys.argv = [sys.argv[0]] + hydra_args
@@ -94,16 +98,27 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+if args_cli.headless and not args_cli.video:
+    import carb
+
+    carb_settings = carb.settings.get_settings()
+    carb_settings.set_bool("/app/window/enabled", False)
+    carb_settings.set_bool("/app/livestream/enabled", False)
+    carb_settings.set_bool("/app/xr/enabled", False)
+    carb_settings.set_bool("/isaaclab/render/offscreen", False)
+    carb_settings.set_bool("/isaaclab/render/active_viewport", False)
+
 """以下为训练的主要逻辑部分。"""
 
 import gymnasium as gym
+import pickle
 import random
 from datetime import datetime
 
 # 确保本地 skrl 可被导入（仓库内自带 skrl 目录）
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _local_skrl = os.path.join(_repo_root, "skrl")
-if _local_skrl not in sys.path:
+if os.path.isfile(os.path.join(_local_skrl, "skrl", "__init__.py")) and _local_skrl not in sys.path:
     sys.path.insert(0, _local_skrl)
 
 import skrl
@@ -159,10 +174,18 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,  # 多智能体到单智能体的转换工具
 )
 from isaaclab.utils.dict import print_dict      # 字典打印工具
-from isaaclab.utils.io.pkl import dump_pickle   # pickle 序列化工具
-from isaaclab.utils.io.yaml import dump_yaml    # YAML 配置导出工具
+from isaaclab.utils.io import dump_yaml  # 配置序列化工具
 from isaaclab_tasks.utils import get_checkpoint_path  # 检查点路径获取工具
 from isaaclab_tasks.utils.hydra import hydra_task_config  # Hydra 配置装饰器
+
+
+def dump_pickle(filename: str, data):
+    """Save data to a pickle file for Isaac Lab versions that no longer expose dump_pickle."""
+    if not filename.endswith("pkl"):
+        filename += ".pkl"
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, "wb") as f:
+        pickle.dump(data, f)
 
 # 配置快捷变量
 # 根据算法类型确定配置入口点

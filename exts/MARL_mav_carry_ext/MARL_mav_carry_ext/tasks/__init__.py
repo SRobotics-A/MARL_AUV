@@ -1,16 +1,18 @@
 """Package containing task implementations for various robotic environments."""
 
 import os
-import toml
-
-from isaaclab_tasks.utils import import_packages
 
 ##
 # Register Gym environments.
 ##
 
+# ManagerBased tasks create visualization markers at import time. In offline
+# containers, those marker USDs may resolve to remote Omniverse URLs and fail
+# before the requested task is even registered. Register DirectMARL tasks by
+# default; opt into the legacy full import only when needed.
+if os.environ.get("MARL_MAV_IMPORT_ALL_TASKS", "0") == "1":
+    from isaaclab_tasks.utils import import_packages
 
-# The blacklist is used to prevent importing configs from sub-packages
-_BLACKLIST_PKGS = ["utils"]
-# Import all configs in this package
-import_packages(__name__, _BLACKLIST_PKGS)
+    import_packages(__name__, ["utils"])
+else:
+    from . import directMARL  # noqa: F401
