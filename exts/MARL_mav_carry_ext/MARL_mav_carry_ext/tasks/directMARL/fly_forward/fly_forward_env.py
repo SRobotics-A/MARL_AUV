@@ -97,10 +97,15 @@ class FlyForwardEnv(DirectRLEnv):
         # 诊断日志：设置 FLY_FORWARD_DIAG=1 后，将 env_0 的关键状态写入 CSV 便于离线排查。
         # 这些模式互相独立，用来判断问题来自 policy、速度 PD、几何控制器、INDI 还是电机模型。
         self._diag_enabled = os.environ.get("FLY_FORWARD_DIAG", "0") == "1"
-        # 设置 FLY_FORWARD_ZERO_ACTION=1 时忽略策略动作，改用全 0 动作测试正常控制链。
+        # 设置 FLY_FORWARD_ZERO_ACTION=1 时忽略策略动作，并强制 action[0]=-1，
+        # 使 desired_vx=0，真正测试“零前向速度命令”下的正常控制链。
         self._diag_zero_action = os.environ.get("FLY_FORWARD_ZERO_ACTION", "0") == "1"
         # 设置 FLY_FORWARD_DIRECT_HEIGHT=1 时绕过正常控制链，直接施加手写高度保持推力。
         self._diag_direct_height = os.environ.get("FLY_FORWARD_DIRECT_HEIGHT", "0") == "1"
+        # 设置 FLY_FORWARD_TEST_X_FORCE=1 时，绕过策略和几何控制器，只保留高度保持，
+        # 并在世界系对 base_link 施加固定 x 向水平力，验证“固定水平力 -> 前飞响应”。
+        self._diag_test_x_force = os.environ.get("FLY_FORWARD_TEST_X_FORCE", "0") == "1"
+        self._diag_test_fx = float(os.environ.get("FLY_FORWARD_TEST_FX", "0.0"))
         # 设置 FLY_FORWARD_CONST_A0=<value> 时固定 action[0]，用于测试给定 vx_cmd 下的物理响应。
         self._diag_const_a0 = os.environ.get("FLY_FORWARD_CONST_A0", None)
         # 设置 FLY_FORWARD_RANDOM=1 时忽略策略动作，改用随机动作做控制链 smoke test。
@@ -109,7 +114,17 @@ class FlyForwardEnv(DirectRLEnv):
             self._diag_path = os.environ.get("FLY_FORWARD_DIAG_PATH", "/tmp/fly_forward_diag.csv")
             self._diag_file = open(self._diag_path, "w", newline="")
             self._diag_writer = csv.writer(self._diag_file)
-            mode = "direct_height" if self._diag_direct_height else "zero" if self._diag_zero_action else "random" if self._diag_random else "policy"
+            mode = (
+                "test_x_force"
+                if self._diag_test_x_force
+                else "direct_height"
+                if self._diag_direct_height
+                else "zero"
+                if self._diag_zero_action
+                else "random"
+                if self._diag_random
+                else "policy"
+            )
             self._diag_writer.writerow(
                 ["phase", "episode", "policy_step",
                  "a0", "a1", "a2", "a3", "a4",
@@ -172,6 +187,7 @@ class FlyForwardEnv(DirectRLEnv):
                 "action_smoothness",
                 "action_magnitude",
                 "success_reward",
+                "success_early_bonus",
                 "crash_penalty",
             ]
         }
@@ -291,8 +307,10 @@ class FlyForwardEnv(DirectRLEnv):
             actions = torch.zeros_like(actions)
             actions[:, 0] = float(self._diag_const_a0)
         elif self._diag_zero_action:
-            # 零动作 smoke test：隔离策略输出，只检查高度保持和底层控制是否会自行爬升。
+            # 零速度 smoke test：隔离策略输出，并强制 desired_vx=0，
+            # 只检查高度保持和底层控制是否会自行爬升或自行前移。
             actions = torch.zeros_like(actions)
+            actions[:, 0] = -1.0
         elif self._diag_random:
             # 诊断模式下使用随机动作覆盖策略动作，便于排除 policy 输出对控制链的影响。
             actions = torch.rand_like(actions) * 2.0 - 1.0
@@ -443,7 +461,8 @@ class FlyForwardEnv(DirectRLEnv):
 
         诊断 / 旁路模式：
             FLY_FORWARD_DIRECT_FORCE=1  直接给定每个旋翼推力，检查物理施力和质量参数。
-            FLY_FORWARD_SIMPLE_CONTROL=1  只用高度 PD 生成总推力，绕过几何控制器和 INDI。
+            FLY_FORWARD_TEST_X_FORCE=1  保留高度保持，并在世界系对 base_link 施加固定 x 向水平力。
+            FLY_FORWARD_SIMPLE_CONTROL=1  用简化版“高度推力 + x 方向速度跟踪力”训练，绕过几何控制器和 INDI。
             FLY_FORWARD_DIRECT_HEIGHT=1  手写高度保持推力分支，用于和正常控制链对照。
         """
         if os.environ.get("FLY_FORWARD_DIRECT_FORCE", "0") == "1":
@@ -469,7 +488,7 @@ class FlyForwardEnv(DirectRLEnv):
             self._write_apply_diag()
             return
 
-        if os.environ.get("FLY_FORWARD_SIMPLE_CONTROL", "0") == "1":
+        if self._diag_test_x_force:
             root = self._robot.data.root_state_w
             pos_l = root[:, :3] - self.scene.env_origins
             vel = root[:, 7:10]
@@ -477,7 +496,9 @@ class FlyForwardEnv(DirectRLEnv):
             z = pos_l[:, 2]
             vz = vel[:, 2]
 
-            # 简化训练分支：只用高度 PD 生成总推力，绕过 Geometric/INDI/Motor 链。
+            # 纯水平力诊断：不使用策略，不使用 desired_vx，只验证固定世界系 x 向力是否能产生稳定前飞。
+            # 注意 Isaac Lab 的 articulation 外力缓冲区共享 is_global 标志，因此这里把 base force
+            # 和 rotor thrust 都统一写成世界系，避免“前一个调用设 global，后一个调用又改回 local”。
             acc_z = (
                 self.cfg.height_hold_kp * (self.cfg.goal_z - z)
                 - self.cfg.height_hold_damping * vz
@@ -487,20 +508,81 @@ class FlyForwardEnv(DirectRLEnv):
             mass = self._geo_ctrl.falcon_mass
             collective_thrust = mass * (9.8066 + acc_z)
             collective_thrust = torch.clamp(collective_thrust, 0.0, 4.0 * self.cfg.max_thrust_pp)
+            base_forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
+            base_forces[:, 0, 0] = self._diag_test_fx
 
             self._forces.zero_()
             self._moments.zero_()
             self._forces[..., 2] = (collective_thrust / 4.0).unsqueeze(-1).expand(-1, 4)
+            self._last_target_rpm.zero_()
+            self._last_acc_cmd.zero_()
+            self._last_acc_cmd[:, 0] = self._diag_test_fx / mass
+            self._last_acc_cmd[:, 2] = 9.8066 + acc_z
+            self._last_collective_thrust_des = collective_thrust.clone()
 
             self._robot.set_external_force_and_torque(
-                forces=torch.zeros(self.num_envs, 1, 3, device=self.device),
-                torques=self._moments,
+                forces=base_forces,
+                torques=torch.zeros_like(base_forces),
                 body_ids=self._falcon_body_idx,
+                is_global=True,
             )
             self._robot.set_external_force_and_torque(
                 forces=self._forces,
                 torques=torch.zeros_like(self._forces),
                 body_ids=self._rotor_idx,
+                is_global=True,
+            )
+            self._write_apply_diag()
+            return
+
+        if os.environ.get("FLY_FORWARD_SIMPLE_CONTROL", "0") == "1":
+            root = self._robot.data.root_state_w
+            pos_l = root[:, :3] - self.scene.env_origins
+            vel = root[:, 7:10]
+
+            z = pos_l[:, 2]
+            vx = vel[:, 0]
+            vz = vel[:, 2]
+
+            # 简化训练分支：
+            #   1. 继续用高度 PD 生成总推力，保证低空稳定。
+            #   2. 在世界系 base_link 上直接施加 x 方向速度跟踪力，让前飞命令转成水平加速度。
+            # 这样可以绕过 Geometric/INDI/Motor 链，但保留“策略想前飞 -> 物理上确实会前飞”的最小闭环。
+            acc_z = (
+                self.cfg.height_hold_kp * (self.cfg.goal_z - z)
+                - self.cfg.height_hold_damping * vz
+            )
+            acc_z = torch.clamp(acc_z, -self.cfg.lin_acc_z_down_max, self.cfg.lin_acc_z_up_max)
+            acc_x = self.cfg.simple_vx_kp * (self._last_desired_vel[:, 0] - vx)
+            acc_x = torch.clamp(acc_x, -self.cfg.simple_acc_x_max, self.cfg.simple_acc_x_max)
+            self._setpoint["lin_acc"][:, 0] = acc_x
+
+            mass = self._geo_ctrl.falcon_mass
+            collective_thrust = mass * (9.8066 + acc_z)
+            collective_thrust = torch.clamp(collective_thrust, 0.0, 4.0 * self.cfg.max_thrust_pp)
+            base_forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
+            base_forces[:, 0, 0] = mass * acc_x
+
+            self._forces.zero_()
+            self._moments.zero_()
+            self._forces[..., 2] = (collective_thrust / 4.0).unsqueeze(-1).expand(-1, 4)
+            self._last_target_rpm.zero_()
+            self._last_acc_cmd.zero_()
+            self._last_acc_cmd[:, 0] = acc_x
+            self._last_acc_cmd[:, 2] = 9.8066 + acc_z
+            self._last_collective_thrust_des = collective_thrust.clone()
+
+            self._robot.set_external_force_and_torque(
+                forces=base_forces,
+                torques=torch.zeros_like(base_forces),
+                body_ids=self._falcon_body_idx,
+                is_global=True,
+            )
+            self._robot.set_external_force_and_torque(
+                forces=self._forces,
+                torques=torch.zeros_like(self._forces),
+                body_ids=self._rotor_idx,
+                is_global=True,
             )
             self._write_apply_diag()
             return
@@ -674,7 +756,7 @@ class FlyForwardEnv(DirectRLEnv):
 
         这个 helper 的目的不是省代码，而是保证 reward 和 done 使用同一时刻、同一口径的状态：
             - 高度统一使用 local z，而不是 world z。
-            - success 同时要求到达目标、速度足够低、高度未进入高飞区、姿态稳定。
+            - success 同时要求到达目标、速度足够低、高度在上下限内、姿态稳定。
             - fly_high/fly_low/out_of_bounds 直接基于当前 step 计算，避免使用上一 step 的 flag。
         """
         root = self._robot.data.root_state_w
@@ -693,11 +775,12 @@ class FlyForwardEnv(DirectRLEnv):
         rot_mat = matrix_from_quat(root[:, 3:7])
         z_body_z = rot_mat[:, 2, 2]
         stable_upright = z_body_z > 0.9
+        within_altitude_limits = (z > self.cfg.fly_low_z) & (z < self.cfg.fly_high_z)
         success = (
             (dist < self.cfg.goal_tolerance)
             & (forward_progress > self.cfg.success_forward_x)
             & (speed < self.cfg.success_speed_tolerance)
-            & (z < self.cfg.fly_high_guard_z)
+            & within_altitude_limits
             & stable_upright
         )
 
@@ -721,10 +804,9 @@ class FlyForwardEnv(DirectRLEnv):
 
         当前 reward 是“短距离低空前飞课程”的 shaping，而不是最终 200m 长航程版本：
             - progress_rew: 到目标距离变小才给奖励，防止远离目标。
-            - forward_progress_rew: 在安全高度内向 +x 前进给奖励，帮助早期学会低速前飞。
-            - forward_speed_rew: 远离目标且确实向前运动时，奖励接近 target_forward_speed 的前向速度。
-            - slow_near_goal_rew: 接近目标后奖励低速，配合 success_speed_tolerance 防止高速撞线。
-            - height/fly_high/upright/speed/action: 约束高度、姿态、速度和动作幅度。
+            - forward_progress_rew: 只有向目标方向前进时才给奖励。
+            - forward_speed_rew: 只有移动并接近目标时，奖励接近 target_forward_speed 的前向速度。
+            - height/fly_high/fly_low: 高度只作为上下界约束，不再给低空存活奖励。
 
         注意 _prev_dist、_prev_x、_prev_actions 会在这里更新，因此它们必须在 reset 时重新初始化。
         持续存活型 dense reward 需要乘 step_dt，否则 PPO 会偏向“悬停到超时刷累计奖励”。
@@ -738,53 +820,62 @@ class FlyForwardEnv(DirectRLEnv):
         speed = terms["speed"]
         forward_progress = terms["forward_progress"]
         z_body_z = terms["z_body_z"]
-        height_error = z - self.cfg.goal_z
+        cmd_acc = self._setpoint["lin_acc"]
+        base_id = self._falcon_body_idx[0]
+        body_acc = self._robot.data.body_acc_w[:, base_id, :3]
 
-        # 1. 真正的到目标进度
+        # 1. 真正的到目标进度：必须动起来且距离变小，静止或远离目标不给正奖励。
         delta_dist = self._prev_dist - dist
-        progress_rew = self.cfg.progress_reward_weight * torch.clamp(delta_dist, -0.2, 0.2)
+        moving = speed > self.cfg.move_reward_min_speed
+        moving_to_goal = moving & (delta_dist > 0.0)
+        progress_rew = (
+            self.cfg.progress_reward_weight
+            * torch.clamp(delta_dist, 0.0, 0.2)
+            * moving.float()
+        )
         self._prev_dist = dist.clone()
 
-        # 1b. 早期课程：安全高度内的 x 方向前进直接给正奖励。
+        # 1b. 目标方向前进奖励：只奖励朝目标方向移动，不奖励原地存活。
         delta_x = pos_l[:, 0] - self._prev_x
         self._prev_x = pos_l[:, 0].clone()
 
-        # 2. 距离目标越近越好。乘 step_dt，避免长时间悬停仅靠 dense distance reward 刷高总分。
+        # 2. 距离目标越近越好，但必须处于“移动并接近目标”的状态，避免悬停刷距离 dense reward。
         dist_rew = (
             self.cfg.dist_reward_weight
             * torch.exp(-self.cfg.dist_reward_scale * dist)
+            * moving_to_goal.float()
             * self.step_dt
         )
 
-        # 3. 安全高度带内存活正奖励，让早期策略明确知道低空稳定是有效行为。
-        in_altitude_band = (z > self.cfg.fly_low_z + 0.2) & (z < self.cfg.fly_high_guard_z)
-        altitude_safe = in_altitude_band.float()
-        altitude_band_rew = self.cfg.altitude_band_reward_weight * altitude_safe * self.step_dt
+        # 3. 高度只作为上下界安全约束，范围内不再给正奖励。
+        within_altitude_limits = (z > self.cfg.fly_low_z) & (z < self.cfg.fly_high_z)
+        altitude_safe = within_altitude_limits.float()
+        altitude_band_rew = torch.zeros_like(dist)
         goal_rel_x = self._goal_w[:, 0] - pos_w[:, 0]
         before_goal = goal_rel_x > 0.0
         forward_progress_rew = (
             self.cfg.forward_progress_reward_weight
-            * torch.clamp(delta_x, -0.05, 0.05)
+            * torch.clamp(delta_x, 0.0, 0.05)
             * altitude_safe
+            * moving.float()
             * before_goal.float()
         )
         vx = vel_w[:, 0]
         approach_phase = dist > self.cfg.goal_tolerance
-        forward_moving = vx > self.cfg.forward_speed_min_vx
         forward_speed_rew = (
             self.cfg.forward_speed_reward_weight
             * torch.exp(-((vx - self.cfg.target_forward_speed) ** 2) / self.cfg.forward_speed_sigma)
             * altitude_safe
             * approach_phase.float()
             * before_goal.float()
-            * forward_moving.float()
+            * moving_to_goal.float()
             * self.step_dt
         )
 
-        # 4. 高度约束，明确惩罚偏离目标高度
-        height_pen = -self.cfg.height_penalty_weight * height_error.square()
+        # 4. 不再惩罚偏离 goal_z，高度由控制器保持，reward 只关心越界。
+        height_pen = torch.zeros_like(dist)
 
-        # 5. 过高强惩罚
+        # 5. 接近高度上限时轻度惩罚，真正越界由 done + crash_pen 处理。
         fly_high_guard_pen = (
             -self.cfg.fly_high_guard_penalty_weight
             * torch.relu(z - self.cfg.fly_high_guard_z).square()
@@ -821,11 +912,17 @@ class FlyForwardEnv(DirectRLEnv):
         # 9. 动作平滑
         delta_a = self._actions - self._prev_actions
         smooth_pen = -self.cfg.action_smoothness_weight * delta_a.square().sum(-1)
-        action_mag_pen = -self.cfg.action_magnitude_weight * self._actions.square().sum(-1)
+        action_mag_pen = -self.cfg.action_magnitude_weight * self._actions[:, 0].square()
         self._prev_actions = self._actions.clone()
 
-        # 10. 成功奖励
-        success_rew = terms["success"].float() * self.cfg.success_reward
+        # 10. 成功奖励：保底成功奖励 + 按剩余时间递减的早到奖励。
+        # 这样“快速到达并稳定停下”会比“慢慢挪到目标”拿到更高回报。
+        success_mask = terms["success"].float()
+        elapsed_fraction = self.episode_length_buf.float() / max(float(self.max_episode_length - 1), 1.0)
+        remaining_fraction = torch.clamp(1.0 - elapsed_fraction, 0.0, 1.0)
+        success_base_rew = success_mask * self.cfg.success_reward
+        success_early_bonus = success_mask * self.cfg.success_early_bonus * remaining_fraction
+        success_rew = success_base_rew + success_early_bonus
 
         # 11. 失败惩罚
         crash_pen = -(
@@ -869,6 +966,7 @@ class FlyForwardEnv(DirectRLEnv):
         self._episode_sums["action_smoothness"] += smooth_pen
         self._episode_sums["action_magnitude"] += action_mag_pen
         self._episode_sums["success_reward"] += success_rew
+        self._episode_sums["success_early_bonus"] += success_early_bonus
         self._episode_sums["crash_penalty"] += crash_pen
 
         self.extras.setdefault("log", {}).update(
@@ -888,12 +986,22 @@ class FlyForwardEnv(DirectRLEnv):
                 "Episode Reward/smooth": smooth_pen.mean().item(),
                 "Episode Reward/action_magnitude": action_mag_pen.mean().item(),
                 "Episode Reward/success": success_rew.mean().item(),
+                "Episode Reward/success_early_bonus": success_early_bonus.mean().item(),
                 "Episode Reward/crash": crash_pen.mean().item(),
                 "Metrics/z_mean": z.mean().item(),
                 "Metrics/z_max": z.max().item(),
                 "Metrics/dist_mean": dist.mean().item(),
                 "Metrics/speed_mean": speed.mean().item(),
                 "Metrics/forward_progress_mean": forward_progress.mean().item(),
+                "Metrics/cmd_acc_x_mean": cmd_acc[:, 0].mean().item(),
+                "Metrics/cmd_acc_y_mean": cmd_acc[:, 1].mean().item(),
+                "Metrics/cmd_acc_z_mean": cmd_acc[:, 2].mean().item(),
+                "Metrics/body_acc_x_mean": body_acc[:, 0].mean().item(),
+                "Metrics/body_acc_y_mean": body_acc[:, 1].mean().item(),
+                "Metrics/body_acc_z_mean": body_acc[:, 2].mean().item(),
+                "Metrics/cmd_acc_x_abs_mean": cmd_acc[:, 0].abs().mean().item(),
+                "Metrics/body_acc_x_abs_mean": body_acc[:, 0].abs().mean().item(),
+                "Metrics/success_remaining_fraction": remaining_fraction.mean().item(),
             }
         )
 
